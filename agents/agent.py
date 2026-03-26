@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from pydantic import BaseModel
@@ -54,6 +55,29 @@ def build(model) -> Agent:
         output_type=DiagnosisOutput,
         system_prompt=SYSTEM_PROMPT,
     )
+
+    def _normalize_changes(
+        raw_changes: dict[str, str] | str, tool_name: str
+    ) -> tuple[dict[str, str] | None, str | None]:
+        changes_obj = raw_changes
+        if isinstance(changes_obj, str):
+            try:
+                changes_obj = json.loads(changes_obj)
+            except json.JSONDecodeError as e:
+                return None, f"{tool_name}: invalid JSON for 'changes' ({e.msg})"
+
+        if not isinstance(changes_obj, dict):
+            return None, f"{tool_name}: 'changes' must be a dictionary"
+
+        normalized: dict[str, str] = {}
+        for key, value in changes_obj.items():
+            if not isinstance(key, str):
+                key = str(key)
+            if isinstance(value, (dict, list)):
+                normalized[key] = json.dumps(value, separators=(",", ":"))
+            else:
+                normalized[key] = str(value)
+        return normalized, None
 
     @agent.tool
     async def inspect_nginx_config(ctx: RunContext[AgentDeps]) -> dict:
@@ -152,10 +176,18 @@ def build(model) -> Agent:
 
     @agent.tool
     async def apply_nginx_tuning(ctx: RunContext[AgentDeps],
-                                 changes: dict[str, str], reason: str) -> dict:
+                                 changes: dict[str, str] | str, reason: str) -> dict:
         """Apply multiple nginx config changes in one batch, then reload.
         Example: {"sendfile": "on", "tcp_nopush": "on", "open_file_cache": "max=10000 inactive=60s"}
         """
+        normalized_changes, parse_error = _normalize_changes(changes, "apply_nginx")
+        if parse_error:
+            tool_call("apply_nginx", "invalid input payload")
+            tool_result("apply_nginx", f"FAILED: {parse_error}")
+            ctx.deps.token_counter.tool_calls += 1
+            return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
+
+        changes = normalized_changes
         tool_call("apply_nginx", f"{len(changes)} changes: {', '.join(changes.keys())}")
         log("agent", f"Reason: {reason[:150]}", "info")
 
@@ -208,10 +240,18 @@ def build(model) -> Agent:
 
     @agent.tool
     async def apply_system_tuning(ctx: RunContext[AgentDeps],
-                                  changes: dict[str, str], reason: str) -> dict:
+                                  changes: dict[str, str] | str, reason: str) -> dict:
         """Apply multiple sysctl/kernel changes in one batch.
         Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never", "selinux": "permissive"}
         """
+        normalized_changes, parse_error = _normalize_changes(changes, "apply_system")
+        if parse_error:
+            tool_call("apply_system", "invalid input payload")
+            tool_result("apply_system", f"FAILED: {parse_error}")
+            ctx.deps.token_counter.tool_calls += 1
+            return {"applied": {}, "failed": {"_input": parse_error}}
+
+        changes = normalized_changes
         tool_call("apply_system", f"{len(changes)} changes: {', '.join(changes.keys())}")
         log("agent", f"Reason: {reason[:150]}", "info")
 
