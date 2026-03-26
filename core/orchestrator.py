@@ -112,17 +112,14 @@ async def run(model, deps: AgentDeps) -> str:
             seen_params.add(param)
             prior_fixes.append({
                 "parameter": param,
-                "before_value": f.get("before_value", ""),
-                "after_value": f.get("after_value", ""),
-                "impact_pct": f.get("impact_pct", 0),
-                "reasoning": f.get("reasoning", "")[:200],
-                "session": f.get("session_id", ""),
+                "value": f.get("after_value", ""),
+                "impact": f.get("impact_pct", 0),
             })
 
     if prior_fixes:
         for pf in prior_fixes:
-            logger.status("context", f"  Prior fix: {pf['parameter']} = {pf['after_value']} "
-                          f"({pf['impact_pct']:+.1f}%)")
+            logger.status("context", f"  Prior fix: {pf['parameter']} = {pf['value']} "
+                          f"({pf['impact']:+.1f}%)")
     else:
         logger.status("context", "No prior fixes found — fresh diagnosis")
 
@@ -137,9 +134,9 @@ async def run(model, deps: AgentDeps) -> str:
     ]
     knowledge_chunks = []
     for q in rag_queries:
-        results = memory.semantic_search(q, top_k=3)
+        results = memory.semantic_search(q, top_k=2)
         for r in results:
-            chunk = f"[{r.get('parameter', '')}]: {r.get('reasoning', '')[:500]}"
+            chunk = f"{r.get('parameter', '')}: {r.get('reasoning', '')[:200]}"
             if chunk not in knowledge_chunks:
                 knowledge_chunks.append(chunk)
                 logger.log("rag", f"  {r.get('parameter', '')[:60]}", "info")
@@ -209,6 +206,33 @@ async def run(model, deps: AgentDeps) -> str:
     memory.update_profile(session_id, best_rps=best_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 6.5: Capture system throughput limits (direct — no LLM)
+    # ══════════════════════════════════════════════════════════════════════════
+    logger.step("Step 6.5: Capturing system throughput limits...")
+    throughput_info = {}
+
+    # NIC speed
+    r = ssh.execute("ethtool ens3 2>/dev/null | grep Speed || "
+                    "cat /sys/class/net/$(ip route | awk '/default/{print $5}')/speed 2>/dev/null")
+    throughput_info["nic_speed"] = r.stdout.strip()[:50]
+
+    # Disk throughput (quick dd test)
+    r = ssh.execute("dd if=/dev/zero of=/tmp/disktest bs=1M count=256 oflag=direct 2>&1 | tail -1")
+    throughput_info["disk_write"] = r.stdout.strip()[:80]
+    ssh.execute("rm -f /tmp/disktest")
+
+    # Network throughput per payload
+    for size in PAYLOAD_SIZES:
+        data = finals.get(size, {})
+        rps = data.get("rps", 0)
+        file_sizes = {"small": 1, "medium": 100, "large": 1024}  # KB
+        throughput_mbps = (rps * file_sizes.get(size, 1)) / 1024  # MB/s
+        throughput_info[f"{size}_throughput_mb_s"] = round(throughput_mbps, 1)
+
+    for k, v in throughput_info.items():
+        logger.status("throughput", f"{k}: {v}")
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 7: Stability test (direct wrk2 loop — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     stability_cfg = cfg["agent"].get("stability", {})
@@ -253,11 +277,28 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 8: Generate report (template — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 8: Generating report...")
+
+    # Save token usage to context for cross-session tracking
+    tc = deps.token_counter
+    memory.save_context(session_id, "metric", "token_usage",
+                        json.dumps({
+                            "input_tokens": tc.input_tokens,
+                            "output_tokens": tc.output_tokens,
+                            "total_tokens": tc.total,
+                            "tool_calls": tc.tool_calls,
+                            "session_id": session_id,
+                        }),
+                        f"Tokens: in={tc.input_tokens:,} out={tc.output_tokens:,} "
+                        f"total={tc.total:,} calls={tc.tool_calls}")
+
     memory.update_profile(session_id, status="completed")
+
+    token_history = memory.get_token_history()
 
     report_path = reporter.generate(
         session_id, memory, deps.token_counter,
         baselines=baselines, finals=finals, stability=stability_data,
+        throughput=throughput_info, token_history=token_history,
     )
 
     total_improvement = (
@@ -293,47 +334,27 @@ def _build_context_prompt(rhel_ver, kernel_ver, cpu_cores, ram_gb,
     # Prior fixes section
     prior_text = ""
     if prior_fixes:
-        prior_text = "## Previously Applied Fixes (DO NOT REPEAT)\n"
-        prior_text += "The following fixes were already applied in previous runs. Skip these.\n\n"
+        prior_text = "## Already Applied (skip these)\n"
         for pf in prior_fixes:
-            prior_text += (
-                f"- **{pf['parameter']}**: {pf['before_value']} → {pf['after_value']} "
-                f"({pf['impact_pct']:+.1f}%) — {pf['reasoning'][:100]}\n"
-            )
+            prior_text += f"- {pf['parameter']} = {pf['value']} ({pf['impact']:+.1f}%)\n"
         prior_text += "\n"
-    else:
-        prior_text = "## Previously Applied Fixes\nNone — this is a fresh diagnosis.\n\n"
 
-    return f"""## System Information
-- OS: {rhel_ver}
-- Kernel: {kernel_ver}
-- CPU: {cpu_cores} cores
-- RAM: {ram_gb} GB
+    return f"""## System
+{rhel_ver} | Kernel {kernel_ver} | {cpu_cores} CPU | {ram_gb} GB RAM
 
-## RHEL System Checks
+## RHEL Checks
 {checks_text}
 
-## Baseline Benchmarks
+## Baselines
 {baselines_text}
 
-{prior_text}## Knowledge Base (Red Hat Performance Tuning Docs)
+{prior_text}## Knowledge
 {knowledge_text}
 
-## Current Nginx Configuration (first 3000 chars)
+## Nginx Config
 ```
 {nginx_config}
 ```
 
-## Your Task
-Based on all the information above:
-1. Review previously applied fixes — DO NOT repeat them
-2. Identify the TOP 3 NEW performance fixes for this nginx server
-3. For each fix: run a benchmark BEFORE, apply the fix, reload nginx, run a benchmark AFTER
-4. Save each finding using save_finding tool
-5. Return DiagnosisOutput with all fixes and the total improvement percentage
-
-Focus on fixes that will improve requests/sec for small and medium static files.
-Do NOT try to fix things that are already correctly configured or previously applied.
-Do NOT install any packages.
-Keep commands simple — no heredocs or multi-line scripts.
+Inspect the system, apply all proven fixes from your list that are not already configured, benchmark before and after, save findings.
 """

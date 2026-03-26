@@ -151,11 +151,39 @@ def clear_db(cfg: dict) -> None:
     print("  [tidb] Cleared all sessions (knowledge base preserved)")
 
 
+def reset_all_db(cfg: dict) -> None:
+    import pymysql
+    m = cfg["memory"]
+    conn = pymysql.connect(
+        host=m["host"],
+        port=int(m.get("port", 4000)),
+        user=m["user"],
+        password=os.environ.get(m.get("password_env", ""), "") or "",
+        database=m["database"],
+        autocommit=True,
+    )
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM context")
+        cur.execute("DELETE FROM facts")
+        cur.execute("DELETE FROM hypothesis_queue")
+        cur.execute("DELETE FROM profile")
+    conn.close()
+
+    # Remove knowledge hash so facts/ get reloaded on next run
+    hash_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "facts", ".loaded_hash")
+    if os.path.exists(hash_file):
+        os.remove(hash_file)
+
+    print("  [tidb] Cleared EVERYTHING — sessions, fixes, AND knowledge base")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Reset system to clean state")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--clear-db", action="store_true",
-                        help="Also clear TiDB session data (preserves knowledge base)")
+                        help="Clear TiDB session data (preserves knowledge base)")
+    parser.add_argument("--reset-all", action="store_true",
+                        help="Clear EVERYTHING in TiDB including knowledge base")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -164,7 +192,13 @@ def main():
 
     try:
         reset_system(client)
-        if args.clear_db:
+        if args.reset_all:
+            answer = input("\n  WARNING: This will delete ALL data including knowledge base. Continue? [y/N] ")
+            if answer.lower() != "y":
+                print("  Aborted.")
+                return
+            reset_all_db(cfg)
+        elif args.clear_db:
             clear_db(cfg)
     finally:
         client.disconnect()

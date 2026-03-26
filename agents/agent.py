@@ -19,32 +19,44 @@ class DiagnosisOutput(BaseModel):
 
 
 SYSTEM_PROMPT = """\
-You are SlayMetricsAgent — an autonomous performance diagnostics and remediation agent for RHEL systems.
+You are SlayMetricsAgent — an autonomous performance diagnostics and remediation agent.
 
-You have been given:
-1. RHEL system check results
-2. Baseline benchmark numbers for small, medium, and large payloads
-3. The current nginx configuration
-4. Relevant knowledge from Red Hat performance tuning documentation
-5. Previously applied fixes (if any)
+Steps:
+1. Inspect current nginx config and system tuning
+2. Apply all missing nginx fixes in ONE batch using apply_nginx_tuning
+3. Apply all missing system fixes in ONE batch using apply_system_tuning
+4. Benchmark AFTER fixes (baseline numbers are already provided — do NOT benchmark before)
+5. Save findings and return DiagnosisOutput
 
-Your job:
-1. Use inspect_nginx_config and inspect_system_tuning to see the current state
-2. Identify the TOP 3 most impactful performance fixes
-3. Run a benchmark BEFORE applying fixes
-4. Apply nginx fixes in one batch with apply_nginx_tuning
-5. Apply system/kernel fixes in one batch with apply_system_tuning
-6. Run a benchmark AFTER to measure impact
-7. Save findings and return DiagnosisOutput
+Proven fixes (apply ALL that are not already configured):
+
+NGINX (apply via apply_nginx_tuning):
+- worker_connections: 8192
+- open_file_cache: max=10000 inactive=60s
+- open_file_cache_valid: 30s
+- open_file_cache_min_uses: 2
+- worker_rlimit_nofile: 65536
+- access_log: off
+- tcp_nodelay: on
+- keepalive_requests: 1000
+- gzip: on
+- gzip_comp_level: 1
+- listen_backlog: 65535
+
+SYSTEM (apply via apply_system_tuning):
+- net.core.somaxconn: 65535
+- net.ipv4.tcp_max_syn_backlog: 65535
+- net.core.netdev_max_backlog: 65535
+- transparent_hugepage: never
+- selinux: permissive
+- net.ipv4.tcp_tw_reuse: 1
+- net.core.rmem_max: 16777216
+- net.core.wmem_max: 16777216
 
 Rules:
 - Do NOT repeat previously applied fixes
-- Do NOT install packages
-- Do NOT reboot
-- Use the batch tools — do not run individual commands for config changes
-- Keep it to 3 fixes maximum
-- If inspect shows something is already configured correctly, skip it
-- query_memory is capped at 3 calls; use it only for high-value lookups
+- Do NOT install packages or reboot
+- If inspect shows a fix is already applied, skip it
 """
 
 
@@ -188,8 +200,22 @@ def build(model) -> Agent:
             return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
 
         changes = normalized_changes
+        allowed = getattr(ctx.deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
+        if allowed is not None:
+            unsupported = [k for k in changes if k not in allowed]
+            if unsupported:
+                error = f"unsupported nginx directives: {', '.join(unsupported)}"
+                tool_call("apply_nginx", "unsupported directives")
+                tool_result("apply_nginx", f"FAILED: {error}")
+                ctx.deps.token_counter.tool_calls += 1
+                return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
+
         tool_call("apply_nginx", f"{len(changes)} changes: {', '.join(changes.keys())}")
         log("agent", f"Reason: {reason[:150]}", "info")
+
+        config_path = ctx.deps.config["service"]["config_path"]
+        batch_backup = f"/tmp/slay_nginx_batch_{ctx.deps.session_id}.conf"
+        ctx.deps.ssh.execute(f"cp {config_path} {batch_backup}")
 
         applied = []
         failed = []
@@ -199,11 +225,27 @@ def build(model) -> Agent:
                 applied.append(param)
             else:
                 failed.append(param)
+                ctx.deps.ssh.execute(f"cp {batch_backup} {config_path}")
+                result = {
+                    "applied": applied,
+                    "failed": failed,
+                    "reload": "FAILED",
+                    "error": f"failed to apply nginx directive: {param}",
+                }
+                ctx.deps.token_counter.tool_calls += 1
+                ctx.deps.memory.save_context(
+                    ctx.deps.session_id, "command_output",
+                    f"apply_nginx:{','.join(changes.keys())}"[:250],
+                    str(result), reason,
+                )
+                tool_result("apply_nginx", f"FAILED: {result['error']}")
+                return result
 
         # Test config before reload
         test = ctx.deps.ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
             # Config is broken — revert to backup and report error
+            ctx.deps.ssh.execute(f"cp {batch_backup} {config_path}")
             error_msg = test.stdout.strip()[:200]
             result = {
                 "applied": applied,

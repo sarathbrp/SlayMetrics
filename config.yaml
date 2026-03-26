@@ -46,7 +46,7 @@ service:
     tool: wrk2
     duration: 30
     threads: 4
-    connections: 100
+    connections: 400
     rate: 150000
     small_file_url: "http://localhost/1kb.html"
     medium_file_url: "http://localhost/100kb.html"

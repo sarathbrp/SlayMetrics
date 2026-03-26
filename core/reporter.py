@@ -11,7 +11,9 @@ from memory.tidb_store import TiDBStore
 def generate(session_id: str, memory: TiDBStore,
              token_counter: TokenCounter, output_dir: str = "report",
              baselines: dict | None = None, finals: dict | None = None,
-             stability: dict | None = None) -> str:
+             stability: dict | None = None,
+             throughput: dict | None = None,
+             token_history: list | None = None) -> str:
     os.makedirs(output_dir, exist_ok=True)
 
     profile = memory.get_profile(session_id) or {}
@@ -31,7 +33,8 @@ def generate(session_id: str, memory: TiDBStore,
     # ── Markdown report ──────────────────────────────────────────────────────
     md = _md_report(profile, fixes, findings, negatives, queue,
                     baseline_rps, best_rps, total_improvement, token_counter,
-                    baselines=baselines, finals=finals, stability=stability)
+                    baselines=baselines, finals=finals, stability=stability,
+                    throughput=throughput, token_history=token_history)
 
     # ── JSON report ──────────────────────────────────────────────────────────
     report_data = {
@@ -44,6 +47,7 @@ def generate(session_id: str, memory: TiDBStore,
         "baselines_by_size": baselines or {},
         "finals_by_size": finals or {},
         "stability": stability or {},
+        "throughput": throughput or {},
         "fixes_applied": [_clean(f) for f in fixes],
         "findings": [_clean(f) for f in findings],
         "negatives": [_clean(f) for f in negatives],
@@ -78,7 +82,8 @@ def generate(session_id: str, memory: TiDBStore,
 
 def _md_report(profile, fixes, findings, negatives, queue,
                baseline_rps, best_rps, total_improvement, token_counter,
-               baselines=None, finals=None, stability=None) -> str:
+               baselines=None, finals=None, stability=None,
+               throughput=None, token_history=None) -> str:
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     service = profile.get("service", "unknown")
     host = profile.get("host", "unknown")
@@ -156,6 +161,51 @@ def _md_report(profile, fixes, findings, negatives, queue,
                 f"| **{cpu_change:+.1f}%** |"
             )
         lines += ["", "---", ""]
+
+    # ── Bottleneck Analysis ─────────────────────────────────────────────────
+    if throughput or (baselines and finals):
+        lines += [
+            "## Bottleneck Analysis",
+            "",
+        ]
+        if throughput:
+            nic = throughput.get("nic_speed", "unknown")
+            disk = throughput.get("disk_write", "unknown")
+            lines += [
+                f"- **NIC Speed:** {nic}",
+                f"- **Disk Write Throughput:** {disk}",
+                "",
+                "| Payload | Final RPS | Data Throughput | Bottleneck |",
+                "|---------|-----------|----------------|------------|",
+            ]
+            for size in ["small", "medium", "large"]:
+                tp_key = f"{size}_throughput_mb_s"
+                tp = throughput.get(tp_key, 0)
+                f_data = (finals or {}).get(size, {})
+                f_rps = f_data.get("rps", 0)
+                f_cpu = f_data.get("cpu_pct", 0)
+                # Determine bottleneck
+                if f_cpu > 90:
+                    bottleneck = "CPU saturated"
+                elif tp > 4000:
+                    bottleneck = "Memory bus / NIC bandwidth"
+                elif tp > 1000:
+                    bottleneck = "Network throughput"
+                else:
+                    bottleneck = "Application tuning"
+                lines.append(
+                    f"| {size} | {f_rps:.0f} | {tp:.0f} MB/s | {bottleneck} |"
+                )
+            lines += [
+                "",
+                "**Note:** Medium and large file performance is typically bounded by hardware "
+                "(NIC bandwidth, memory bus, disk I/O) rather than software configuration. "
+                "Small file performance benefits most from nginx/kernel tuning because "
+                "per-request overhead (syscalls, connection handling) dominates over data transfer.",
+                "",
+                "---",
+                "",
+            ]
 
     # ── Sustained Stability Test ──────────────────────────────────────────────
     if stability:
@@ -241,6 +291,25 @@ def _md_report(profile, fixes, findings, negatives, queue,
         f"| Tool calls | {token_counter.tool_calls:,} |",
         "",
     ]
+
+    # ── Token History (across sessions) ──────────────────────────────────────
+    if token_history:
+        lines += [
+            "### Token Usage History (all sessions)",
+            "",
+            "| Session | Date | Input | Output | Total | Tool Calls |",
+            "|---------|------|-------|--------|-------|------------|",
+        ]
+        for th in token_history:
+            lines.append(
+                f"| {th.get('session_id', '')[:8]} "
+                f"| {th.get('created_at', '')[:19]} "
+                f"| {th.get('input_tokens', 0):,} "
+                f"| {th.get('output_tokens', 0):,} "
+                f"| {th.get('total_tokens', 0):,} "
+                f"| {th.get('tool_calls', 0)} |"
+            )
+        lines += ["", "---", ""]
 
     return "\n".join(lines)
 

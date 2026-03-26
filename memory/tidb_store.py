@@ -246,6 +246,27 @@ class TiDBStore:
 
     # ── Session resume ───────────────────────────────────────────────────────
 
+    def get_token_history(self) -> list[dict]:
+        """Get token usage across all sessions for tracking consumption over time."""
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT session_id, source, content, created_at
+                FROM context
+                WHERE type = 'metric' AND source = 'token_usage'
+                ORDER BY created_at ASC
+            """)
+            rows = cur.fetchall()
+        history = []
+        for row in rows:
+            try:
+                data = json.loads(row.get("content", "{}"))
+                data["created_at"] = str(row.get("created_at", ""))
+                data["session_id"] = row.get("session_id", "")
+                history.append(data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return history
+
     def session_exists(self, session_id: str) -> bool:
         with self._cursor() as cur:
             cur.execute(

@@ -31,6 +31,18 @@ class NginxAdapter(ServiceAdapter):
     }
     # Not real directives or need special handling — reject outright
     SKIP_DIRECTIVES = {"listen_backlog"}
+    # Explicit set for agent-side batch validation.
+    ALLOWED_BATCH_DIRECTIVES = (
+        MAIN_DIRECTIVES
+        | EVENTS_DIRECTIVES
+        | {
+            "sendfile", "tcp_nopush", "tcp_nodelay", "keepalive_timeout",
+            "keepalive_requests", "open_file_cache", "access_log",
+            "gzip", "gzip_comp_level", "gzip_types",
+            "reset_timedout_connection", "lingering_close", "lingering_timeout",
+            "listen_backlog",
+        }
+    )
 
     def apply_config(self, parameter: str, value: str) -> bool:
         # Handle listen_backlog specially — modifies existing listen directives
