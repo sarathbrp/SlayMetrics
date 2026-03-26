@@ -1,12 +1,12 @@
 # SlayMetricsAgent
 
-Autonomous AI agent that diagnoses and remediates performance issues on RHEL systems. Point it at a degraded system, let it run — get a full diagnostic report with before-and-after proof.
+An autonomous AI agent that diagnoses and remediates performance issues on RHEL systems. Point it at a degraded system, let it run — get a full diagnostic report with before-and-after proof.
 
 ## What It Does
 
 1. Collects system state (RHEL checks, fingerprint, nginx config)
 2. Benchmarks the service across small, medium, and large payloads
-3. Queries knowledge base (RAG) and cross-session memory for proven fixes
+3. Queries the knowledge base (RAG) and cross-session memory for proven fixes
 4. AI agent inspects what needs fixing, applies all fixes in batched operations
 5. Benchmarks again, captures bottleneck analysis
 6. Generates a report with decision log, per-payload results, and token usage
@@ -17,7 +17,7 @@ Every decision is logged with the data and reasoning that drove it. No black box
 
 ```
 Steps 1-4: Direct (subprocess + vector search) → zero LLM tokens
-Step 5:    ONE agent call with full context → ~24k tokens
+Step 5:    ONE agent call with full context 
 Steps 6-8: Direct (wrk2 + template) → zero LLM tokens
 ```
 
@@ -128,8 +128,6 @@ report/
 ├── report_20260326_215258_04d5fecc.md    ← timestamped, never overwritten
 ├── report_20260326_215258_04d5fecc.json
 ├── log_20260326_215258_04d5fecc.md       ← detailed execution log
-├── report.md                              ← latest (convenience copy)
-└── report.json
 ```
 
 Report includes:
@@ -139,14 +137,3 @@ Report includes:
 - Bottleneck analysis (NIC speed, disk I/O, throughput per payload)
 - Applied fixes with reasoning
 - Token consumption + cross-session history
-
-## Performance
-
-Typical run on a clean RHEL system:
-
-| Metric | Value |
-|--------|-------|
-| Improvement (small files) | +60-70% |
-| Total tokens | ~24k |
-| Tool calls | 8 |
-| Runtime | ~3 minutes |
