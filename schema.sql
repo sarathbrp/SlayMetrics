@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS profile (
 CREATE TABLE IF NOT EXISTS facts (
     id              VARCHAR(64)     PRIMARY KEY,
     session_id      VARCHAR(64)     NOT NULL,
-    type            ENUM('finding', 'fix', 'negative', 'escalation') NOT NULL,
+    type            ENUM('finding', 'fix', 'negative', 'escalation', 'knowledge') NOT NULL,
     parameter       VARCHAR(256),
     before_value    TEXT,
     after_value     TEXT,

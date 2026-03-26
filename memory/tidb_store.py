@@ -161,7 +161,8 @@ class TiDBStore:
                            impact_pct, type,
                            VEC_COSINE_DISTANCE(embedding, %s) AS score
                     FROM facts
-                    WHERE session_id = %s AND embedding IS NOT NULL
+                    WHERE (session_id = %s OR type = 'knowledge')
+                      AND embedding IS NOT NULL
                     ORDER BY score ASC
                     LIMIT %s
                 """, (vec_str, session_id, top_k))
