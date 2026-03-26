@@ -215,6 +215,15 @@ if [ ${#MISSING[@]} -eq 0 ]; then
 fi
 
 echo ""
+echo -n -e "${BOLD}Install ${#MISSING[@]} missing components? [Y/n] ${NC}"
+read -r answer
+case "$answer" in
+    [nN]|[nN][oO])
+        echo "Aborted."
+        exit 0
+        ;;
+esac
+echo ""
 log "Installing ${#MISSING[@]} missing components..."
 echo ""
 
