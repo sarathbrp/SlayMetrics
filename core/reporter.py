@@ -56,12 +56,21 @@ def generate(session_id: str, memory: TiDBStore,
         },
     }
 
-    md_path = os.path.join(output_dir, "report.md")
-    json_path = os.path.join(output_dir, "report.json")
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    md_path = os.path.join(output_dir, f"report_{ts}_{session_id}.md")
+    json_path = os.path.join(output_dir, f"report_{ts}_{session_id}.json")
 
     with open(md_path, "w") as f:
         f.write(md)
     with open(json_path, "w") as f:
+        json.dump(report_data, f, indent=2, default=str)
+
+    # Also write a latest symlink for convenience
+    latest_md = os.path.join(output_dir, "report.md")
+    latest_json = os.path.join(output_dir, "report.json")
+    with open(latest_md, "w") as f:
+        f.write(md)
+    with open(latest_json, "w") as f:
         json.dump(report_data, f, indent=2, default=str)
 
     return md_path

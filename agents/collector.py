@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
-from pydantic_ai import Agent, RunContext
 
 from agents import AgentDeps
+from core.log import log
 
 
 class CollectionOutput(BaseModel):
@@ -12,69 +12,53 @@ class CollectionOutput(BaseModel):
     raw_summary: str
 
 
-def build(model) -> Agent:
-    agent: Agent[AgentDeps, CollectionOutput] = Agent(
-        model,
-        deps_type=AgentDeps,
-        result_type=CollectionOutput,
-        system_prompt=(
-            "You are a data collection agent for RHEL system diagnostics. "
-            "Run the requested commands via SSH, record results to memory, "
-            "and return a structured summary of what you observed. "
-            "Always pass a reason explaining why you ran each command."
-        ),
-    )
-
-    @agent.tool
-    async def run_command(ctx: RunContext[AgentDeps],
-                          command: str, reason: str) -> str:
-        """Run a shell command on the target RHEL system via SSH."""
-        result = ctx.deps.ssh.execute(command)
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output", command,
-            str(result), reason,
-        )
-        ctx.deps.token_counter.tool_calls += 1
-        return str(result)
-
-    @agent.tool
-    async def get_service_logs(ctx: RunContext[AgentDeps], tail: int = 50) -> str:
-        """Fetch the most recent service log lines."""
-        logs = ctx.deps.adapter.get_logs(tail)
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id, "log", "service_logs", logs,
-            f"Last {tail} lines of service log",
-        )
-        ctx.deps.token_counter.tool_calls += 1
-        return logs
-
-    @agent.tool
-    async def get_service_metrics(ctx: RunContext[AgentDeps]) -> dict:
-        """Collect live service metrics (connections, throughput, etc.)."""
-        metrics = ctx.deps.adapter.get_metrics()
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id, "metric", "live_metrics",
-            str(metrics), "live service metrics snapshot",
-        )
-        ctx.deps.token_counter.tool_calls += 1
-        return metrics
-
-    @agent.tool
-    async def get_service_config(ctx: RunContext[AgentDeps]) -> dict:
-        """Read the current service configuration file."""
-        config = ctx.deps.adapter.get_config()
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output", "service_config",
-            config.get("raw", ""), "current service config",
-        )
-        ctx.deps.token_counter.tool_calls += 1
-        return {"path": config.get("path"), "preview": config.get("raw", "")[:1000]}
-
-    return agent
-
-
 async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
-    agent = build(model)
-    result = await agent.run(task, deps=deps)
-    deps.token_counter.add(result.usage())
-    return result.data
+    """Collect service config, logs, and metrics directly — no LLM needed."""
+    checks_run = []
+    findings = []
+
+    # 1. Service config
+    log("collector", "Reading service config...", "action")
+    config = deps.adapter.get_config()
+    config_preview = config.get("raw", "")[:2000]
+    deps.memory.save_context(
+        deps.session_id, "command_output", "service_config",
+        config.get("raw", ""), "current service config",
+    )
+    checks_run.append("service_config")
+    findings.append(f"Config path: {config.get('path', 'unknown')}")
+    deps.token_counter.tool_calls += 1
+    log("collector", f"Config loaded ({len(config.get('raw', ''))} chars)", "info")
+
+    # 2. Service logs
+    log("collector", "Fetching service logs...", "action")
+    logs = deps.adapter.get_logs(tail=50)
+    deps.memory.save_context(
+        deps.session_id, "log", "service_logs",
+        logs, "last 50 lines of service log",
+    )
+    checks_run.append("service_logs")
+    log_lines = len(logs.strip().splitlines()) if logs.strip() else 0
+    findings.append(f"Log lines retrieved: {log_lines}")
+    deps.token_counter.tool_calls += 1
+    log("collector", f"{log_lines} log lines retrieved", "info")
+
+    # 3. Live metrics
+    log("collector", "Collecting live metrics...", "action")
+    metrics = deps.adapter.get_metrics()
+    deps.memory.save_context(
+        deps.session_id, "metric", "live_metrics",
+        str(metrics), "live service metrics snapshot",
+    )
+    checks_run.append("live_metrics")
+    for k, v in metrics.items():
+        findings.append(f"{k}: {str(v)[:100]}")
+    deps.token_counter.tool_calls += 1
+    log("collector", f"{len(metrics)} metric groups collected", "info")
+
+    return CollectionOutput(
+        checks_run=checks_run,
+        findings=findings,
+        raw_summary=f"Collected config ({len(config_preview)} chars), "
+                    f"{log_lines} log lines, {len(metrics)} metric groups",
+    )

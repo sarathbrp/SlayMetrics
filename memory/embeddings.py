@@ -47,8 +47,7 @@ class LocalEmbeddings:
 
 
 def from_config(cfg: dict) -> EmbeddingProvider:
-    profile_name = cfg["llm"]["active_profile"]
-    profile = cfg["llm"]["profiles"][profile_name]
-    if profile["backend"] == "claude" and os.environ.get("ANTHROPIC_API_KEY"):
-        return ClaudeEmbeddings()
+    # Anthropic doesn't have an embeddings API.
+    # Use LocalEmbeddings by default — sufficient for keyword-based
+    # semantic search over our knowledge base and findings.
     return LocalEmbeddings()

@@ -17,30 +17,72 @@ class NginxAdapter(ServiceAdapter):
         result = self._ssh.execute(f"cat {self._cfg['config_path']}")
         return {"raw": result.stdout, "path": self._cfg["config_path"]}
 
+    # Which block each directive belongs in
+    MAIN_DIRECTIVES = {
+        "worker_processes", "worker_rlimit_nofile", "worker_priority",
+        "worker_cpu_affinity", "pid", "error_log",
+    }
+    EVENTS_DIRECTIVES = {
+        "worker_connections", "use", "multi_accept",
+    }
+    # Not a real directive — needs special handling
+    SKIP_DIRECTIVES = {"listen_backlog"}
+
     def apply_config(self, parameter: str, value: str) -> bool:
+        if parameter in self.SKIP_DIRECTIVES:
+            return False
+
         config_path = self._cfg["config_path"]
-        # Read current config
         current = self._ssh.execute(f"cat {config_path}").stdout
+        lines = current.splitlines()
 
-        # Build the new directive line
-        new_line = f"    {parameter} {value};"
-
-        # If directive exists anywhere — replace it
-        pattern = rf"^\s*{re.escape(parameter)}\s+[^;]+;"
-        if re.search(pattern, current, re.MULTILINE):
-            escaped_new = new_line.replace("/", r"\/").replace("&", r"\&")
-            sed_cmd = (
-                f"sed -i 's/^\\s*{parameter}\\s\\+[^;]*;/{escaped_new}/' {config_path}"
-            )
-            result = self._ssh.execute(sed_cmd)
+        # Determine block and indent
+        if parameter in self.MAIN_DIRECTIVES:
+            block = "main"
+            indent = ""
+        elif parameter in self.EVENTS_DIRECTIVES:
+            block = "events"
+            indent = "    "
         else:
-            # Insert inside first http { block
-            insert_cmd = (
-                f"sed -i '/^http {{/a\\{new_line}' {config_path}"
-            )
-            result = self._ssh.execute(insert_cmd)
+            block = "http"
+            indent = "    "
 
-        return result.ok
+        new_directive = f"{indent}{parameter} {value};"
+
+        # First: remove ALL existing occurrences of this directive (prevent duplicates)
+        pattern = re.compile(rf"^\s*{re.escape(parameter)}\s+[^;]*;", re.MULTILINE)
+        cleaned = [l for l in lines if not pattern.match(l)]
+
+        # Find insertion point based on block
+        insert_idx = None
+        if block == "main":
+            # Insert after the last main-level directive before events/http
+            for i, line in enumerate(cleaned):
+                if re.match(r"^(worker_processes|pid|error_log)\s", line):
+                    insert_idx = i + 1
+            if insert_idx is None:
+                insert_idx = 0
+        elif block == "events":
+            for i, line in enumerate(cleaned):
+                if re.match(r"^events\s*\{", line):
+                    insert_idx = i + 1
+                    break
+        else:  # http
+            for i, line in enumerate(cleaned):
+                if re.match(r"^http\s*\{", line):
+                    insert_idx = i + 1
+                    break
+
+        if insert_idx is not None:
+            cleaned.insert(insert_idx, new_directive)
+
+        # Write back
+        new_config = "\n".join(cleaned) + "\n"
+        # Use a temp file to avoid partial writes
+        self._ssh.execute(f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF")
+        self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
+
+        return True
 
     def benchmark(self, duration: int = 30, url: str = "") -> BenchmarkResult:
         target_url = url or self._bench_cfg.get("small_file_url", "http://localhost/")

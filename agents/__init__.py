@@ -14,14 +14,25 @@ class TokenCounter:
     tool_calls: int = 0
 
     def add(self, usage) -> None:
+        inp = 0
+        out = 0
         if hasattr(usage, "input_tokens"):
-            self.input_tokens += usage.input_tokens or 0
-            self.output_tokens += usage.output_tokens or 0
+            inp = usage.input_tokens or 0
+            out = usage.output_tokens or 0
+        elif hasattr(usage, "request_tokens"):
+            inp = usage.request_tokens or 0
+            out = usage.response_tokens or 0
+        self.input_tokens += inp
+        self.output_tokens += out
         self.tool_calls += 1
+        return inp, out
 
     @property
     def total(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    def summary(self) -> str:
+        return f"in={self.input_tokens:,} out={self.output_tokens:,} total={self.total:,} calls={self.tool_calls}"
 
 
 @dataclass

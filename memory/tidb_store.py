@@ -132,11 +132,26 @@ class TiDBStore:
                 )
             return cur.fetchall()
 
+    def get_all_fixes_for_host(self, host: str) -> list[dict]:
+        """Get all fixes across ALL sessions for a given host — cross-session learning."""
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT f.session_id, f.type, f.parameter, f.before_value,
+                       f.after_value, f.before_rps, f.after_rps,
+                       f.impact_pct, f.reasoning, f.status, f.created_at
+                FROM facts f
+                JOIN profile p ON f.session_id = p.session_id
+                WHERE p.host = %s AND f.type = 'fix'
+                ORDER BY f.created_at DESC
+            """, (host,))
+            return cur.fetchall()
+
     # ── Context ──────────────────────────────────────────────────────────────
 
     def save_context(self, session_id: str, type: str, source: str,
                      content: str, summary: str = "") -> str:
         cid = str(uuid.uuid4())
+        source = source[:250]  # VARCHAR(256) safety
         text = f"{source} {summary or content[:500]}"
         embedding = self._embedder.embed(text)
         with self._cursor() as cur:

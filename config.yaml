@@ -12,6 +12,11 @@ llm:
       model: claude-opus-4-6
       api_key_env: ANTHROPIC_API_KEY
 
+    claude-haiku:                      # fast + cheap, good enough for diagnosis
+      backend: claude
+      model: claude-haiku-4-5-20251001
+      api_key_env: ANTHROPIC_API_KEY
+
     ollama-local:                      # lightweight alternative, zero infra
       backend: ollama
       model: llama3.2
@@ -42,7 +47,7 @@ service:
     duration: 30
     threads: 4
     connections: 100
-    rate: 2000
+    rate: 150000
     small_file_url: "http://localhost/1kb.html"
     medium_file_url: "http://localhost/100kb.html"
     large_file_url: "http://localhost/1mb.html"
@@ -70,7 +75,7 @@ agent:
   max_iterations: 50                   # safety cap on hypothesis loop
   benchmark_after_every_fix: true
   stability:
-    enabled: true                      # run sustained stability test after all fixes
+    enabled: false                     # enable for final run (30 min test)
     duration_sec: 1800                 # 30 minutes total
     sample_interval_sec: 60            # one wrk2 run per minute
     url_key: small_file_url            # which payload to use for stability

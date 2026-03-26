@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS profile (
     session_id      VARCHAR(64)     NOT NULL,
     service         VARCHAR(64)     NOT NULL,
     host            VARCHAR(256)    NOT NULL,
-    rhel_version    VARCHAR(32),
+    rhel_version    VARCHAR(128),
     kernel_version  VARCHAR(64),
     cpu_cores       INT,
     ram_gb          INT,

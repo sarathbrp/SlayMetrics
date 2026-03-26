@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import subprocess
+from dataclasses import dataclass
 
 import paramiko
 
@@ -26,7 +27,45 @@ class SSHResult:
         return out
 
 
+class LocalClient:
+    """Direct subprocess execution — no SSH overhead for localhost."""
+
+    def __init__(self):
+        pass
+
+    def connect(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    def execute(self, command: str, timeout: int | None = None) -> SSHResult:
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=timeout or 120,
+            )
+            return SSHResult(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return SSHResult(stdout="", stderr="Command timed out", exit_code=124)
+
+    def execute_as(self, command: str, user: str = "root") -> SSHResult:
+        return self.execute(f"sudo -u {user} {command}")
+
+    def __enter__(self) -> LocalClient:
+        return self
+
+    def __exit__(self, *_) -> None:
+        pass
+
+
 class SSHClient:
+    """Paramiko SSH client for remote targets."""
+
     def __init__(self, host: str, user: str, key_path: str, timeout: int = 30):
         self.host = host
         self.user = user
@@ -74,10 +113,13 @@ class SSHClient:
         self.disconnect()
 
 
-def from_config(cfg: dict) -> SSHClient:
+def from_config(cfg: dict) -> LocalClient | SSHClient:
     t = cfg["target"]
+    host = t["host"]
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return LocalClient()
     return SSHClient(
-        host=t["host"],
+        host=host,
         user=t["ssh_user"],
         key_path=t["ssh_key"],
         timeout=t.get("ssh_timeout", 30),

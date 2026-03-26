@@ -16,15 +16,26 @@ Every decision is logged with the data and reasoning that drove it. No black box
 
 ### Prerequisites
 
-- Python 3.11+
-- TiDB v8.4+ (for memory/vector search)
-- SSH access to the target RHEL system
-- An LLM backend (local Granite via vLLM, Claude API, or Ollama)
+- RHEL 9.x / CentOS Stream 9+ system
+- Root access
+- An LLM backend (Claude API key, or local Granite via vLLM, or Ollama)
 
-### Setup
+### Automated Setup
+
+The setup script installs all dependencies (nginx, wrk2, TiDB, Python packages, system tools) and configures localhost SSH:
 
 ```bash
-# Install dependencies
+git clone https://github.com/sarathbrp/SlayMetrics.git /opt/slaymetrics
+cd /opt/slaymetrics
+chmod +x setup.sh
+sudo ./setup.sh
+```
+
+### Manual Setup
+
+If you prefer to install components individually:
+
+```bash
 pip install -r requirements.txt
 
 # Start TiDB (local single-node)

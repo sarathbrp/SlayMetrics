@@ -40,3 +40,4 @@ id_ed25519
 # Environment
 .env
 .env.*
+source_env

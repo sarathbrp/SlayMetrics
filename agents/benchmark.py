@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from pydantic import BaseModel
-from pydantic_ai import Agent, RunContext
 
 from agents import AgentDeps
 from adapters.base import BenchmarkResult as AdapterBenchmarkResult
+from core.log import log
 
 
 class BenchmarkOutput(BaseModel):
@@ -20,42 +20,33 @@ class BenchmarkOutput(BaseModel):
     summary: str = ""
 
 
-def build(model) -> Agent:
-    agent: Agent[AgentDeps, BenchmarkOutput] = Agent(
-        model,
-        deps_type=AgentDeps,
-        result_type=BenchmarkOutput,
-        system_prompt=(
-            "You are a benchmarking agent. Run the benchmark tool and return structured results. "
-            "Always include a one-sentence summary of what the numbers mean."
-        ),
-    )
-
-    @agent.tool
-    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30,
-                            url: str = "") -> dict:
-        """Run the service benchmark (wrk2/pgbench) and return raw metrics."""
-        result: AdapterBenchmarkResult = ctx.deps.adapter.benchmark(duration, url)
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id, "benchmark", url or "default",
-            str(result.__dict__),
-            f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms",
-        )
-        ctx.deps.token_counter.tool_calls += 1
-        return result.__dict__
-
-    return agent
-
-
 async def run(model, deps: AgentDeps, duration: int = 30,
               url: str = "") -> BenchmarkOutput:
-    agent = build(model)
+    """Run benchmark directly — no LLM needed for this step."""
     bench_cfg = deps.config["service"]["benchmark"]
     target_url = url or bench_cfg.get("small_file_url", "http://localhost/")
-    result = await agent.run(
-        f"Run benchmark for {duration}s against {target_url}. "
-        f"Return structured BenchmarkOutput.",
-        deps=deps,
+
+    log("benchmark", f"Running wrk2 for {duration}s against {target_url}", "action")
+    result: AdapterBenchmarkResult = deps.adapter.benchmark(duration, target_url)
+    log("benchmark", f"Result: {result.requests_per_sec:.1f} RPS, "
+        f"p99={result.latency_p99_ms:.1f}ms, CPU={result.cpu_pct:.1f}%", "result")
+
+    deps.memory.save_context(
+        deps.session_id, "benchmark", target_url,
+        str(result.__dict__),
+        f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms",
     )
-    deps.token_counter.add(result.usage())
-    return result.data
+    deps.token_counter.tool_calls += 1
+
+    return BenchmarkOutput(
+        requests_per_sec=result.requests_per_sec,
+        latency_p50_ms=result.latency_p50_ms,
+        latency_p99_ms=result.latency_p99_ms,
+        error_rate=result.error_rate,
+        duration_sec=result.duration_sec,
+        url=result.url,
+        payload_size=result.payload_size,
+        cpu_pct=result.cpu_pct,
+        mem_mb=result.mem_mb,
+        summary=f"RPS={result.requests_per_sec:.1f} p50={result.latency_p50_ms:.1f}ms p99={result.latency_p99_ms:.1f}ms",
+    )
