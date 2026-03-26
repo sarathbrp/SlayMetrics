@@ -6,7 +6,8 @@ from adapters.postgres import PostgresAdapter, _parse_pgbench
 from adapters.redis import RedisAdapter, _parse_redis_bench
 from core import decision_engine
 from memory.embeddings import LocalEmbeddings, from_config
-from tools.ssh import LocalClient, SSHClient, SSHResult, from_config as ssh_from_config
+from tools.ssh import LocalClient, SSHClient, SSHResult
+from tools.ssh import from_config as ssh_from_config
 
 
 class FakeSSH:
@@ -47,15 +48,29 @@ def test_load_adapter_constructs_named_adapter():
 def test_postgres_adapter_behaviors():
     ssh = FakeSSH(
         {
-            "psql -U postgres -c 'SHOW ALL;' 2>/dev/null || cat /etc/postgresql.conf": SSHResult("cfg", "", 0),
-            "sed -i 's/^#\\?max_connections\\s*=.*/max_connections = 200/' /etc/postgresql.conf": SSHResult("", "", 0),
-            "pgbench -c10 -j2 -T60 postgres 2>&1": SSHResult("tps = 123.4\nlatency average = 5.6 ms\n", "", 0),
-            'psql -U postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null': SSHResult("42", "", 0),
+            "psql -U postgres -c 'SHOW ALL;' 2>/dev/null || cat /etc/postgresql.conf": SSHResult(
+                "cfg", "", 0
+            ),
+            "sed -i 's/^#\\?max_connections\\s*=.*/max_connections = 200/' /etc/postgresql.conf": SSHResult(
+                "", "", 0
+            ),
+            "pgbench -c10 -j2 -T60 postgres 2>&1": SSHResult(
+                "tps = 123.4\nlatency average = 5.6 ms\n", "", 0
+            ),
+            'psql -U postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null': SSHResult(
+                "42", "", 0
+            ),
             "tail -10 /var/log/postgresql/postgresql.log": SSHResult("logline", "", 0),
             "systemctl reload postgresql.service": SSHResult("", "", 0),
         }
     )
-    cfg = {"service": {"config_path": "/etc/postgresql.conf", "systemd_unit": "postgresql.service", "benchmark": {"args": "-c10 -j2 -T60"}}}
+    cfg = {
+        "service": {
+            "config_path": "/etc/postgresql.conf",
+            "systemd_unit": "postgresql.service",
+            "benchmark": {"args": "-c10 -j2 -T60"},
+        }
+    }
     adapter = PostgresAdapter(cfg, ssh)
     assert adapter.get_config() == {"raw": "cfg", "path": "/etc/postgresql.conf"}
     assert adapter.apply_config("max_connections", "200") is True
@@ -88,7 +103,13 @@ def test_redis_adapter_behaviors():
             "systemctl reload redis.service": SSHResult("", "", 0),
         }
     )
-    cfg = {"service": {"config_path": "/etc/redis.conf", "systemd_unit": "redis.service", "log_path": "/var/log/redis/redis.log"}}
+    cfg = {
+        "service": {
+            "config_path": "/etc/redis.conf",
+            "systemd_unit": "redis.service",
+            "log_path": "/var/log/redis/redis.log",
+        }
+    }
     adapter = RedisAdapter(cfg, ssh)
     assert adapter.get_config()["raw"] == "cfg"
     assert adapter.apply_config("maxmemory", "1gb") is True
@@ -136,7 +157,16 @@ def test_ssh_result_and_client_selection(monkeypatch):
     assert str(SSHResult("out", "err", 1)) == "out\n[stderr]: err"
     assert str(SSHResult("", "err", 1)) == "err"
     assert isinstance(ssh_from_config({"target": {"host": "localhost"}}), LocalClient)
-    remote = ssh_from_config({"target": {"host": "1.2.3.4", "ssh_user": "root", "ssh_key": "~/.ssh/id", "ssh_timeout": 9}})
+    remote = ssh_from_config(
+        {
+            "target": {
+                "host": "1.2.3.4",
+                "ssh_user": "root",
+                "ssh_key": "~/.ssh/id",
+                "ssh_timeout": 9,
+            }
+        }
+    )
     assert isinstance(remote, SSHClient)
     assert remote.timeout == 9
 
@@ -150,6 +180,7 @@ def test_ssh_result_and_client_selection(monkeypatch):
 
     def boom(*args, **kwargs):
         import subprocess
+
         raise subprocess.TimeoutExpired("cmd", 1)
 
     monkeypatch.setattr("subprocess.run", boom)

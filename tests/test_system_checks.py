@@ -38,9 +38,16 @@ def test_run_all_and_check_variants():
     results = system_checks.run_all(
         ssh,
         [
-            "cpu_governor", "transparent_hugepages", "selinux_mode", "sysctl_net_params",
-            "irq_affinity", "filesystem_mount_options", "numa_topology",
-            "open_file_limits", "nic_offloading", "kernel_version",
+            "cpu_governor",
+            "transparent_hugepages",
+            "selinux_mode",
+            "sysctl_net_params",
+            "irq_affinity",
+            "filesystem_mount_options",
+            "numa_topology",
+            "open_file_limits",
+            "nic_offloading",
+            "kernel_version",
         ],
     )
     assert len(results) == 10

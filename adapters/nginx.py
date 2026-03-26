@@ -3,11 +3,29 @@ from __future__ import annotations
 import re
 
 from adapters.base import BenchmarkResult, ServiceAdapter
-from tools.ssh import SSHClient
+from tools.ssh import LocalClient, SSHClient
+
+HTTP_DIRECTIVES = {
+    "sendfile",
+    "tcp_nopush",
+    "tcp_nodelay",
+    "keepalive_timeout",
+    "keepalive_requests",
+    "open_file_cache",
+    "open_file_cache_valid",
+    "open_file_cache_min_uses",
+    "access_log",
+    "gzip",
+    "gzip_comp_level",
+    "gzip_types",
+    "reset_timedout_connection",
+    "lingering_close",
+    "lingering_timeout",
+}
 
 
 class NginxAdapter(ServiceAdapter):
-    def __init__(self, cfg: dict, ssh: SSHClient):
+    def __init__(self, cfg: dict, ssh: LocalClient | SSHClient):
         self._cfg = cfg["service"]
         self._bench_cfg = self._cfg["benchmark"]
         self._ssh = ssh
@@ -36,37 +54,25 @@ class NginxAdapter(ServiceAdapter):
         "server_name",
         "root",
     }
-    # Not real directives or need special handling — reject outright
-    SKIP_DIRECTIVES = {"listen_backlog"}
-    # Explicit set for agent-side batch validation.
-    ALLOWED_BATCH_DIRECTIVES = (
-        MAIN_DIRECTIVES
-        | EVENTS_DIRECTIVES
-        | {
-            "sendfile",
-            "tcp_nopush",
-            "tcp_nodelay",
-            "keepalive_timeout",
-            "keepalive_requests",
-            "open_file_cache",
-            "access_log",
-            "gzip",
-            "gzip_comp_level",
-            "gzip_types",
-            "reset_timedout_connection",
-            "lingering_close",
-            "lingering_timeout",
-            "listen_backlog",
-        }
-    )
+    # One source of truth for validation and placement.
+    DIRECTIVE_SPECS = {
+        **{name: {"context": "main", "indent": ""} for name in MAIN_DIRECTIVES},
+        **{name: {"context": "events", "indent": "    "} for name in EVENTS_DIRECTIVES},
+        **{name: {"context": "server", "indent": "    "} for name in SERVER_DIRECTIVES},
+        **{name: {"context": "http", "indent": "    "} for name in HTTP_DIRECTIVES},
+        "listen_backlog": {"context": "special", "indent": "    "},
+    }
+    ALLOWED_BATCH_DIRECTIVES = set(DIRECTIVE_SPECS)
 
     def apply_config(self, parameter: str, value: str) -> bool:
         # Handle listen_backlog specially — modifies existing listen directives
         if parameter == "listen_backlog":
             return self._set_listen_backlog(value)
-        if parameter in self.SKIP_DIRECTIVES:
+        spec = self.DIRECTIVE_SPECS.get(parameter)
+        if spec is None or spec["context"] == "special":
             return False
-        if parameter in self.SERVER_DIRECTIVES:
+        block = spec["context"]
+        if block == "server":
             return False  # server block directives need special handling
 
         config_path = self._cfg["config_path"]
@@ -76,47 +82,13 @@ class NginxAdapter(ServiceAdapter):
         # Backup before modifying
         self._ssh.execute(f"cp {config_path} {config_path}.bak")
 
-        # Determine block and indent
-        if parameter in self.MAIN_DIRECTIVES:
-            block = "main"
-            indent = ""
-        elif parameter in self.EVENTS_DIRECTIVES:
-            block = "events"
-            indent = "    "
-        else:
-            block = "http"
-            indent = "    "
-
-        new_directive = f"{indent}{parameter} {value};"
-
-        # First: remove ALL existing occurrences of this directive (prevent duplicates)
-        pattern = re.compile(rf"^\s*{re.escape(parameter)}\s+[^;]*;")
-        cleaned = [line for line in lines if not pattern.match(line)]
-
-        # Find insertion point based on block
-        insert_idx = None
-        if block == "main":
-            for i, line in enumerate(cleaned):
-                if re.match(r"^(worker_processes|pid|error_log)\s", line):
-                    insert_idx = i + 1
-            if insert_idx is None:
-                insert_idx = 0
-        elif block == "events":
-            for i, line in enumerate(cleaned):
-                if re.match(r"^events\s*\{", line):
-                    insert_idx = i + 1
-                    break
-        else:  # http
-            for i, line in enumerate(cleaned):
-                if re.match(r"^http\s*\{", line):
-                    insert_idx = i + 1
-                    break
-
-        if insert_idx is not None:
-            cleaned.insert(insert_idx, new_directive)
+        new_directive = f"{spec['indent']}{parameter} {value};"
+        updated = _upsert_directive_in_context(lines, parameter, new_directive, block)
+        if updated is None:
+            return False
 
         # Write to temp, test, then apply
-        new_config = "\n".join(cleaned) + "\n"
+        new_config = "\n".join(updated) + "\n"
         self._ssh.execute(
             f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
         )
@@ -306,6 +278,79 @@ def _rewrite_listen_backlog_line(line: str, backlog: str) -> str:
     if comment:
         rewritten = f"{rewritten} {comment}"
     return rewritten
+
+
+def _upsert_directive_in_context(
+    lines: list[str], parameter: str, new_directive: str, context: str
+) -> list[str] | None:
+    pattern = re.compile(rf"^\s*{re.escape(parameter)}\s+[^;]*;")
+    new_lines: list[str] = []
+    stack: list[str] = []
+    block_open_idx: int | None = None
+    seen = False
+
+    for line in lines:
+        stripped = line.strip()
+        current_scope = _scope_name(stack)
+
+        if current_scope == context and pattern.match(line):
+            if not seen:
+                new_lines.append(new_directive)
+                seen = True
+            continue
+
+        new_lines.append(line)
+
+        if context in {"http", "events"} and block_open_idx is None:
+            block_name = _block_open_name(stripped)
+            if block_name == context and current_scope == "main":
+                block_open_idx = len(new_lines) - 1
+
+        _update_block_stack(stack, stripped)
+
+    if seen:
+        return new_lines
+
+    if context == "main":
+        insert_idx = 0
+        for idx, line in enumerate(new_lines):
+            if re.match(r"^(worker_processes|pid|error_log)\s", line):
+                insert_idx = idx + 1
+        new_lines.insert(insert_idx, new_directive)
+        return new_lines
+
+    if block_open_idx is None:
+        return None
+
+    new_lines.insert(block_open_idx + 1, new_directive)
+    return new_lines
+
+
+def _scope_name(stack: list[str]) -> str:
+    if not stack:
+        return "main"
+    if stack == ["http"]:
+        return "http"
+    if stack == ["events"]:
+        return "events"
+    return stack[-1]
+
+
+def _block_open_name(stripped: str) -> str | None:
+    match = re.match(r"^(events|http|server|location)\b[^{;]*\{", stripped)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _update_block_stack(stack: list[str], stripped: str) -> None:
+    block_name = _block_open_name(stripped)
+    if block_name:
+        stack.append(block_name)
+
+    for _ in range(stripped.count("}")):
+        if stack:
+            stack.pop()
 
 
 def _parse_sar_avg(sar_output: str) -> float:

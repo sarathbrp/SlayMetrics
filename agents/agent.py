@@ -246,9 +246,11 @@ def build(model) -> Agent:
             return {"applied": [], "failed": [], "reload": "FAILED", "error": "invalid payload"}
         changes_dict = normalized_changes
         allowed = getattr(ctx.deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
+        unsupported: list[str] = []
         if allowed is not None:
             unsupported = [k for k in changes_dict if k not in allowed]
-            if unsupported:
+            changes_dict = {k: v for k, v in changes_dict.items() if k in allowed}
+            if unsupported and not changes_dict:
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
                 tool_call("apply_nginx", "unsupported directives")
                 tool_result("apply_nginx", f"FAILED: {error}")
@@ -263,7 +265,7 @@ def build(model) -> Agent:
         ctx.deps.ssh.execute(f"cp {config_path} {batch_backup}")
 
         applied = []
-        failed = []
+        failed = list(unsupported)
         for param, value in changes_dict.items():
             success = ctx.deps.adapter.apply_config(param, value)
             if success:
@@ -319,6 +321,8 @@ def build(model) -> Agent:
             "failed": failed,
             "reload": "OK" if reload_ok else "FAILED",
         }
+        if unsupported:
+            result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(

@@ -18,7 +18,13 @@ class FakeMemory:
 class FakeAdapter:
     def __init__(self):
         self.applied: list[tuple[str, str]] = []
-        self.ALLOWED_BATCH_DIRECTIVES = {"sendfile", "keepalive_requests", "tcp_nodelay"}
+        self.ALLOWED_BATCH_DIRECTIVES = {
+            "sendfile",
+            "keepalive_requests",
+            "tcp_nodelay",
+            "open_file_cache_valid",
+            "open_file_cache_min_uses",
+        }
 
     def apply_config(self, parameter: str, value: str) -> bool:
         self.applied.append((parameter, value))
@@ -106,15 +112,38 @@ def test_apply_nginx_tuning_rejects_unsupported_directives():
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
+    result = asyncio.run(tool(ctx, {"upstream_read_timeout": "5s", "sendfile": "on"}, "test"))
+
+    assert result["reload"] == "OK"
+    assert result["applied"] == ["sendfile"]
+    assert result["failed"] == ["upstream_read_timeout"]
+    assert "ignored unsupported nginx directives" in result["warning"]
+    assert ctx.deps.adapter.applied == [("sendfile", "on")]
+
+
+def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
+    agent = build(TestModel())
+    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    ctx = _ctx()
+
     result = asyncio.run(
-        tool(ctx, {"upstream_read_timeout": "5s", "sendfile": "on"}, "test")
+        tool(
+            ctx,
+            {
+                "open_file_cache_valid": "60s",
+                "upstream_read_timeout": "5s",
+                "sendfile": "on",
+            },
+            "test",
+        )
     )
 
-    assert result["reload"] == "FAILED"
-    assert result["applied"] == []
+    assert result["reload"] == "OK"
+    assert result["applied"] == ["open_file_cache_valid", "sendfile"]
     assert result["failed"] == ["upstream_read_timeout"]
-    assert "unsupported nginx directives" in result["error"]
-    assert ctx.deps.adapter.applied == []
+    assert "ignored unsupported nginx directives" in result["warning"]
+    assert ("open_file_cache_valid", "60s") in ctx.deps.adapter.applied
+    assert ("sendfile", "on") in ctx.deps.adapter.applied
 
 
 def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
@@ -137,9 +166,7 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
     agent = build(TestModel())
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
 
-    result = asyncio.run(
-        tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}, "test")
-    )
+    result = asyncio.run(tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}, "test"))
 
     assert result["reload"] == "FAILED"
     assert result["applied"] == ["sendfile"]

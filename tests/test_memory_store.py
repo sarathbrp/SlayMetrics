@@ -67,7 +67,9 @@ def test_tidb_store_methods(monkeypatch):
     conn.fetchone_queue.append({"session_id": "s1"})
     assert store.get_profile("s1") == {"session_id": "s1"}
 
-    fid = store.save_fact("s1", "fix", "param", "reason", before_value="a", after_value="b", impact_pct=1.5)
+    fid = store.save_fact(
+        "s1", "fix", "param", "reason", before_value="a", after_value="b", impact_pct=1.5
+    )
     assert isinstance(fid, str)
     conn.fetchall_queue.append([{"type": "fix"}])
     assert store.get_facts("s1", "fix") == [{"type": "fix"}]
@@ -93,16 +95,23 @@ def test_tidb_store_methods(monkeypatch):
     conn.fetchall_queue.append([{"name": "h1"}])
     assert store.get_queue("s1") == [{"name": "h1"}]
 
-    conn.fetchall_queue.append([
-        {"content": json.dumps({"input_tokens": 1}), "created_at": "now", "session_id": "s1"},
-        {"content": "bad", "created_at": "later", "session_id": "s2"},
-    ])
+    conn.fetchall_queue.append(
+        [
+            {"content": json.dumps({"input_tokens": 1}), "created_at": "now", "session_id": "s1"},
+            {"content": "bad", "created_at": "later", "session_id": "s2"},
+        ]
+    )
     hist = store.get_token_history()
     assert hist[0]["session_id"] == "s1"
 
     conn.fetchone_queue.append({"cnt": 1})
     assert store.session_exists("s1") is True
-    assert isinstance(from_config({"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, FakeEmbedder()), TiDBStore)
+    assert isinstance(
+        from_config(
+            {"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, FakeEmbedder()
+        ),
+        TiDBStore,
+    )
 
 
 def test_tidb_store_reconnects_when_connection_closed(monkeypatch):

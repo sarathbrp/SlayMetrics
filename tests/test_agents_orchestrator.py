@@ -6,8 +6,7 @@ from types import SimpleNamespace
 from pydantic_ai.models.test import TestModel
 
 from adapters.base import BenchmarkResult
-from agents import TokenCounter
-from agents import analyzer, benchmark, collector, remediation
+from agents import TokenCounter, analyzer, benchmark, collector, remediation
 from core import orchestrator
 from rhel.system_checks import CheckResult
 from tools.ssh import SSHResult
@@ -53,7 +52,9 @@ class FakeAdapter:
 
     def benchmark(self, duration=30, url=""):
         self.count += 1
-        return BenchmarkResult(100 + self.count, 1.0, 2.0, 0.0, duration, url=url, cpu_pct=10.0, mem_mb=20.0)
+        return BenchmarkResult(
+            100 + self.count, 1.0, 2.0, 0.0, duration, url=url, cpu_pct=10.0, mem_mb=20.0
+        )
 
     def get_config(self):
         return {"raw": "worker_processes auto;", "path": "/etc/nginx/nginx.conf"}
@@ -106,7 +107,14 @@ def _deps():
                 },
             },
             "rhel": {"checks": ["cpu_governor"]},
-            "agent": {"stability": {"enabled": True, "duration_sec": 2, "sample_interval_sec": 1, "url_key": "small_file_url"}},
+            "agent": {
+                "stability": {
+                    "enabled": True,
+                    "duration_sec": 2,
+                    "sample_interval_sec": 1,
+                    "url_key": "small_file_url",
+                }
+            },
         },
     )
 
@@ -131,8 +139,27 @@ def test_analyzer_tools_and_run(monkeypatch):
     assert asyncio.run(get_past_facts(ctx))[0]["parameter"] == "p"
     assert "output" in asyncio.run(run_diagnostic(ctx, "cmd", "why"))
 
-    fake_output = analyzer.AnalysisOutput(symptom="s", root_cause="r", confidence=0.5, hypothesis="h", recommended_action="a", reasoning="why")
-    monkeypatch.setattr(analyzer, "build", lambda model: SimpleNamespace(run=lambda prompt, deps: asyncio.sleep(0, result=SimpleNamespace(output=fake_output, usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=2)))))
+    fake_output = analyzer.AnalysisOutput(
+        symptom="s",
+        root_cause="r",
+        confidence=0.5,
+        hypothesis="h",
+        recommended_action="a",
+        reasoning="why",
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "build",
+        lambda model: SimpleNamespace(
+            run=lambda prompt, deps: asyncio.sleep(
+                0,
+                result=SimpleNamespace(
+                    output=fake_output,
+                    usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=2),
+                ),
+            )
+        ),
+    )
     result = asyncio.run(analyzer.run(None, deps, "h", "ctx"))
     assert result.hypothesis == "h"
 
@@ -141,26 +168,81 @@ def test_remediation_tools_and_run(monkeypatch):
     deps = _deps()
     agent = remediation.build(TestModel())
     ctx = SimpleNamespace(deps=deps)
-    assert asyncio.run(agent._function_toolset.tools["run_benchmark"].function(ctx, 1))["requests_per_sec"] > 0
-    assert asyncio.run(agent._function_toolset.tools["apply_config_change"].function(ctx, "sendfile", "on", "why")) is True
+    assert (
+        asyncio.run(agent._function_toolset.tools["run_benchmark"].function(ctx, 1))[
+            "requests_per_sec"
+        ]
+        > 0
+    )
+    assert (
+        asyncio.run(
+            agent._function_toolset.tools["apply_config_change"].function(
+                ctx, "sendfile", "on", "why"
+            )
+        )
+        is True
+    )
     assert asyncio.run(agent._function_toolset.tools["reload_service"].function(ctx, "why")) is True
-    assert "output" in asyncio.run(agent._function_toolset.tools["run_command"].function(ctx, "cmd", "why"))
+    assert "output" in asyncio.run(
+        agent._function_toolset.tools["run_command"].function(ctx, "cmd", "why")
+    )
 
-    fake_output = remediation.RemediationOutput(parameter="p", old_value="a", new_value="b", reasoning="why", success=True, before_rps=1, after_rps=2, impact_pct=100)
-    monkeypatch.setattr(remediation, "build", lambda model: SimpleNamespace(run=lambda prompt, deps: asyncio.sleep(0, result=SimpleNamespace(output=fake_output, usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=1)))))
+    fake_output = remediation.RemediationOutput(
+        parameter="p",
+        old_value="a",
+        new_value="b",
+        reasoning="why",
+        success=True,
+        before_rps=1,
+        after_rps=2,
+        impact_pct=100,
+    )
+    monkeypatch.setattr(
+        remediation,
+        "build",
+        lambda model: SimpleNamespace(
+            run=lambda prompt, deps: asyncio.sleep(
+                0,
+                result=SimpleNamespace(
+                    output=fake_output,
+                    usage=lambda: SimpleNamespace(input_tokens=1, output_tokens=1),
+                ),
+            )
+        ),
+    )
     result = asyncio.run(remediation.run(None, deps, "analysis", "action"))
     assert result.success is True
 
 
 def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
     deps = _deps()
-    monkeypatch.setattr(orchestrator.system_checks, "run_all", lambda ssh, checks: [CheckResult("cpu_governor", "ok", "ok", "")])
+    monkeypatch.setattr(
+        orchestrator.system_checks,
+        "run_all",
+        lambda ssh, checks: [CheckResult("cpu_governor", "ok", "ok", "")],
+    )
     diagnosis = SimpleNamespace(summary="done", fixes_applied=[{"after_rps": 150}])
-    monkeypatch.setattr(orchestrator.diagnosis_agent, "run", lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis))
-    monkeypatch.setattr(orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md"))
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run",
+        lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
+    )
+    monkeypatch.setattr(
+        orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
+    )
     for name in ["panel", "step", "check", "status", "benchmark", "log"]:
         monkeypatch.setattr(orchestrator.logger, name, lambda *a, **k: None)
     report = asyncio.run(orchestrator.run("model", deps))
     assert report.endswith("report.md")
-    prompt = orchestrator._build_context_prompt("RHEL", "6.0", 8, 16, ["- x"], {"small": {"rps": 1.0, "p50": 1.0, "p99": 2.0, "cpu_pct": 3.0, "error_rate": 0.0}}, "cfg", ["k"], [{"parameter": "p", "value": "v", "impact": 1.0}])
+    prompt = orchestrator._build_context_prompt(
+        "RHEL",
+        "6.0",
+        8,
+        16,
+        ["- x"],
+        {"small": {"rps": 1.0, "p50": 1.0, "p99": 2.0, "cpu_pct": 3.0, "error_rate": 0.0}},
+        "cfg",
+        ["k"],
+        [{"parameter": "p", "value": "v", "impact": 1.0}],
+    )
     assert "Already Applied" in prompt

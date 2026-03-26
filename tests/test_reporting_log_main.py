@@ -7,11 +7,11 @@ from types import SimpleNamespace
 
 import yaml
 
+import main
 from agents import TokenCounter
 from core import log as logger
 from core.reporter import _clean, generate
 from memory.embeddings import ClaudeEmbeddings
-import main
 
 
 class FakeConsole:
@@ -31,7 +31,18 @@ class FakeMemory:
         return {"service": "nginx", "host": "localhost", "baseline_rps": 100, "best_rps": 120}
 
     def get_facts(self, session_id):
-        return [{"type": "fix", "parameter": "p", "before_value": "a", "after_value": "b", "before_rps": 100, "after_rps": 120, "impact_pct": 20, "reasoning": "why"}]
+        return [
+            {
+                "type": "fix",
+                "parameter": "p",
+                "before_value": "a",
+                "after_value": "b",
+                "before_rps": 100,
+                "after_rps": 120,
+                "impact_pct": 20,
+                "reasoning": "why",
+            }
+        ]
 
     def get_queue(self, session_id):
         return [{"name": "h1", "priority": 1, "status": "done", "outcome": "ok"}]
@@ -53,7 +64,25 @@ def test_reporter_generate_and_clean(tmp_path):
     memory = FakeMemory()
     tc = TokenCounter(input_tokens=10, output_tokens=5, tool_calls=2)
     tc.add_tool_tokens("inspect", calls=1, call_input=2, call_output=1, post_input=3, post_output=1)
-    path = generate("s1", memory, tc, output_dir=str(tmp_path), baselines={"small": {"rps": 100, "p99": 1, "cpu_pct": 1, "mem_mb": 1}}, finals={"small": {"rps": 120, "p99": 1, "cpu_pct": 2, "mem_mb": 2}}, throughput={"nic_speed": "1g", "disk_write": "100MB/s", "small_throughput_mb_s": 10}, token_history=[{"session_id": "s1", "created_at": "2024-01-01T00:00:00", "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "tool_calls": 4}])
+    path = generate(
+        "s1",
+        memory,
+        tc,
+        output_dir=str(tmp_path),
+        baselines={"small": {"rps": 100, "p99": 1, "cpu_pct": 1, "mem_mb": 1}},
+        finals={"small": {"rps": 120, "p99": 1, "cpu_pct": 2, "mem_mb": 2}},
+        throughput={"nic_speed": "1g", "disk_write": "100MB/s", "small_throughput_mb_s": 10},
+        token_history=[
+            {
+                "session_id": "s1",
+                "created_at": "2024-01-01T00:00:00",
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+                "tool_calls": 4,
+            }
+        ],
+    )
     assert Path(path).exists()
     md = Path(path).read_text()
     assert "Token Attribution by Tool" in md
@@ -66,7 +95,20 @@ def test_reporter_generate_and_clean(tmp_path):
             return []
 
     tc2 = TokenCounter()
-    path2 = generate("s2", EmptyMemory(), tc2, output_dir=str(tmp_path), stability={"duration_sec": 60, "sample_count": 1, "mean_rps": 1.0, "stdev_rps": 0.0, "cv_pct": 0.0, "samples": [1.0]})
+    path2 = generate(
+        "s2",
+        EmptyMemory(),
+        tc2,
+        output_dir=str(tmp_path),
+        stability={
+            "duration_sec": 60,
+            "sample_count": 1,
+            "mean_rps": 1.0,
+            "stdev_rps": 0.0,
+            "cv_pct": 0.0,
+            "samples": [1.0],
+        },
+    )
     assert "No fixes were applied." in Path(path2).read_text()
 
 
@@ -121,39 +163,75 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
             return [1.0]
 
     class Cur:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def execute(self, *a, **k): pass
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            pass
 
     class Conn:
-        def cursor(self): return Cur()
-        def close(self): pass
+        def cursor(self):
+            return Cur()
+
+        def close(self):
+            pass
 
     monkeypatch.setattr("pymysql.connect", lambda **kwargs: Conn())
-    main.load_knowledge({"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, Embedder(), object())
+    main.load_knowledge(
+        {"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, Embedder(), object()
+    )
     assert (facts_dir / ".loaded_hash").exists()
 
-    cfg = {"llm": {"active_profile": "v", "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}}}, "target": {"host": "localhost"}, "service": {"name": "nginx"}}
-    monkeypatch.setitem(main.sys.modules, "pydantic_ai.models.openai", SimpleNamespace(OpenAIChatModel=lambda model, provider: ("model", model, provider)))
-    monkeypatch.setitem(main.sys.modules, "pydantic_ai.providers.openai", SimpleNamespace(OpenAIProvider=lambda base_url, api_key: ("provider", base_url, api_key)))
-    monkeypatch.setitem(main.sys.modules, "pydantic_ai.models.anthropic", SimpleNamespace(AnthropicModel=lambda model: ("anthropic", model)))
+    cfg = {
+        "llm": {
+            "active_profile": "v",
+            "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}},
+        },
+        "target": {"host": "localhost"},
+        "service": {"name": "nginx"},
+    }
+    monkeypatch.setitem(
+        main.sys.modules,
+        "pydantic_ai.models.openai",
+        SimpleNamespace(OpenAIChatModel=lambda model, provider: ("model", model, provider)),
+    )
+    monkeypatch.setitem(
+        main.sys.modules,
+        "pydantic_ai.providers.openai",
+        SimpleNamespace(OpenAIProvider=lambda base_url, api_key: ("provider", base_url, api_key)),
+    )
+    monkeypatch.setitem(
+        main.sys.modules,
+        "pydantic_ai.models.anthropic",
+        SimpleNamespace(AnthropicModel=lambda model: ("anthropic", model)),
+    )
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
     assert main.get_model(cfg)[0] == "model"
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     try:
-        main.get_model({"llm": {"active_profile": "c", "profiles": {"c": {"backend": "claude", "model": "m"}}}})
+        main.get_model(
+            {"llm": {"active_profile": "c", "profiles": {"c": {"backend": "claude", "model": "m"}}}}
+        )
         assert False
     except SystemExit:
         pass
     try:
-        main.get_model({"llm": {"active_profile": "x", "profiles": {"x": {"backend": "bad", "model": "m"}}}})
+        main.get_model(
+            {"llm": {"active_profile": "x", "profiles": {"x": {"backend": "bad", "model": "m"}}}}
+        )
         assert False
     except SystemExit:
         pass
 
     cfg_main = {
-        "llm": {"active_profile": "v", "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}}},
+        "llm": {
+            "active_profile": "v",
+            "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}},
+        },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
     }
@@ -171,7 +249,11 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(main.logger, "status", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "close", lambda: None)
-    monkeypatch.setitem(main.sys.modules, "core.orchestrator", SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")))
+    monkeypatch.setitem(
+        main.sys.modules,
+        "core.orchestrator",
+        SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
+    )
     asyncio.run(main.main("cfg.yaml", None, False))
     assert fake_memory.created is True
 
@@ -186,7 +268,9 @@ def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):
     (facts_dir / ".loaded_hash").write_text(current_hash)
     calls = []
     monkeypatch.setattr(main.logger, "status", lambda *a, **k: calls.append(a))
-    main.load_knowledge({"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, object(), object())
+    main.load_knowledge(
+        {"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, object(), object()
+    )
     assert any("unchanged, skipping load" in args[1] for args in calls if len(args) > 1)
 
 

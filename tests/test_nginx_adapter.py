@@ -78,13 +78,7 @@ def test_set_listen_backlog_updates_and_adds_only_in_server_block():
 
 
 def test_set_listen_backlog_is_idempotent():
-    initial = (
-        "http {\n"
-        "    server {\n"
-        "        listen 80;\n"
-        "    }\n"
-        "}\n"
-    )
+    initial = "http {\n    server {\n        listen 80;\n    }\n}\n"
     ssh = FakeSSH(initial, nginx_test_ok=True)
     adapter = _build_adapter(ssh)
 
@@ -97,15 +91,50 @@ def test_set_listen_backlog_is_idempotent():
 
 
 def test_set_listen_backlog_rolls_back_on_invalid_nginx_config():
-    initial = (
-        "http {\n"
-        "    server {\n"
-        "        listen 80;\n"
-        "    }\n"
-        "}\n"
-    )
+    initial = "http {\n    server {\n        listen 80;\n    }\n}\n"
     ssh = FakeSSH(initial, nginx_test_ok=False)
     adapter = _build_adapter(ssh)
 
     assert adapter._set_listen_backlog("1024") is False
     assert ssh.files["/etc/nginx/nginx.conf"] == initial
+
+
+def test_apply_config_supports_open_file_cache_related_http_directives():
+    initial = "http {\n    sendfile on;\n}\n"
+    ssh = FakeSSH(initial, nginx_test_ok=True)
+    adapter = _build_adapter(ssh)
+
+    assert adapter.apply_config("open_file_cache_valid", "60s") is True
+    assert adapter.apply_config("open_file_cache_min_uses", "2") is True
+
+    final = ssh.files["/etc/nginx/nginx.conf"]
+    assert "    open_file_cache_valid 60s;" in final
+    assert "    open_file_cache_min_uses 2;" in final
+
+
+def test_apply_config_only_rewrites_http_level_directive_and_preserves_server_override():
+    initial = (
+        "http {\n"
+        "    sendfile on;\n"
+        "    server {\n"
+        "        sendfile off;\n"
+        "    }\n"
+        "}\n"
+    )
+    ssh = FakeSSH(initial, nginx_test_ok=True)
+    adapter = _build_adapter(ssh)
+
+    assert adapter.apply_config("sendfile", "off") is True
+
+    final = ssh.files["/etc/nginx/nginx.conf"]
+    assert final.count("sendfile off;") == 2
+    assert "    sendfile off;" in final
+    assert "        sendfile off;" in final
+
+
+def test_apply_config_returns_false_when_target_context_block_is_missing():
+    initial = "worker_processes auto;\n"
+    ssh = FakeSSH(initial, nginx_test_ok=True)
+    adapter = _build_adapter(ssh)
+
+    assert adapter.apply_config("sendfile", "on") is False
