@@ -8,12 +8,17 @@ from agents import TokenCounter
 from memory.tidb_store import TiDBStore
 
 
-def generate(session_id: str, memory: TiDBStore,
-             token_counter: TokenCounter, output_dir: str = "report",
-             baselines: dict | None = None, finals: dict | None = None,
-             stability: dict | None = None,
-             throughput: dict | None = None,
-             token_history: list | None = None) -> str:
+def generate(
+    session_id: str,
+    memory: TiDBStore,
+    token_counter: TokenCounter,
+    output_dir: str = "report",
+    baselines: dict | None = None,
+    finals: dict | None = None,
+    stability: dict | None = None,
+    throughput: dict | None = None,
+    token_history: list | None = None,
+) -> str:
     os.makedirs(output_dir, exist_ok=True)
 
     profile = memory.get_profile(session_id) or {}
@@ -26,15 +31,25 @@ def generate(session_id: str, memory: TiDBStore,
 
     baseline_rps = profile.get("baseline_rps", 0.0) or 0.0
     best_rps = profile.get("best_rps", 0.0) or 0.0
-    total_improvement = (
-        ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
-    )
+    total_improvement = ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
 
     # ── Markdown report ──────────────────────────────────────────────────────
-    md = _md_report(profile, fixes, findings, negatives, queue,
-                    baseline_rps, best_rps, total_improvement, token_counter,
-                    baselines=baselines, finals=finals, stability=stability,
-                    throughput=throughput, token_history=token_history)
+    md = _md_report(
+        profile,
+        fixes,
+        findings,
+        negatives,
+        queue,
+        baseline_rps,
+        best_rps,
+        total_improvement,
+        token_counter,
+        baselines=baselines,
+        finals=finals,
+        stability=stability,
+        throughput=throughput,
+        token_history=token_history,
+    )
 
     # ── JSON report ──────────────────────────────────────────────────────────
     report_data = {
@@ -57,6 +72,7 @@ def generate(session_id: str, memory: TiDBStore,
             "output": token_counter.output_tokens,
             "total": token_counter.total,
             "tool_calls": token_counter.tool_calls,
+            "by_tool": token_counter.tool_token_rows(),
         },
     }
 
@@ -80,10 +96,22 @@ def generate(session_id: str, memory: TiDBStore,
     return md_path
 
 
-def _md_report(profile, fixes, findings, negatives, queue,
-               baseline_rps, best_rps, total_improvement, token_counter,
-               baselines=None, finals=None, stability=None,
-               throughput=None, token_history=None) -> str:
+def _md_report(
+    profile,
+    fixes,
+    findings,
+    negatives,
+    queue,
+    baseline_rps,
+    best_rps,
+    total_improvement,
+    token_counter,
+    baselines=None,
+    finals=None,
+    stability=None,
+    throughput=None,
+    token_history=None,
+) -> str:
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     service = profile.get("service", "unknown")
     host = profile.get("host", "unknown")
@@ -147,7 +175,10 @@ def _md_report(profile, fixes, findings, negatives, queue,
         lines += [
             "## Resource Usage During Benchmarks",
             "",
-            "| Payload | Baseline CPU% | Baseline Mem MB | Final CPU% | Final Mem MB | CPU Change |",
+            (
+                "| Payload | Baseline CPU% | Baseline Mem MB | Final CPU% "
+                "| Final Mem MB | CPU Change |"
+            ),
             "|---------|--------------|----------------|-----------|-------------|------------|",
         ]
         for size in ["small", "medium", "large"]:
@@ -193,15 +224,14 @@ def _md_report(profile, fixes, findings, negatives, queue,
                     bottleneck = "Network throughput"
                 else:
                     bottleneck = "Application tuning"
-                lines.append(
-                    f"| {size} | {f_rps:.0f} | {tp:.0f} MB/s | {bottleneck} |"
-                )
+                lines.append(f"| {size} | {f_rps:.0f} | {tp:.0f} MB/s | {bottleneck} |")
             lines += [
                 "",
                 "**Note:** Medium and large file performance is typically bounded by hardware "
                 "(NIC bandwidth, memory bus, disk I/O) rather than software configuration. "
                 "Small file performance benefits most from nginx/kernel tuning because "
-                "per-request overhead (syscalls, connection handling) dominates over data transfer.",
+                "per-request overhead (syscalls, connection handling) dominates over "
+                "data transfer.",
                 "",
                 "---",
                 "",
@@ -291,6 +321,22 @@ def _md_report(profile, fixes, findings, negatives, queue,
         f"| Tool calls | {token_counter.tool_calls:,} |",
         "",
     ]
+
+    by_tool = token_counter.tool_token_rows()
+    if by_tool:
+        lines += [
+            "### Token Attribution by Tool",
+            "",
+            "| Tool | Calls | Call In | Call Out | Post In | Post Out | Total |",
+            "|------|------:|--------:|---------:|--------:|---------:|------:|",
+        ]
+        for row in by_tool:
+            lines.append(
+                f"| `{row['tool']}` | {row['calls']} | {row['call_input_tokens']:,} | "
+                f"{row['call_output_tokens']:,} | {row['post_input_tokens']:,} | "
+                f"{row['post_output_tokens']:,} | **{row['total_tokens']:,}** |"
+            )
+        lines += ["", "---", ""]
 
     # ── Token History (across sessions) ──────────────────────────────────────
     if token_history:

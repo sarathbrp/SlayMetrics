@@ -10,12 +10,12 @@ llm:
     claude-remote:                     # best reasoning, requires API key
       backend: claude
       model: claude-opus-4-6
-      api_key_env: ANTHROPIC_API_KEY
+      api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
 
     claude-haiku:                      # fast + cheap, good enough for diagnosis
       backend: claude
       model: claude-haiku-4-5-20251001
-      api_key_env: ANTHROPIC_API_KEY
+      api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
 
     ollama-local:                      # lightweight alternative, zero infra
       backend: ollama
@@ -28,7 +28,7 @@ memory:
   port: 4000
   database: perfagent
   user: root
-  password_env: TIDB_PASSWORD          # leave unset for local tiup playground
+  password_env: TIDB_PASSWORD          # pragma: allowlist secret
 
 target:
   host: 192.168.1.100

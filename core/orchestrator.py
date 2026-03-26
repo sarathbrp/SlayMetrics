@@ -18,9 +18,10 @@ async def run(model, deps: AgentDeps) -> str:
     session_id = deps.session_id
     memory = deps.memory
 
-    logger.panel("SlayMetricsAgent",
-                 f"Session: {session_id}\n"
-                 f"Service: {cfg['service']['name']} on {cfg['target']['host']}")
+    logger.panel(
+        "SlayMetricsAgent",
+        f"Session: {session_id}\nService: {cfg['service']['name']} on {cfg['target']['host']}",
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1: RHEL system checks (direct — no LLM)
@@ -30,10 +31,10 @@ async def run(model, deps: AgentDeps) -> str:
     checks_summary = []
     for chk in checks:
         logger.check(chk.name, chk.value, chk.status, chk.recommendation)
-        memory.save_context(session_id, "system_check", chk.name,
-                            chk.value, chk.recommendation)
-        checks_summary.append(f"- {chk.name}: {chk.value[:100]} "
-                              f"[{chk.status}] {chk.recommendation[:100]}")
+        memory.save_context(session_id, "system_check", chk.name, chk.value, chk.recommendation)
+        checks_summary.append(
+            f"- {chk.name}: {chk.value[:100]} [{chk.status}] {chk.recommendation[:100]}"
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1.5: System fingerprint (direct — no LLM)
@@ -46,13 +47,17 @@ async def run(model, deps: AgentDeps) -> str:
     ram_kb = ssh.execute("grep MemTotal /proc/meminfo | awk '{print $2}'").stdout.strip()
     ram_gb = int(ram_kb) // (1024 * 1024) if ram_kb.isdigit() else 0
 
-    memory.update_profile(session_id,
-                          rhel_version=rhel_ver[:64],
-                          kernel_version=kernel_ver[:64],
-                          cpu_cores=cpu_cores,
-                          ram_gb=ram_gb)
-    logger.status("system", f"RHEL: {rhel_ver}, Kernel: {kernel_ver}, "
-                  f"CPU: {cpu_cores} cores, RAM: {ram_gb} GB")
+    memory.update_profile(
+        session_id,
+        rhel_version=rhel_ver[:64],
+        kernel_version=kernel_ver[:64],
+        cpu_cores=cpu_cores,
+        ram_gb=ram_gb,
+    )
+    logger.status(
+        "system",
+        f"RHEL: {rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB",
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 2: Baseline benchmarks — all 3 sizes (direct wrk2 — no LLM)
@@ -66,7 +71,8 @@ async def run(model, deps: AgentDeps) -> str:
         if not url:
             continue
         result = deps.adapter.benchmark(
-            duration=bench_cfg.get("duration", 30), url=url,
+            duration=bench_cfg.get("duration", 30),
+            url=url,
         )
         baselines[size] = {
             "rps": result.requests_per_sec,
@@ -77,11 +83,20 @@ async def run(model, deps: AgentDeps) -> str:
             "error_rate": result.error_rate,
             "url": url,
         }
-        logger.benchmark(f"Baseline ({size})", result.requests_per_sec,
-                         result.latency_p99_ms, result.cpu_pct, result.mem_mb)
-        memory.save_context(session_id, "benchmark", f"baseline_{size}",
-                            json.dumps(baselines[size]),
-                            f"Baseline {size}: {result.requests_per_sec:.1f} RPS")
+        logger.benchmark(
+            f"Baseline ({size})",
+            result.requests_per_sec,
+            result.latency_p99_ms,
+            result.cpu_pct,
+            result.mem_mb,
+        )
+        memory.save_context(
+            session_id,
+            "benchmark",
+            f"baseline_{size}",
+            json.dumps(baselines[size]),
+            f"Baseline {size}: {result.requests_per_sec:.1f} RPS",
+        )
 
     baseline_rps = baselines.get("small", {}).get("rps", 0)
     memory.update_profile(session_id, baseline_rps=baseline_rps, best_rps=baseline_rps)
@@ -92,9 +107,12 @@ async def run(model, deps: AgentDeps) -> str:
     logger.step("Step 3: Collecting service configuration...")
     config_data = deps.adapter.get_config()
     nginx_config = config_data.get("raw", "")
-    memory.save_context(session_id, "command_output", "service_config",
-                        nginx_config, "current service config")
-    logger.status("collector", f"Config: {config_data.get('path', 'unknown')} ({len(nginx_config)} chars)")
+    memory.save_context(
+        session_id, "command_output", "service_config", nginx_config, "current service config"
+    )
+    logger.status(
+        "collector", f"Config: {config_data.get('path', 'unknown')} ({len(nginx_config)} chars)"
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 4a: Check context — previously applied fixes (TiDB — no LLM)
@@ -110,16 +128,19 @@ async def run(model, deps: AgentDeps) -> str:
         param = f.get("parameter", "")
         if param and param not in seen_params:
             seen_params.add(param)
-            prior_fixes.append({
-                "parameter": param,
-                "value": f.get("after_value", ""),
-                "impact": f.get("impact_pct", 0),
-            })
+            prior_fixes.append(
+                {
+                    "parameter": param,
+                    "value": f.get("after_value", ""),
+                    "impact": f.get("impact_pct", 0),
+                }
+            )
 
     if prior_fixes:
         for pf in prior_fixes:
-            logger.status("context", f"  Prior fix: {pf['parameter']} = {pf['value']} "
-                          f"({pf['impact']:+.1f}%)")
+            logger.status(
+                "context", f"  Prior fix: {pf['parameter']} = {pf['value']} ({pf['impact']:+.1f}%)"
+            )
     else:
         logger.status("context", "No prior fixes found — fresh diagnosis")
 
@@ -186,7 +207,8 @@ async def run(model, deps: AgentDeps) -> str:
         if not url:
             continue
         result = deps.adapter.benchmark(
-            duration=bench_cfg.get("duration", 30), url=url,
+            duration=bench_cfg.get("duration", 30),
+            url=url,
         )
         finals[size] = {
             "rps": result.requests_per_sec,
@@ -196,8 +218,13 @@ async def run(model, deps: AgentDeps) -> str:
             "mem_mb": result.mem_mb,
             "url": url,
         }
-        logger.benchmark(f"Final ({size})", result.requests_per_sec,
-                         result.latency_p99_ms, result.cpu_pct, result.mem_mb)
+        logger.benchmark(
+            f"Final ({size})",
+            result.requests_per_sec,
+            result.latency_p99_ms,
+            result.cpu_pct,
+            result.mem_mb,
+        )
 
     # Update best_rps from actual final benchmarks
     final_small_rps = finals.get("small", {}).get("rps", 0)
@@ -210,18 +237,23 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     # Capture system throughput limits silently (for report only)
     throughput_info = {}
-    r = ssh.execute("ethtool ens3 2>/dev/null | grep Speed || "
-                    "cat /sys/class/net/$(ip route | awk '/default/{print $5}')/speed 2>/dev/null")
-    throughput_info["nic_speed"] = r.stdout.strip()[:50]
-    r = ssh.execute("dd if=/dev/zero of=/tmp/disktest bs=1M count=256 oflag=direct 2>&1 | tail -1")
-    throughput_info["disk_write"] = r.stdout.strip()[:80]
+    nic_result = ssh.execute(
+        "ethtool ens3 2>/dev/null | grep Speed || "
+        "cat /sys/class/net/$(ip route | awk '/default/{print $5}')/speed 2>/dev/null"
+    )
+    throughput_info["nic_speed"] = nic_result.stdout.strip()[:50]
+    disk_result = ssh.execute(
+        "dd if=/dev/zero of=/tmp/disktest bs=1M count=256 oflag=direct 2>&1 | tail -1"
+    )
+    throughput_info["disk_write"] = disk_result.stdout.strip()[:80]
     ssh.execute("rm -f /tmp/disktest")
     for size in PAYLOAD_SIZES:
         data = finals.get(size, {})
         rps = data.get("rps", 0)
         file_sizes = {"small": 1, "medium": 100, "large": 1024}
         throughput_info[f"{size}_throughput_mb_s"] = round(
-            (rps * file_sizes.get(size, 1)) / 1024, 1)
+            (rps * file_sizes.get(size, 1)) / 1024, 1
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 7: Stability test (direct wrk2 loop — no LLM)
@@ -236,15 +268,18 @@ async def run(model, deps: AgentDeps) -> str:
         stability_url = bench_cfg.get(url_key, "http://localhost/")
         num_samples = total_duration // interval
 
-        logger.step(f"Step 7: Running {total_duration // 60}-minute stability test "
-                    f"({num_samples} samples)...")
+        logger.step(
+            f"Step 7: Running {total_duration // 60}-minute stability test "
+            f"({num_samples} samples)..."
+        )
         samples = []
 
         for i in range(num_samples):
             result = deps.adapter.benchmark(duration=interval, url=stability_url)
             samples.append(result.requests_per_sec)
-            logger.status("stability", f"Sample {i + 1}/{num_samples}: "
-                          f"{result.requests_per_sec:.1f} RPS")
+            logger.status(
+                "stability", f"Sample {i + 1}/{num_samples}: {result.requests_per_sec:.1f} RPS"
+            )
 
         mean_rps = statistics.mean(samples)
         stdev_rps = statistics.stdev(samples) if len(samples) > 1 else 0.0
@@ -258,11 +293,16 @@ async def run(model, deps: AgentDeps) -> str:
             "duration_sec": total_duration,
             "sample_count": num_samples,
         }
-        memory.save_context(session_id, "benchmark", "stability_test",
-                            json.dumps(stability_data),
-                            f"Stability: mean={mean_rps:.1f} stdev={stdev_rps:.1f} CV={cv:.1f}%")
-        logger.status("stability", f"Result: mean={mean_rps:.1f}  "
-                      f"stdev={stdev_rps:.1f}  CV={cv:.1f}%")
+        memory.save_context(
+            session_id,
+            "benchmark",
+            "stability_test",
+            json.dumps(stability_data),
+            f"Stability: mean={mean_rps:.1f} stdev={stdev_rps:.1f} CV={cv:.1f}%",
+        )
+        logger.status(
+            "stability", f"Result: mean={mean_rps:.1f}  stdev={stdev_rps:.1f}  CV={cv:.1f}%"
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8: Generate report (template — no LLM)
@@ -271,45 +311,63 @@ async def run(model, deps: AgentDeps) -> str:
 
     # Save token usage to context for cross-session tracking
     tc = deps.token_counter
-    memory.save_context(session_id, "metric", "token_usage",
-                        json.dumps({
-                            "input_tokens": tc.input_tokens,
-                            "output_tokens": tc.output_tokens,
-                            "total_tokens": tc.total,
-                            "tool_calls": tc.tool_calls,
-                            "session_id": session_id,
-                        }),
-                        f"Tokens: in={tc.input_tokens:,} out={tc.output_tokens:,} "
-                        f"total={tc.total:,} calls={tc.tool_calls}")
+    memory.save_context(
+        session_id,
+        "metric",
+        "token_usage",
+        json.dumps(
+            {
+                "input_tokens": tc.input_tokens,
+                "output_tokens": tc.output_tokens,
+                "total_tokens": tc.total,
+                "tool_calls": tc.tool_calls,
+                "session_id": session_id,
+            }
+        ),
+        f"Tokens: in={tc.input_tokens:,} out={tc.output_tokens:,} "
+        f"total={tc.total:,} calls={tc.tool_calls}",
+    )
 
     memory.update_profile(session_id, status="completed")
 
     token_history = memory.get_token_history()
 
     report_path = reporter.generate(
-        session_id, memory, deps.token_counter,
-        baselines=baselines, finals=finals, stability=stability_data,
-        throughput=throughput_info, token_history=token_history,
+        session_id,
+        memory,
+        deps.token_counter,
+        baselines=baselines,
+        finals=finals,
+        stability=stability_data,
+        throughput=throughput_info,
+        token_history=token_history,
     )
 
-    total_improvement = (
-        ((best_rps - baseline_rps) / baseline_rps * 100)
-        if baseline_rps else 0.0
+    total_improvement = ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
+    logger.panel(
+        "SlayMetricsAgent Complete",
+        f"Baseline (small): {baseline_rps:.1f} req/sec\n"
+        f"Best (small):     {best_rps:.1f} req/sec\n"
+        f"Improvement: {total_improvement:+.1f}%\n"
+        f"Fixes applied: {len(diagnosis.fixes_applied)}\n"
+        f"Tokens used: {deps.token_counter.summary()}\n"
+        f"Report: {report_path}\n"
+        f"Log: report/log_*_{session_id}.md",
     )
-    logger.panel("SlayMetricsAgent Complete",
-                 f"Baseline (small): {baseline_rps:.1f} req/sec\n"
-                 f"Best (small):     {best_rps:.1f} req/sec\n"
-                 f"Improvement: {total_improvement:+.1f}%\n"
-                 f"Fixes applied: {len(diagnosis.fixes_applied)}\n"
-                 f"Tokens used: {deps.token_counter.summary()}\n"
-                 f"Report: {report_path}\n"
-                 f"Log: report/log_*_{session_id}.md")
     return report_path
 
 
-def _build_context_prompt(rhel_ver, kernel_ver, cpu_cores, ram_gb,
-                          checks_summary, baselines, nginx_config,
-                          knowledge_chunks, prior_fixes=None) -> str:
+def _build_context_prompt(
+    rhel_ver,
+    kernel_ver,
+    cpu_cores,
+    ram_gb,
+    checks_summary,
+    baselines,
+    nginx_config,
+    knowledge_chunks,
+    prior_fixes=None,
+) -> str:
     checks_text = "\n".join(checks_summary)
 
     baselines_text = ""
@@ -347,5 +405,6 @@ def _build_context_prompt(rhel_ver, kernel_ver, cpu_cores, ram_gb,
 {nginx_config}
 ```
 
-Inspect the system, apply all proven fixes from your list that are not already configured, benchmark before and after, save findings.
+Inspect the system, apply all proven fixes from your list that are not already
+configured, benchmark before and after, save findings.
 """

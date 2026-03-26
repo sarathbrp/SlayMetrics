@@ -17,7 +17,7 @@ Every decision is logged with the data and reasoning that drove it. No black box
 
 ```
 Steps 1-4: Direct (subprocess + vector search) → zero LLM tokens
-Step 5:    ONE agent call with full context 
+Step 5:    ONE agent call with full context
 Steps 6-8: Direct (wrk2 + template) → zero LLM tokens
 ```
 
@@ -50,7 +50,7 @@ The setup script scans the system, shows what's present/missing, asks for confir
 
 ```bash
 # Set API key (if using Claude)
-echo 'ANTHROPIC_API_KEY=sk-ant-your-key' > .env
+echo 'ANTHROPIC_API_KEY=sk-ant-your-key' > .env  # pragma: allowlist secret
 
 # Edit target and LLM profile
 vi config.yaml

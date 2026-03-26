@@ -13,6 +13,7 @@ class ClaudeEmbeddings:
 
     def __init__(self, model: str = "voyage-3"):
         import anthropic
+
         self._client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
         self.model = model
         self.dimensions = 1024

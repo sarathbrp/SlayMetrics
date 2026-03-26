@@ -9,11 +9,12 @@ Usage:
     python tools/degrade.py --host 192.168.1.100 --restore
     python tools/degrade.py --host 192.168.1.100 --list
 """
+
 from __future__ import annotations
 
 import argparse
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.ssh import SSHClient
@@ -50,29 +51,55 @@ DEGRADATIONS = [
     {
         "name": "low_tcp_backlog",
         "hypothesis": "net_somaxconn_backlog",
-        "degrade": "sysctl -w net.ipv4.tcp_max_syn_backlog=128 && sysctl -w net.core.netdev_max_backlog=300",
-        "restore": "sysctl -w net.ipv4.tcp_max_syn_backlog=65535 && sysctl -w net.core.netdev_max_backlog=65535",
+        "degrade": (
+            "sysctl -w net.ipv4.tcp_max_syn_backlog=128 && "
+            "sysctl -w net.core.netdev_max_backlog=300"
+        ),
+        "restore": (
+            "sysctl -w net.ipv4.tcp_max_syn_backlog=65535 && "
+            "sysctl -w net.core.netdev_max_backlog=65535"
+        ),
         "verify": "sysctl net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog",
     },
     {
         "name": "nginx_worker_processes_1",
         "hypothesis": "worker_processes_match_cores",
-        "degrade": "sed -i 's/^worker_processes.*/worker_processes 1;/' /etc/nginx/nginx.conf && systemctl reload nginx",
-        "restore": "sed -i 's/^worker_processes.*/worker_processes auto;/' /etc/nginx/nginx.conf && systemctl reload nginx",
+        "degrade": (
+            "sed -i 's/^worker_processes.*/worker_processes 1;/' "
+            "/etc/nginx/nginx.conf && systemctl reload nginx"
+        ),
+        "restore": (
+            "sed -i 's/^worker_processes.*/worker_processes auto;/' "
+            "/etc/nginx/nginx.conf && systemctl reload nginx"
+        ),
         "verify": "grep worker_processes /etc/nginx/nginx.conf",
     },
     {
         "name": "nginx_sendfile_off",
         "hypothesis": "sendfile_enabled",
-        "degrade": "sed -i 's/sendfile\\s\\+on;/sendfile off;/' /etc/nginx/nginx.conf && systemctl reload nginx",
-        "restore": "sed -i 's/sendfile\\s\\+off;/sendfile on;/' /etc/nginx/nginx.conf && systemctl reload nginx",
+        "degrade": (
+            "sed -i 's/sendfile\\s\\+on;/sendfile off;/' "
+            "/etc/nginx/nginx.conf && systemctl reload nginx"
+        ),
+        "restore": (
+            "sed -i 's/sendfile\\s\\+off;/sendfile on;/' "
+            "/etc/nginx/nginx.conf && systemctl reload nginx"
+        ),
         "verify": "grep sendfile /etc/nginx/nginx.conf",
     },
     {
         "name": "nginx_tcp_nopush_off",
         "hypothesis": "tcp_nopush_nodelay",
-        "degrade": "sed -i 's/tcp_nopush\\s\\+on;/tcp_nopush off;/' /etc/nginx/nginx.conf && sed -i 's/tcp_nodelay\\s\\+on;/tcp_nodelay off;/' /etc/nginx/nginx.conf && systemctl reload nginx",
-        "restore": "sed -i 's/tcp_nopush\\s\\+off;/tcp_nopush on;/' /etc/nginx/nginx.conf && sed -i 's/tcp_nodelay\\s\\+off;/tcp_nodelay on;/' /etc/nginx/nginx.conf && systemctl reload nginx",
+        "degrade": (
+            "sed -i 's/tcp_nopush\\s\\+on;/tcp_nopush off;/' /etc/nginx/nginx.conf && "
+            "sed -i 's/tcp_nodelay\\s\\+on;/tcp_nodelay off;/' /etc/nginx/nginx.conf && "
+            "systemctl reload nginx"
+        ),
+        "restore": (
+            "sed -i 's/tcp_nopush\\s\\+off;/tcp_nopush on;/' /etc/nginx/nginx.conf && "
+            "sed -i 's/tcp_nodelay\\s\\+off;/tcp_nodelay on;/' /etc/nginx/nginx.conf && "
+            "systemctl reload nginx"
+        ),
         "verify": "grep -E 'tcp_nopush|tcp_nodelay' /etc/nginx/nginx.conf",
     },
 ]
@@ -82,7 +109,7 @@ def degrade(ssh: SSHClient) -> None:
     print("Applying degradations...\n")
     for d in DEGRADATIONS:
         print(f"  [{d['name']}] degrading...")
-        result = ssh.execute(d["degrade"])
+        ssh.execute(d["degrade"])
         verify = ssh.execute(d["verify"])
         print(f"    -> {verify.stdout.strip()}")
     print(f"\nApplied {len(DEGRADATIONS)} degradations. System is now detuned.")
@@ -102,7 +129,7 @@ def restore(ssh: SSHClient) -> None:
 def list_degradations() -> None:
     print("Available degradations:\n")
     print(f"  {'Name':<35} {'Agent Hypothesis':<35}")
-    print(f"  {'-'*35} {'-'*35}")
+    print(f"  {'-' * 35} {'-' * 35}")
     for d in DEGRADATIONS:
         print(f"  {d['name']:<35} {d['hypothesis']:<35}")
 

@@ -9,19 +9,20 @@ Usage:
     python tools/load_facts.py --dir /path/to/docs
     python tools/load_facts.py --clear   # remove all knowledge entries first
 """
+
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import uuid
-import json
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
+
 from memory.embeddings import from_config as embedder_from_config
-from memory.tidb_store import TiDBStore
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -33,7 +34,7 @@ def chunk_markdown(text: str, source_file: str) -> list[dict]:
     """Split markdown by ## headers into chunks. Each chunk gets the header as title."""
     chunks = []
     current_title = source_file
-    current_lines = []
+    current_lines: list[str] = []
 
     for line in text.splitlines():
         if line.startswith("## "):
@@ -78,18 +79,16 @@ def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
 
     import pymysql
     import pymysql.cursors
+
     conn = pymysql.connect(**conn_kwargs, cursorclass=pymysql.cursors.DictCursor)
 
     if clear:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM facts WHERE type = 'knowledge'")
-            print(f"Cleared existing knowledge entries.")
+            print("Cleared existing knowledge entries.")
 
     # Find all .md files
-    md_files = sorted(
-        f for f in os.listdir(facts_dir)
-        if f.endswith(".md")
-    )
+    md_files = sorted(f for f in os.listdir(facts_dir) if f.endswith(".md"))
 
     if not md_files:
         print(f"No .md files found in {facts_dir}")
@@ -110,18 +109,21 @@ def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
             embedding = embedder.embed(embed_text)
 
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO facts
                         (id, session_id, type, parameter, reasoning, embedding)
                     VALUES (%s, %s, %s, %s, %s, %s)
-                """, (
-                    fid,
-                    "__knowledge__",
-                    "knowledge",
-                    chunk["title"],
-                    chunk["body"][:10000],
-                    json.dumps(embedding),
-                ))
+                """,
+                    (
+                        fid,
+                        "__knowledge__",
+                        "knowledge",
+                        chunk["title"],
+                        chunk["body"][:10000],
+                        json.dumps(embedding),
+                    ),
+                )
             total += 1
 
     conn.close()
@@ -129,15 +131,14 @@ def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Load knowledge docs from facts/ into TiDB"
+    parser = argparse.ArgumentParser(description="Load knowledge docs from facts/ into TiDB")
+    parser.add_argument("--dir", default="facts", help="Directory with .md files (default: facts/)")
+    parser.add_argument(
+        "--config", default="config.yaml", help="Config file (default: config.yaml)"
     )
-    parser.add_argument("--dir", default="facts",
-                        help="Directory with .md files (default: facts/)")
-    parser.add_argument("--config", default="config.yaml",
-                        help="Config file (default: config.yaml)")
-    parser.add_argument("--clear", action="store_true",
-                        help="Clear existing knowledge entries first")
+    parser.add_argument(
+        "--clear", action="store_true", help="Clear existing knowledge entries first"
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)

@@ -7,16 +7,16 @@ import json
 import os
 import sys
 import uuid
-
-import yaml
 from pathlib import Path
 
-from agents import AgentDeps, TokenCounter
+import yaml
+
 from adapters import load_adapter
+from agents import AgentDeps, TokenCounter
+from core import log as logger
 from memory.embeddings import from_config as embedder_from_config
 from memory.tidb_store import from_config as tidb_from_config
 from tools.ssh import from_config as ssh_from_config
-from core import log as logger
 
 
 def load_dotenv():
@@ -49,19 +49,23 @@ def get_model(cfg: dict):
 
     profile_name = cfg["llm"]["active_profile"]
     profile = cfg["llm"]["profiles"][profile_name]
-    logger.status("main", f"LLM profile: {profile_name} ({profile['backend']} / {profile['model']})")
+    logger.status(
+        "main", f"LLM profile: {profile_name} ({profile['backend']} / {profile['model']})"
+    )
 
     match profile["backend"]:
         case "claude":
             api_key = os.environ.get(profile.get("api_key_env", "ANTHROPIC_API_KEY"))
             if not api_key:
-                logger.log("main", f"{profile.get('api_key_env','ANTHROPIC_API_KEY')} not set", "error")
+                logger.log(
+                    "main", f"{profile.get('api_key_env', 'ANTHROPIC_API_KEY')} not set", "error"
+                )
                 sys.exit(1)
             return AnthropicModel(profile["model"])
         case "vllm" | "ollama":
             provider = OpenAIProvider(
                 base_url=profile["base_url"],
-                api_key="ollama",
+                api_key="ollama",  # pragma: allowlist secret
             )
             return OpenAIChatModel(
                 profile["model"],
@@ -97,6 +101,7 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
     # Load knowledge into TiDB
     logger.status("knowledge", f"Loading {len(md_files)} docs into TiDB...")
     import pymysql
+
     conn_kwargs = dict(
         host=cfg["memory"]["host"],
         port=int(cfg["memory"].get("port", 4000)),
@@ -122,11 +127,20 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
             embed_text = f"{chunk['title']} {chunk['body'][:2000]}"
             embedding = embedder.embed(embed_text)
             with conn.cursor() as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO facts (id, session_id, type, parameter, reasoning, embedding)
                     VALUES (%s, %s, %s, %s, %s, %s)
-                """, (fid, "__knowledge__", "knowledge", chunk["title"],
-                      chunk["body"][:10000], json.dumps(embedding)))
+                """,
+                    (
+                        fid,
+                        "__knowledge__",
+                        "knowledge",
+                        chunk["title"],
+                        chunk["body"][:10000],
+                        json.dumps(embedding),
+                    ),
+                )
             total += 1
         logger.status("knowledge", f"  {filepath.name}: {len(chunks)} chunks")
 
@@ -139,7 +153,7 @@ def _chunk_markdown(text: str, source_file: str) -> list[dict]:
     """Split markdown by ## headers into chunks."""
     chunks = []
     current_title = source_file
-    current_lines = []
+    current_lines: list[str] = []
 
     for line in text.splitlines():
         if line.startswith("## "):
@@ -218,12 +232,16 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
 
     try:
         from core.orchestrator import run
+
         report_path = await run(model, deps)
         logger.status("main", f"Report: {report_path}")
     except KeyboardInterrupt:
         logger.log("main", "Interrupted by user (Ctrl+C)", "warn")
-        logger.log("main", f"Session {session_id} can be resumed with: "
-                   f"python3 main.py --session {session_id}", "warn")
+        logger.log(
+            "main",
+            f"Session {session_id} can be resumed with: python3 main.py --session {session_id}",
+            "warn",
+        )
         logger.log("main", f"Tokens used so far: {token_counter.summary()}", "warn")
     except Exception as e:
         logger.log("main", f"Error: {e}", "error")
@@ -237,12 +255,16 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SlayMetricsAgent")
-    parser.add_argument("--config", default="config.yaml",
-                        help="Path to config file (default: config.yaml)")
-    parser.add_argument("--session", default=None,
-                        help="Resume an existing session ID")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Show all agent logs (not just actions/results)")
+    parser.add_argument(
+        "--config", default="config.yaml", help="Path to config file (default: config.yaml)"
+    )
+    parser.add_argument("--session", default=None, help="Resume an existing session ID")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show all agent logs (not just actions/results)",
+    )
     args = parser.parse_args()
     try:
         asyncio.run(main(args.config, args.session, args.verbose))

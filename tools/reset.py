@@ -9,6 +9,7 @@ Usage:
     python3 tools/reset.py --clear-db           # also clear TiDB sessions
     python3 tools/reset.py --host 192.168.1.100 # remote target
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,8 +19,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
-from tools.ssh import from_config, LocalClient, SSHClient
 
+from tools.ssh import from_config
 
 DEFAULT_NGINX_CONF = """\
 # For more information on configuration, see:
@@ -124,7 +125,10 @@ def reset_system(client) -> None:
     print("\n  Verifying...")
     r = client.execute("curl -s -o /dev/null -w '%{http_code}' http://localhost/1kb.html")
     print(f"  [nginx] HTTP status: {r.stdout.strip()}")
-    r = client.execute("nginx -T 2>&1 | grep -E 'worker_processes|sendfile|tcp_nopush|access_log|worker_connections'")
+    r = client.execute(
+        "nginx -T 2>&1 | "
+        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log|worker_connections'"
+    )
     for line in r.stdout.strip().splitlines():
         print(f"  [nginx] {line.strip()}")
 
@@ -133,6 +137,7 @@ def reset_system(client) -> None:
 
 def clear_db(cfg: dict) -> None:
     import pymysql
+
     m = cfg["memory"]
     conn = pymysql.connect(
         host=m["host"],
@@ -153,6 +158,7 @@ def clear_db(cfg: dict) -> None:
 
 def reset_all_db(cfg: dict) -> None:
     import pymysql
+
     m = cfg["memory"]
     conn = pymysql.connect(
         host=m["host"],
@@ -170,7 +176,9 @@ def reset_all_db(cfg: dict) -> None:
     conn.close()
 
     # Remove knowledge hash so facts/ get reloaded on next run
-    hash_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "facts", ".loaded_hash")
+    hash_file = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "facts", ".loaded_hash"
+    )
     if os.path.exists(hash_file):
         os.remove(hash_file)
 
@@ -180,10 +188,12 @@ def reset_all_db(cfg: dict) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Reset system to clean state")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--clear-db", action="store_true",
-                        help="Clear TiDB session data (preserves knowledge base)")
-    parser.add_argument("--reset-all", action="store_true",
-                        help="Clear EVERYTHING in TiDB including knowledge base")
+    parser.add_argument(
+        "--clear-db", action="store_true", help="Clear TiDB session data (preserves knowledge base)"
+    )
+    parser.add_argument(
+        "--reset-all", action="store_true", help="Clear EVERYTHING in TiDB including knowledge base"
+    )
     args = parser.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -193,7 +203,9 @@ def main():
     try:
         reset_system(client)
         if args.reset_all:
-            answer = input("\n  WARNING: This will delete ALL data including knowledge base. Continue? [y/N] ")
+            answer = input(
+                "\n  WARNING: This will delete ALL data including knowledge base. Continue? [y/N] "
+            )
             if answer.lower() != "y":
                 print("  Aborted.")
                 return

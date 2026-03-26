@@ -7,15 +7,13 @@ from tools.ssh import SSHClient
 
 
 class RedisAdapter(ServiceAdapter):
-
     def __init__(self, cfg: dict, ssh: SSHClient):
         self._cfg = cfg["service"]
         self._ssh = ssh
 
     def get_config(self) -> dict:
         result = self._ssh.execute(
-            "redis-cli CONFIG GETALL 2>/dev/null || "
-            f"cat {self._cfg['config_path']}"
+            f"redis-cli CONFIG GETALL 2>/dev/null || cat {self._cfg['config_path']}"
         )
         return {"raw": result.stdout, "path": self._cfg["config_path"]}
 
@@ -49,12 +47,12 @@ class RedisAdapter(ServiceAdapter):
 
     def get_hypothesis_queue(self) -> list[dict]:
         return [
-            {"name": "cpu_governor_performance",  "priority": 1},
-            {"name": "tcp_backlog_tuned",         "priority": 1},
-            {"name": "maxmemory_policy_tuned",    "priority": 2},
-            {"name": "io_threads_tuned",          "priority": 2},
+            {"name": "cpu_governor_performance", "priority": 1},
+            {"name": "tcp_backlog_tuned", "priority": 1},
+            {"name": "maxmemory_policy_tuned", "priority": 2},
+            {"name": "io_threads_tuned", "priority": 2},
             {"name": "transparent_hugepages_disabled", "priority": 2},
-            {"name": "tcp_nodelay_enabled",       "priority": 3},
+            {"name": "tcp_nodelay_enabled", "priority": 3},
         ]
 
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 
-from agents import AgentDeps
 from adapters.base import BenchmarkResult
+from agents import AgentDeps
 from core.log import log, tokens
 
 
@@ -38,17 +38,21 @@ def build(model) -> Agent:
     )
 
     @agent.tool
-    async def run_benchmark(ctx: RunContext[AgentDeps],
-                            duration: int = 30) -> dict:
+    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30) -> dict:
         """Run the benchmark and return req/sec and latency metrics."""
         bench_cfg = ctx.deps.config["service"]["benchmark"]
         url = bench_cfg.get("small_file_url", "http://localhost/")
         log("remediation", f"Benchmarking {url} for {duration}s...", "action")
         result: BenchmarkResult = ctx.deps.adapter.benchmark(duration, url)
-        log("remediation", f"-> {result.requests_per_sec:.1f} RPS, "
-            f"p99={result.latency_p99_ms:.1f}ms", "result")
+        log(
+            "remediation",
+            f"-> {result.requests_per_sec:.1f} RPS, p99={result.latency_p99_ms:.1f}ms",
+            "result",
+        )
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "benchmark", url,
+            ctx.deps.session_id,
+            "benchmark",
+            url,
             str(result.__dict__),
             f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms",
         )
@@ -56,16 +60,18 @@ def build(model) -> Agent:
         return result.__dict__
 
     @agent.tool
-    async def apply_config_change(ctx: RunContext[AgentDeps],
-                                  parameter: str, value: str,
-                                  reason: str) -> bool:
+    async def apply_config_change(
+        ctx: RunContext[AgentDeps], parameter: str, value: str, reason: str
+    ) -> bool:
         """Apply a single config parameter change. Returns True on success."""
         log("remediation", f"Applying: {parameter} = {value}", "action")
         log("remediation", f"Reason: {reason[:100]}", "info")
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output",
+            ctx.deps.session_id,
+            "command_output",
             f"apply_config:{parameter}",
-            f"{parameter}={value}", reason,
+            f"{parameter}={value}",
+            reason,
         )
         ctx.deps.token_counter.tool_calls += 1
         success = ctx.deps.adapter.apply_config(parameter, value)
@@ -82,14 +88,16 @@ def build(model) -> Agent:
         return success
 
     @agent.tool
-    async def run_command(ctx: RunContext[AgentDeps],
-                          command: str, reason: str) -> str:
+    async def run_command(ctx: RunContext[AgentDeps], command: str, reason: str) -> str:
         """Run a shell command — for sysctl/kernel-level changes."""
         log("remediation", f"SSH: {command[:80]}", "action")
         result = ctx.deps.ssh.execute(command)
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output", command,
-            str(result), reason,
+            ctx.deps.session_id,
+            "command_output",
+            command,
+            str(result),
+            reason,
         )
         ctx.deps.token_counter.tool_calls += 1
         log("remediation", f"-> {str(result)[:120]}", "info")
@@ -98,8 +106,9 @@ def build(model) -> Agent:
     return agent
 
 
-async def run(model, deps: AgentDeps, analysis_summary: str,
-              recommended_action: str) -> RemediationOutput:
+async def run(
+    model, deps: AgentDeps, analysis_summary: str, recommended_action: str
+) -> RemediationOutput:
     log("remediation", f"Starting: {recommended_action[:100]}", "action")
     agent = build(model)
     result = await agent.run(
@@ -111,8 +120,11 @@ async def run(model, deps: AgentDeps, analysis_summary: str,
     inp, out = deps.token_counter.add(result.usage())
 
     output = result.output
-    log("remediation", f"Done: {output.parameter} = {output.new_value} "
-        f"({output.impact_pct:+.1f}%)", "result")
+    log(
+        "remediation",
+        f"Done: {output.parameter} = {output.new_value} ({output.impact_pct:+.1f}%)",
+        "result",
+    )
     tokens("remediation", inp, out, deps.token_counter.summary())
 
     # Persist the fix to Facts table

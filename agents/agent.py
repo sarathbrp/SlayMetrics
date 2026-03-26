@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 from pydantic import BaseModel
 from pydantic_ai import Agent, RunContext
 
-from agents import AgentDeps
 from adapters.base import BenchmarkResult
-from core.log import log, tokens, tool_call, tool_result, llm_call
+from agents import AgentDeps, TokenCounter
+from core.log import llm_call, log, tokens, tool_call, tool_result
 
 
 class DiagnosisOutput(BaseModel):
     """Final output after the agent has diagnosed and fixed issues."""
+
     fixes_applied: list[dict]
     summary: str
     total_improvement_pct: float
@@ -156,10 +158,15 @@ def build(model) -> Agent:
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output", "inspect_nginx",
-            str(result), f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
+            ctx.deps.session_id,
+            "command_output",
+            "inspect_nginx",
+            str(result),
+            f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
         )
-        tool_result("inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok")
+        tool_result(
+            "inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
+        )
         return result
 
     @agent.tool
@@ -171,9 +178,14 @@ def build(model) -> Agent:
         current = {}
 
         # Sysctl params
-        for key in ["net.core.somaxconn", "net.ipv4.tcp_max_syn_backlog",
-                     "net.core.netdev_max_backlog", "net.ipv4.tcp_tw_reuse",
-                     "net.core.rmem_max", "net.core.wmem_max"]:
+        for key in [
+            "net.core.somaxconn",
+            "net.ipv4.tcp_max_syn_backlog",
+            "net.core.netdev_max_backlog",
+            "net.ipv4.tcp_tw_reuse",
+            "net.core.rmem_max",
+            "net.core.wmem_max",
+        ]:
             r = ssh.execute(f"sysctl -n {key} 2>/dev/null")
             current[key] = r.stdout.strip()
 
@@ -183,7 +195,9 @@ def build(model) -> Agent:
         current["transparent_hugepage"] = m.group(1) if m else "unknown"
 
         # SELinux
-        current["selinux"] = ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip().lower()
+        current["selinux"] = (
+            ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip().lower()
+        )
 
         # Compare against targets
         needs_fixing = {}
@@ -202,17 +216,24 @@ def build(model) -> Agent:
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output", "inspect_system",
-            str(result), f"system: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
+            ctx.deps.session_id,
+            "command_output",
+            "inspect_system",
+            str(result),
+            f"system: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
         )
-        tool_result("inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok")
+        tool_result(
+            "inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
+        )
         return result
 
     @agent.tool
-    async def apply_nginx_tuning(ctx: RunContext[AgentDeps],
-                                 changes: dict[str, str] | str, reason: str) -> dict:
+    async def apply_nginx_tuning(
+        ctx: RunContext[AgentDeps], changes: dict[str, str] | str, reason: str
+    ) -> dict:
         """Apply multiple nginx config changes in one batch, then reload.
-        Example: {"sendfile": "on", "tcp_nopush": "on", "open_file_cache": "max=10000 inactive=60s"}
+        Example: {"sendfile": "on", "tcp_nopush": "on",
+        "open_file_cache": "max=10000 inactive=60s"}
         """
         normalized_changes, parse_error = _normalize_changes(changes, "apply_nginx")
         if parse_error:
@@ -221,10 +242,12 @@ def build(model) -> Agent:
             ctx.deps.token_counter.tool_calls += 1
             return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
 
-        changes = normalized_changes
+        if normalized_changes is None:
+            return {"applied": [], "failed": [], "reload": "FAILED", "error": "invalid payload"}
+        changes_dict = normalized_changes
         allowed = getattr(ctx.deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
         if allowed is not None:
-            unsupported = [k for k in changes if k not in allowed]
+            unsupported = [k for k in changes_dict if k not in allowed]
             if unsupported:
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
                 tool_call("apply_nginx", "unsupported directives")
@@ -232,7 +255,7 @@ def build(model) -> Agent:
                 ctx.deps.token_counter.tool_calls += 1
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
-        tool_call("apply_nginx", f"{len(changes)} changes: {', '.join(changes.keys())}")
+        tool_call("apply_nginx", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
         log("agent", f"Reason: {reason}", "info")
 
         config_path = ctx.deps.config["service"]["config_path"]
@@ -241,7 +264,7 @@ def build(model) -> Agent:
 
         applied = []
         failed = []
-        for param, value in changes.items():
+        for param, value in changes_dict.items():
             success = ctx.deps.adapter.apply_config(param, value)
             if success:
                 applied.append(param)
@@ -256,9 +279,11 @@ def build(model) -> Agent:
                 }
                 ctx.deps.token_counter.tool_calls += 1
                 ctx.deps.memory.save_context(
-                    ctx.deps.session_id, "command_output",
-                    f"apply_nginx:{','.join(changes.keys())}"[:250],
-                    str(result), reason,
+                    ctx.deps.session_id,
+                    "command_output",
+                    f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
+                    str(result),
+                    reason,
                 )
                 tool_result("apply_nginx", f"FAILED: {result['error']}")
                 return result
@@ -277,9 +302,11 @@ def build(model) -> Agent:
             }
             ctx.deps.token_counter.tool_calls += 1
             ctx.deps.memory.save_context(
-                ctx.deps.session_id, "command_output",
-                f"apply_nginx:{','.join(changes.keys())}"[:250],
-                str(result), reason,
+                ctx.deps.session_id,
+                "command_output",
+                f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
+                str(result),
+                reason,
             )
             tool_result("apply_nginx", f"FAILED: {error_msg}")
             return result
@@ -295,18 +322,25 @@ def build(model) -> Agent:
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output",
-            f"apply_nginx:{','.join(changes.keys())}"[:250],
-            str(result), reason,
+            ctx.deps.session_id,
+            "command_output",
+            f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
+            str(result),
+            reason,
         )
-        tool_result("apply_nginx", f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}")
+        tool_result(
+            "apply_nginx",
+            f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}",
+        )
         return result
 
     @agent.tool
-    async def apply_system_tuning(ctx: RunContext[AgentDeps],
-                                  changes: dict[str, str] | str, reason: str) -> dict:
+    async def apply_system_tuning(
+        ctx: RunContext[AgentDeps], changes: dict[str, str] | str, reason: str
+    ) -> dict:
         """Apply multiple sysctl/kernel changes in one batch.
-        Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never", "selinux": "permissive"}
+        Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never",
+        "selinux": "permissive"}
         """
         normalized_changes, parse_error = _normalize_changes(changes, "apply_system")
         if parse_error:
@@ -315,15 +349,20 @@ def build(model) -> Agent:
             ctx.deps.token_counter.tool_calls += 1
             return {"applied": {}, "failed": {"_input": parse_error}}
 
-        changes = normalized_changes
-        tool_call("apply_system", f"{len(changes)} changes: {', '.join(changes.keys())}")
+        if normalized_changes is None:
+            return {"applied": {}, "failed": {"_input": "invalid payload"}}
+        changes_dict = normalized_changes
+        tool_call(
+            "apply_system",
+            f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}",
+        )
         log("agent", f"Reason: {reason}", "info")
 
         ssh = ctx.deps.ssh
         applied = {}
         failed = {}
 
-        for param, value in changes.items():
+        for param, value in changes_dict.items():
             if param == "transparent_hugepage":
                 r = ssh.execute(f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1")
                 if r.ok:
@@ -345,25 +384,31 @@ def build(model) -> Agent:
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output",
-            f"apply_system:{','.join(changes.keys())}"[:250],
-            str(result), reason,
+            ctx.deps.session_id,
+            "command_output",
+            f"apply_system:{','.join(changes_dict.keys())}"[:250],
+            str(result),
+            reason,
         )
         tool_result("apply_system", f"applied={list(applied.keys())} failed={list(failed.keys())}")
         return result
 
     @agent.tool
-    async def run_benchmark(ctx: RunContext[AgentDeps],
-                            duration: int = 30) -> dict:
+    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30) -> dict:
         """Run wrk2 benchmark against the small file URL. Returns RPS and latency."""
         bench_cfg = ctx.deps.config["service"]["benchmark"]
         url = bench_cfg.get("small_file_url", "http://localhost/")
         tool_call("benchmark", f"wrk2 {duration}s -> {url}")
         result: BenchmarkResult = ctx.deps.adapter.benchmark(duration, url)
-        tool_result("benchmark", f"{result.requests_per_sec:.1f} RPS, "
-                    f"p99={result.latency_p99_ms:.1f}ms, CPU={result.cpu_pct:.1f}%")
+        tool_result(
+            "benchmark",
+            f"{result.requests_per_sec:.1f} RPS, "
+            f"p99={result.latency_p99_ms:.1f}ms, CPU={result.cpu_pct:.1f}%",
+        )
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "benchmark", url,
+            ctx.deps.session_id,
+            "benchmark",
+            url,
             str(result.__dict__),
             f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms",
         )
@@ -390,11 +435,16 @@ def build(model) -> Agent:
         return results
 
     @agent.tool
-    async def save_finding(ctx: RunContext[AgentDeps],
-                           parameter: str, reasoning: str,
-                           before_value: str = "", after_value: str = "",
-                           before_rps: float = 0, after_rps: float = 0,
-                           impact_pct: float = 0) -> bool:
+    async def save_finding(
+        ctx: RunContext[AgentDeps],
+        parameter: str,
+        reasoning: str,
+        before_value: str = "",
+        after_value: str = "",
+        before_rps: float = 0,
+        after_rps: float = 0,
+        impact_pct: float = 0,
+    ) -> bool:
         """Save a fix result to long-term memory."""
         tool_call("save", f"{parameter} ({impact_pct:+.1f}%)")
         ctx.deps.memory.save_fact(
@@ -419,7 +469,71 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     llm_call("agent", "Starting diagnosis — sending context to LLM...")
     agent = build(model)
     result = await agent.run(context_prompt, deps=deps)
+    _attribute_tool_tokens(result, deps.token_counter)
     inp, out = deps.token_counter.add(result.usage())
     llm_call("agent", f"LLM finished — {inp:,} in / {out:,} out tokens")
     tokens("agent", inp, out, deps.token_counter.summary())
+    rows = deps.token_counter.tool_token_rows()
+    if rows:
+        top = ", ".join(
+            f"{r['tool']}={r['total_tokens']:,}t/{r['calls']}c"
+            for r in sorted(rows, key=lambda x: x["total_tokens"], reverse=True)[:5]
+        )
+        log("agent", f"Tool token attribution: {top}", "result")
     return result.output
+
+
+def _attribute_tool_tokens(run_result: Any, token_counter: TokenCounter) -> None:
+    """Approximate per-tool token attribution from model message usage deltas."""
+    try:
+        messages = run_result.all_messages()
+    except Exception:
+        return
+
+    pending_post_tools: list[str] = []
+    for msg in messages:
+        usage = getattr(msg, "usage", None)
+        parts = getattr(msg, "parts", None) or []
+
+        tool_names = [p.tool_name for p in parts if getattr(p, "part_kind", "") == "tool-call"]
+
+        if usage and pending_post_tools and not tool_names:
+            _distribute_usage(
+                token_counter,
+                pending_post_tools,
+                int(usage.input_tokens or 0),
+                int(usage.output_tokens or 0),
+                phase="post",
+            )
+            pending_post_tools = []
+
+        if usage and tool_names:
+            _distribute_usage(
+                token_counter,
+                tool_names,
+                int(usage.input_tokens or 0),
+                int(usage.output_tokens or 0),
+                phase="call",
+            )
+            pending_post_tools = list(tool_names)
+
+
+def _distribute_usage(
+    token_counter: TokenCounter,
+    tool_names: list[str],
+    input_tokens: int,
+    output_tokens: int,
+    phase: str,
+) -> None:
+    n = len(tool_names)
+    if n == 0:
+        return
+    in_base, in_rem = divmod(max(0, input_tokens), n)
+    out_base, out_rem = divmod(max(0, output_tokens), n)
+    for i, name in enumerate(tool_names):
+        in_part = in_base + (1 if i < in_rem else 0)
+        out_part = out_base + (1 if i < out_rem else 0)
+        if phase == "call":
+            token_counter.add_tool_tokens(name, calls=1, call_input=in_part, call_output=out_part)
+        else:
+            token_counter.add_tool_tokens(name, post_input=in_part, post_output=out_part)

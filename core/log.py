@@ -45,8 +45,14 @@ def log(agent: str, message: str, level: str = "info") -> None:
         _log_file.write(f"{ts} {tag:16s} {msg}\n")
         _log_file.flush()
 
-    color = {"info": "dim", "action": "yellow", "result": "green",
-             "error": "red", "warn": "yellow", "skip": "dim"}.get(level, "dim")
+    color = {
+        "info": "dim",
+        "action": "yellow",
+        "result": "green",
+        "error": "red",
+        "warn": "yellow",
+        "skip": "dim",
+    }.get(level, "dim")
 
     if level in ("error", "warn", "result", "action"):
         _console.print(f"       [{color}]{tag}[/{color}] {msg}")

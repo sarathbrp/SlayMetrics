@@ -5,7 +5,6 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
 import pymysql
 import pymysql.cursors
@@ -73,14 +72,16 @@ class TiDBStore:
 
     # ── Profile ─────────────────────────────────────────────────────────────
 
-    def create_session(self, session_id: str, service: str, host: str,
-                       llm_profile: str) -> None:
+    def create_session(self, session_id: str, service: str, host: str, llm_profile: str) -> None:
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO profile (id, session_id, service, host, llm_profile)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE updated_at = NOW()
-            """, (str(uuid.uuid4()), session_id, service, host, llm_profile))
+            """,
+                (str(uuid.uuid4()), session_id, service, host, llm_profile),
+            )
 
     def update_profile(self, session_id: str, **kwargs) -> None:
         if not kwargs:
@@ -94,28 +95,50 @@ class TiDBStore:
 
     def get_profile(self, session_id: str) -> dict | None:
         with self._cursor() as cur:
-            cur.execute("SELECT * FROM profile WHERE session_id = %s LIMIT 1",
-                        (session_id,))
+            cur.execute("SELECT * FROM profile WHERE session_id = %s LIMIT 1", (session_id,))
             return cur.fetchone()
 
     # ── Facts ────────────────────────────────────────────────────────────────
 
-    def save_fact(self, session_id: str, type: str, parameter: str,
-                  reasoning: str, before_value: str = "", after_value: str = "",
-                  before_rps: float | None = None, after_rps: float | None = None,
-                  impact_pct: float | None = None, status: str = "applied") -> str:
+    def save_fact(
+        self,
+        session_id: str,
+        type: str,
+        parameter: str,
+        reasoning: str,
+        before_value: str = "",
+        after_value: str = "",
+        before_rps: float | None = None,
+        after_rps: float | None = None,
+        impact_pct: float | None = None,
+        status: str = "applied",
+    ) -> str:
         fid = str(uuid.uuid4())
         text = f"{parameter} {reasoning} {before_value} {after_value}"
         embedding = self._embedder.embed(text)
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO facts
                     (id, session_id, type, parameter, before_value, after_value,
                      before_rps, after_rps, impact_pct, reasoning, status, embedding)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (fid, session_id, type, parameter, before_value, after_value,
-                  before_rps, after_rps, impact_pct, reasoning, status,
-                  json.dumps(embedding)))
+            """,
+                (
+                    fid,
+                    session_id,
+                    type,
+                    parameter,
+                    before_value,
+                    after_value,
+                    before_rps,
+                    after_rps,
+                    impact_pct,
+                    reasoning,
+                    status,
+                    json.dumps(embedding),
+                ),
+            )
         return fid
 
     def get_facts(self, session_id: str, type: str | None = None) -> list[dict]:
@@ -135,7 +158,8 @@ class TiDBStore:
     def get_all_fixes_for_host(self, host: str) -> list[dict]:
         """Get all fixes across ALL sessions for a given host — cross-session learning."""
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT f.session_id, f.type, f.parameter, f.before_value,
                        f.after_value, f.before_rps, f.after_rps,
                        f.impact_pct, f.reasoning, f.status, f.created_at
@@ -143,35 +167,50 @@ class TiDBStore:
                 JOIN profile p ON f.session_id = p.session_id
                 WHERE p.host = %s AND f.type = 'fix'
                 ORDER BY f.created_at DESC
-            """, (host,))
+            """,
+                (host,),
+            )
             return cur.fetchall()
 
     # ── Context ──────────────────────────────────────────────────────────────
 
-    def save_context(self, session_id: str, type: str, source: str,
-                     content: str, summary: str = "") -> str:
+    def save_context(
+        self, session_id: str, type: str, source: str, content: str, summary: str = ""
+    ) -> str:
         cid = str(uuid.uuid4())
         source = source[:250]  # VARCHAR(256) safety
         text = f"{source} {summary or content[:500]}"
         embedding = self._embedder.embed(text)
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO context
                     (id, session_id, type, source, content, summary, embedding)
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (cid, session_id, type, source, content,
-                  summary or content[:500], json.dumps(embedding)))
+            """,
+                (
+                    cid,
+                    session_id,
+                    type,
+                    source,
+                    content,
+                    summary or content[:500],
+                    json.dumps(embedding),
+                ),
+            )
         return cid
 
     # ── Vector search ────────────────────────────────────────────────────────
 
-    def semantic_search(self, query: str, session_id: str | None = None,
-                        top_k: int = 3) -> list[dict]:
+    def semantic_search(
+        self, query: str, session_id: str | None = None, top_k: int = 3
+    ) -> list[dict]:
         embedding = self._embedder.embed(query)
         vec_str = json.dumps(embedding)
         with self._cursor() as cur:
             if session_id:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT parameter, reasoning, before_value, after_value,
                            impact_pct, type,
                            VEC_COSINE_DISTANCE(embedding, %s) AS score
@@ -180,9 +219,12 @@ class TiDBStore:
                       AND embedding IS NOT NULL
                     ORDER BY score ASC
                     LIMIT %s
-                """, (vec_str, session_id, top_k))
+                """,
+                    (vec_str, session_id, top_k),
+                )
             else:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT parameter, reasoning, before_value, after_value,
                            impact_pct, type,
                            VEC_COSINE_DISTANCE(embedding, %s) AS score
@@ -190,7 +232,9 @@ class TiDBStore:
                     WHERE embedding IS NOT NULL
                     ORDER BY score ASC
                     LIMIT %s
-                """, (vec_str, top_k))
+                """,
+                    (vec_str, top_k),
+                )
             return cur.fetchall()
 
     # ── Hypothesis queue ─────────────────────────────────────────────────────
@@ -204,44 +248,58 @@ class TiDBStore:
             if cur.fetchone()["cnt"] > 0:
                 return  # already populated — preserve existing state on restart
             for h in hypotheses:
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO hypothesis_queue (id, session_id, name, priority)
                     VALUES (%s, %s, %s, %s)
-                """, (str(uuid.uuid4()), session_id, h["name"], h["priority"]))
+                """,
+                    (str(uuid.uuid4()), session_id, h["name"], h["priority"]),
+                )
 
     def next_hypothesis(self, session_id: str) -> dict | None:
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT * FROM hypothesis_queue
                 WHERE session_id = %s AND status = 'pending'
                 ORDER BY priority ASC, created_at ASC
                 LIMIT 1
-            """, (session_id,))
+            """,
+                (session_id,),
+            )
             return cur.fetchone()
 
-    def mark_hypothesis(self, session_id: str, name: str,
-                        status: str, outcome: str = "") -> None:
+    def mark_hypothesis(self, session_id: str, name: str, status: str, outcome: str = "") -> None:
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE hypothesis_queue
                 SET status = %s, outcome = %s, updated_at = NOW()
                 WHERE session_id = %s AND name = %s
-            """, (status, outcome, session_id, name))
+            """,
+                (status, outcome, session_id, name),
+            )
 
     def pending_count(self, session_id: str) -> int:
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT COUNT(*) as cnt FROM hypothesis_queue
                 WHERE session_id = %s AND status = 'pending'
-            """, (session_id,))
+            """,
+                (session_id,),
+            )
             return cur.fetchone()["cnt"]
 
     def get_queue(self, session_id: str) -> list[dict]:
         with self._cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT * FROM hypothesis_queue WHERE session_id = %s
                 ORDER BY priority, created_at
-            """, (session_id,))
+            """,
+                (session_id,),
+            )
             return cur.fetchall()
 
     # ── Session resume ───────────────────────────────────────────────────────

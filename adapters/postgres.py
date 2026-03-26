@@ -7,7 +7,6 @@ from tools.ssh import SSHClient
 
 
 class PostgresAdapter(ServiceAdapter):
-
     def __init__(self, cfg: dict, ssh: SSHClient):
         self._cfg = cfg["service"]
         self._bench_cfg = self._cfg["benchmark"]
@@ -15,16 +14,13 @@ class PostgresAdapter(ServiceAdapter):
 
     def get_config(self) -> dict:
         result = self._ssh.execute(
-            "psql -U postgres -c 'SHOW ALL;' 2>/dev/null || "
-            f"cat {self._cfg['config_path']}"
+            f"psql -U postgres -c 'SHOW ALL;' 2>/dev/null || cat {self._cfg['config_path']}"
         )
         return {"raw": result.stdout, "path": self._cfg["config_path"]}
 
     def apply_config(self, parameter: str, value: str) -> bool:
         config_path = self._cfg["config_path"]
-        sed_cmd = (
-            f"sed -i 's/^#\\?{parameter}\\s*=.*/{parameter} = {value}/' {config_path}"
-        )
+        sed_cmd = f"sed -i 's/^#\\?{parameter}\\s*=.*/{parameter} = {value}/' {config_path}"
         result = self._ssh.execute(sed_cmd)
         return result.ok
 
@@ -36,7 +32,7 @@ class PostgresAdapter(ServiceAdapter):
 
     def get_metrics(self) -> dict:
         r = self._ssh.execute(
-            "psql -U postgres -c \"SELECT count(*) FROM pg_stat_activity;\" 2>/dev/null"
+            'psql -U postgres -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null'
         )
         return {"pg_stat_activity": r.stdout.strip()}
 
@@ -52,13 +48,13 @@ class PostgresAdapter(ServiceAdapter):
 
     def get_hypothesis_queue(self) -> list[dict]:
         return [
-            {"name": "shared_buffers_tuned",       "priority": 1},
-            {"name": "cpu_governor_performance",   "priority": 1},
-            {"name": "max_connections_tuned",      "priority": 2},
-            {"name": "work_mem_tuned",             "priority": 2},
+            {"name": "shared_buffers_tuned", "priority": 1},
+            {"name": "cpu_governor_performance", "priority": 1},
+            {"name": "max_connections_tuned", "priority": 2},
+            {"name": "work_mem_tuned", "priority": 2},
             {"name": "effective_cache_size_tuned", "priority": 2},
-            {"name": "checkpoint_tuned",           "priority": 3},
-            {"name": "wal_buffers_tuned",          "priority": 3},
+            {"name": "checkpoint_tuned", "priority": 3},
+            {"name": "wal_buffers_tuned", "priority": 3},
         ]
 
 

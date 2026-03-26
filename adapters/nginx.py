@@ -7,7 +7,6 @@ from tools.ssh import SSHClient
 
 
 class NginxAdapter(ServiceAdapter):
-
     def __init__(self, cfg: dict, ssh: SSHClient):
         self._cfg = cfg["service"]
         self._bench_cfg = self._cfg["benchmark"]
@@ -19,15 +18,23 @@ class NginxAdapter(ServiceAdapter):
 
     # Which block each directive belongs in
     MAIN_DIRECTIVES = {
-        "worker_processes", "worker_rlimit_nofile", "worker_priority",
-        "worker_cpu_affinity", "pid", "error_log",
+        "worker_processes",
+        "worker_rlimit_nofile",
+        "worker_priority",
+        "worker_cpu_affinity",
+        "pid",
+        "error_log",
     }
     EVENTS_DIRECTIVES = {
-        "worker_connections", "use", "multi_accept",
+        "worker_connections",
+        "use",
+        "multi_accept",
     }
     # Directives that belong in server {} block
     SERVER_DIRECTIVES = {
-        "listen", "server_name", "root",
+        "listen",
+        "server_name",
+        "root",
     }
     # Not real directives or need special handling — reject outright
     SKIP_DIRECTIVES = {"listen_backlog"}
@@ -36,10 +43,19 @@ class NginxAdapter(ServiceAdapter):
         MAIN_DIRECTIVES
         | EVENTS_DIRECTIVES
         | {
-            "sendfile", "tcp_nopush", "tcp_nodelay", "keepalive_timeout",
-            "keepalive_requests", "open_file_cache", "access_log",
-            "gzip", "gzip_comp_level", "gzip_types",
-            "reset_timedout_connection", "lingering_close", "lingering_timeout",
+            "sendfile",
+            "tcp_nopush",
+            "tcp_nodelay",
+            "keepalive_timeout",
+            "keepalive_requests",
+            "open_file_cache",
+            "access_log",
+            "gzip",
+            "gzip_comp_level",
+            "gzip_types",
+            "reset_timedout_connection",
+            "lingering_close",
+            "lingering_timeout",
             "listen_backlog",
         }
     )
@@ -75,7 +91,7 @@ class NginxAdapter(ServiceAdapter):
 
         # First: remove ALL existing occurrences of this directive (prevent duplicates)
         pattern = re.compile(rf"^\s*{re.escape(parameter)}\s+[^;]*;")
-        cleaned = [l for l in lines if not pattern.match(l)]
+        cleaned = [line for line in lines if not pattern.match(line)]
 
         # Find insertion point based on block
         insert_idx = None
@@ -101,7 +117,9 @@ class NginxAdapter(ServiceAdapter):
 
         # Write to temp, test, then apply
         new_config = "\n".join(cleaned) + "\n"
-        self._ssh.execute(f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF")
+        self._ssh.execute(
+            f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
+        )
         self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
         # Validate — rollback if broken
@@ -142,7 +160,9 @@ class NginxAdapter(ServiceAdapter):
             new_lines.append(line)
 
         new_config = "\n".join(new_lines) + "\n"
-        self._ssh.execute(f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF")
+        self._ssh.execute(
+            f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
+        )
         self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
         # Validate — rollback if broken
@@ -207,19 +227,19 @@ class NginxAdapter(ServiceAdapter):
 
     def get_hypothesis_queue(self) -> list[dict]:
         return [
-            {"name": "sendfile_enabled",            "priority": 1},
-            {"name": "cpu_governor_performance",    "priority": 1},
-            {"name": "tcp_nopush_nodelay",          "priority": 1},
-            {"name": "worker_processes_match_cores","priority": 1},
-            {"name": "open_file_cache_enabled",     "priority": 2},
-            {"name": "transparent_hugepages_disabled","priority": 2},
-            {"name": "selinux_tuned",               "priority": 2},
-            {"name": "net_somaxconn_backlog",        "priority": 2},
-            {"name": "irq_affinity_tuned",          "priority": 3},
-            {"name": "numa_binding",                "priority": 3},
-            {"name": "filesystem_noatime",          "priority": 3},
-            {"name": "nic_offload_enabled",         "priority": 3},
-            {"name": "gzip_compression_tuned",      "priority": 3},
+            {"name": "sendfile_enabled", "priority": 1},
+            {"name": "cpu_governor_performance", "priority": 1},
+            {"name": "tcp_nopush_nodelay", "priority": 1},
+            {"name": "worker_processes_match_cores", "priority": 1},
+            {"name": "open_file_cache_enabled", "priority": 2},
+            {"name": "transparent_hugepages_disabled", "priority": 2},
+            {"name": "selinux_tuned", "priority": 2},
+            {"name": "net_somaxconn_backlog", "priority": 2},
+            {"name": "irq_affinity_tuned", "priority": 3},
+            {"name": "numa_binding", "priority": 3},
+            {"name": "filesystem_noatime", "priority": 3},
+            {"name": "nic_offload_enabled", "priority": 3},
+            {"name": "gzip_compression_tuned", "priority": 3},
         ]
 
 

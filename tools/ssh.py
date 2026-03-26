@@ -42,7 +42,10 @@ class LocalClient:
     def execute(self, command: str, timeout: int | None = None) -> SSHResult:
         try:
             result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
                 timeout=timeout or 120,
             )
             return SSHResult(
@@ -92,9 +95,8 @@ class SSHClient:
     def execute(self, command: str, timeout: int | None = None) -> SSHResult:
         if not self._client:
             self.connect()
-        _, stdout, stderr = self._client.exec_command(
-            command, timeout=timeout or self.timeout
-        )
+        assert self._client is not None
+        _, stdout, stderr = self._client.exec_command(command, timeout=timeout or self.timeout)
         exit_code = stdout.channel.recv_exit_status()
         return SSHResult(
             stdout=stdout.read().decode("utf-8", errors="replace"),

@@ -10,11 +10,11 @@ from core.log import log, tokens
 class AnalysisOutput(BaseModel):
     symptom: str
     root_cause: str
-    confidence: float       # 0.0 - 1.0
+    confidence: float  # 0.0 - 1.0
     hypothesis: str
     recommended_action: str
     reasoning: str
-    skip: bool = False      # True if memory says this was already tried
+    skip: bool = False  # True if memory says this was already tried
 
 
 def build(model) -> Agent:
@@ -31,7 +31,8 @@ def build(model) -> Agent:
             "Set skip=True if this hypothesis was already tried and had no effect. "
             "Confidence should reflect how certain you are (0.0=guess, 1.0=confirmed). "
             "IMPORTANT: Use at most 5 diagnostic commands. Be targeted, not exhaustive. "
-            "If a system feature is not available (e.g. cpufreq on a VM), set skip=True immediately. "
+            "If a system feature is not available (for example cpufreq on a VM), "
+            "set skip=True immediately. "
             "Never install packages or modify the system — only diagnose."
         ),
     )
@@ -54,14 +55,16 @@ def build(model) -> Agent:
         return [{k: v for k, v in f.items() if k != "embedding"} for f in facts]
 
     @agent.tool
-    async def run_diagnostic_command(ctx: RunContext[AgentDeps],
-                                     command: str, reason: str) -> str:
+    async def run_diagnostic_command(ctx: RunContext[AgentDeps], command: str, reason: str) -> str:
         """Run a targeted diagnostic command to gather evidence for the hypothesis."""
         log("analyzer", f"SSH: {command[:80]} ({reason[:50]})", "action")
         result = ctx.deps.ssh.execute(command)
         ctx.deps.memory.save_context(
-            ctx.deps.session_id, "command_output", command,
-            str(result), reason,
+            ctx.deps.session_id,
+            "command_output",
+            command,
+            str(result),
+            reason,
         )
         ctx.deps.token_counter.tool_calls += 1
         log("analyzer", f"-> {str(result)[:120]}", "info")
@@ -70,8 +73,7 @@ def build(model) -> Agent:
     return agent
 
 
-async def run(model, deps: AgentDeps, hypothesis: str,
-              context_summary: str) -> AnalysisOutput:
+async def run(model, deps: AgentDeps, hypothesis: str, context_summary: str) -> AnalysisOutput:
     log("analyzer", f"Analyzing hypothesis: {hypothesis}", "action")
     agent = build(model)
     result = await agent.run(

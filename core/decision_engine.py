@@ -13,13 +13,11 @@ def next_hypothesis(session_id: str, memory: TiDBStore) -> dict | None:
     return memory.next_hypothesis(session_id)
 
 
-def mark_done(session_id: str, memory: TiDBStore,
-              name: str, outcome: str) -> None:
+def mark_done(session_id: str, memory: TiDBStore, name: str, outcome: str) -> None:
     memory.mark_hypothesis(session_id, name, "done", outcome)
 
 
-def mark_skipped(session_id: str, memory: TiDBStore,
-                 name: str, reason: str) -> None:
+def mark_skipped(session_id: str, memory: TiDBStore, name: str, reason: str) -> None:
     memory.mark_hypothesis(session_id, name, "skipped", reason)
 
 

@@ -19,12 +19,10 @@ class BenchmarkResult:
     def improvement_pct(self, baseline: "BenchmarkResult") -> float:
         if baseline.requests_per_sec == 0:
             return 0.0
-        return ((self.requests_per_sec - baseline.requests_per_sec)
-                / baseline.requests_per_sec * 100)
+        return (self.requests_per_sec - baseline.requests_per_sec) / baseline.requests_per_sec * 100
 
 
 class ServiceAdapter(ABC):
-
     @abstractmethod
     def get_config(self) -> dict:
         """Read and return current service configuration as a dict."""

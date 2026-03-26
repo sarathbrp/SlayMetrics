@@ -22,8 +22,11 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
     config = deps.adapter.get_config()
     config_preview = config.get("raw", "")[:2000]
     deps.memory.save_context(
-        deps.session_id, "command_output", "service_config",
-        config.get("raw", ""), "current service config",
+        deps.session_id,
+        "command_output",
+        "service_config",
+        config.get("raw", ""),
+        "current service config",
     )
     checks_run.append("service_config")
     findings.append(f"Config path: {config.get('path', 'unknown')}")
@@ -34,8 +37,11 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
     log("collector", "Fetching service logs...", "action")
     logs = deps.adapter.get_logs(tail=50)
     deps.memory.save_context(
-        deps.session_id, "log", "service_logs",
-        logs, "last 50 lines of service log",
+        deps.session_id,
+        "log",
+        "service_logs",
+        logs,
+        "last 50 lines of service log",
     )
     checks_run.append("service_logs")
     log_lines = len(logs.strip().splitlines()) if logs.strip() else 0
@@ -47,8 +53,11 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
     log("collector", "Collecting live metrics...", "action")
     metrics = deps.adapter.get_metrics()
     deps.memory.save_context(
-        deps.session_id, "metric", "live_metrics",
-        str(metrics), "live service metrics snapshot",
+        deps.session_id,
+        "metric",
+        "live_metrics",
+        str(metrics),
+        "live service metrics snapshot",
     )
     checks_run.append("live_metrics")
     for k, v in metrics.items():
@@ -60,5 +69,5 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
         checks_run=checks_run,
         findings=findings,
         raw_summary=f"Collected config ({len(config_preview)} chars), "
-                    f"{log_lines} log lines, {len(metrics)} metric groups",
+        f"{log_lines} log lines, {len(metrics)} metric groups",
     )

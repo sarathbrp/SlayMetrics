@@ -2,29 +2,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tools.ssh import SSHClient
+from tools.ssh import LocalClient, SSHClient
+
+SSHLike = LocalClient | SSHClient
 
 
 @dataclass
 class CheckResult:
     name: str
     value: str
-    status: str          # "ok" | "warning" | "critical"
+    status: str  # "ok" | "warning" | "critical"
     recommendation: str  # empty string if no action needed
 
 
-def run_all(ssh: SSHClient, checks: list[str]) -> list[CheckResult]:
+def run_all(ssh: SSHLike, checks: list[str]) -> list[CheckResult]:
     runners = {
-        "cpu_governor":            _cpu_governor,
-        "transparent_hugepages":   _transparent_hugepages,
-        "selinux_mode":            _selinux_mode,
-        "sysctl_net_params":       _sysctl_net_params,
-        "irq_affinity":            _irq_affinity,
-        "filesystem_mount_options":_filesystem_mount_options,
-        "numa_topology":           _numa_topology,
-        "open_file_limits":        _open_file_limits,
-        "nic_offloading":          _nic_offloading,
-        "kernel_version":          _kernel_version,
+        "cpu_governor": _cpu_governor,
+        "transparent_hugepages": _transparent_hugepages,
+        "selinux_mode": _selinux_mode,
+        "sysctl_net_params": _sysctl_net_params,
+        "irq_affinity": _irq_affinity,
+        "filesystem_mount_options": _filesystem_mount_options,
+        "numa_topology": _numa_topology,
+        "open_file_limits": _open_file_limits,
+        "nic_offloading": _nic_offloading,
+        "kernel_version": _kernel_version,
     }
     results = []
     for check in checks:
@@ -34,7 +36,7 @@ def run_all(ssh: SSHClient, checks: list[str]) -> list[CheckResult]:
     return results
 
 
-def _cpu_governor(ssh: SSHClient) -> CheckResult:
+def _cpu_governor(ssh: SSHLike) -> CheckResult:
     r = ssh.execute(
         "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u"
     )
@@ -44,38 +46,45 @@ def _cpu_governor(ssh: SSHClient) -> CheckResult:
     if "performance" in value:
         return CheckResult("cpu_governor", value, "ok", "")
     return CheckResult(
-        "cpu_governor", value, "critical",
+        "cpu_governor",
+        value,
+        "critical",
         "echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor",
     )
 
 
-def _transparent_hugepages(ssh: SSHClient) -> CheckResult:
+def _transparent_hugepages(ssh: SSHLike) -> CheckResult:
     r = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled")
     raw = r.stdout.strip()
     # Extract the active value from [brackets]
     import re as _re
+
     m = _re.search(r"\[(\w+)\]", raw)
     active = m.group(1) if m else raw
     if active in ("never", "madvise"):
         return CheckResult("transparent_hugepages", active, "ok", "")
     return CheckResult(
-        "transparent_hugepages", active, "warning",
+        "transparent_hugepages",
+        active,
+        "warning",
         "echo never > /sys/kernel/mm/transparent_hugepage/enabled",
     )
 
 
-def _selinux_mode(ssh: SSHClient) -> CheckResult:
+def _selinux_mode(ssh: SSHLike) -> CheckResult:
     r = ssh.execute("getenforce 2>/dev/null || echo Disabled")
     value = r.stdout.strip()
     if value == "Enforcing":
         return CheckResult(
-            "selinux_mode", value, "warning",
+            "selinux_mode",
+            value,
+            "warning",
             "setenforce 0  # or tune policy with audit2allow",
         )
     return CheckResult("selinux_mode", value, "ok", "")
 
 
-def _sysctl_net_params(ssh: SSHClient) -> CheckResult:
+def _sysctl_net_params(ssh: SSHLike) -> CheckResult:
     params = {
         "net.core.somaxconn": 4096,
         "net.ipv4.tcp_max_syn_backlog": 4096,
@@ -100,50 +109,57 @@ def _sysctl_net_params(ssh: SSHClient) -> CheckResult:
         pass
 
     status = "warning" if recommendations else "ok"
-    return CheckResult("sysctl_net_params", summary, status,
-                       " && ".join(recommendations))
+    return CheckResult("sysctl_net_params", summary, status, " && ".join(recommendations))
 
 
-def _irq_affinity(ssh: SSHClient) -> CheckResult:
+def _irq_affinity(ssh: SSHLike) -> CheckResult:
     r = ssh.execute("cat /proc/interrupts | grep -i eth | head -5")
     value = r.stdout.strip() or "no ethernet IRQs found"
     r2 = ssh.execute("nproc")
     cores = r2.stdout.strip()
     return CheckResult(
-        "irq_affinity", f"cores={cores} | {value[:200]}", "warning" if value else "ok",
+        "irq_affinity",
+        f"cores={cores} | {value[:200]}",
+        "warning" if value else "ok",
         "Use irqbalance or set /proc/irq/N/smp_affinity manually",
     )
 
 
-def _filesystem_mount_options(ssh: SSHClient) -> CheckResult:
+def _filesystem_mount_options(ssh: SSHLike) -> CheckResult:
     r = ssh.execute("findmnt -o TARGET,OPTIONS | grep -v 'relatime\\|noatime' | grep 'atime'")
     value = r.stdout.strip()
     if value:
         return CheckResult(
-            "filesystem_mount_options", value, "warning",
+            "filesystem_mount_options",
+            value,
+            "warning",
             "Add 'noatime' to mount options in /etc/fstab and remount",
         )
     return CheckResult("filesystem_mount_options", "noatime or relatime in use", "ok", "")
 
 
-def _numa_topology(ssh: SSHClient) -> CheckResult:
+def _numa_topology(ssh: SSHLike) -> CheckResult:
     r = ssh.execute("numactl --hardware 2>/dev/null || echo 'numactl not installed'")
     raw = r.stdout.strip()
     # Count nodes and extract CPU list
-    node_count = len([l for l in raw.splitlines() if l.startswith("node") and "cpus:" in l])
-    cpus_line = next((l for l in raw.splitlines() if "cpus:" in l), "")
+    node_count = len(
+        [line for line in raw.splitlines() if line.startswith("node") and "cpus:" in line]
+    )
+    cpus_line = next((line for line in raw.splitlines() if "cpus:" in line), "")
     summary = f"{node_count} node(s)"
     if cpus_line:
         summary += f", {cpus_line.strip()}"
     if node_count > 1:
         return CheckResult(
-            "numa_topology", summary, "warning",
+            "numa_topology",
+            summary,
+            "warning",
             f"System has {node_count} NUMA nodes — consider numactl --cpunodebind=0 --membind=0",
         )
     return CheckResult("numa_topology", summary, "ok", "")
 
 
-def _open_file_limits(ssh: SSHClient) -> CheckResult:
+def _open_file_limits(ssh: SSHLike) -> CheckResult:
     soft_r = ssh.execute("ulimit -n")
     hard_r = ssh.execute("ulimit -Hn")
     sysmax_r = ssh.execute("cat /proc/sys/fs/file-max")
@@ -156,20 +172,23 @@ def _open_file_limits(ssh: SSHClient) -> CheckResult:
     value = f"soft={soft}, hard={hard}, system-max={sysmax}"
     if soft < 65536:
         return CheckResult(
-            "open_file_limits", value, "warning",
+            "open_file_limits",
+            value,
+            "warning",
             "echo '* soft nofile 65536\\n* hard nofile 65536' >> /etc/security/limits.conf",
         )
     return CheckResult("open_file_limits", value, "ok", "")
 
 
-def _nic_offloading(ssh: SSHClient) -> CheckResult:
-    r = ssh.execute(
-        "ip link show | grep -oP '(?<=\\d: )\\w+' | grep -v lo | head -1"
-    )
+def _nic_offloading(ssh: SSHLike) -> CheckResult:
+    r = ssh.execute("ip link show | grep -oP '(?<=\\d: )\\w+' | grep -v lo | head -1")
     iface = r.stdout.strip()
     if not iface:
         return CheckResult("nic_offloading", "no interface found", "ok", "")
-    r2 = ssh.execute(f"ethtool -k {iface} 2>/dev/null | grep -E 'rx-checksum|tx-checksum|tcp-seg|generic-receive'")
+    r2 = ssh.execute(
+        f"ethtool -k {iface} 2>/dev/null | "
+        "grep -E 'rx-checksum|tx-checksum|tcp-seg|generic-receive'"
+    )
     # Compact: extract on/off status
     features = {}
     for line in r2.stdout.strip().splitlines():
@@ -180,7 +199,7 @@ def _nic_offloading(ssh: SSHClient) -> CheckResult:
     return CheckResult("nic_offloading", summary[:120], "ok", "")
 
 
-def _kernel_version(ssh: SSHClient) -> CheckResult:
+def _kernel_version(ssh: SSHLike) -> CheckResult:
     r = ssh.execute("uname -r")
     value = r.stdout.strip()
     return CheckResult("kernel_version", value, "ok", "")
