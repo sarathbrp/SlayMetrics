@@ -25,16 +25,28 @@ class NginxAdapter(ServiceAdapter):
     EVENTS_DIRECTIVES = {
         "worker_connections", "use", "multi_accept",
     }
-    # Not a real directive — needs special handling
+    # Directives that belong in server {} block
+    SERVER_DIRECTIVES = {
+        "listen", "server_name", "root",
+    }
+    # Not real directives or need special handling — reject outright
     SKIP_DIRECTIVES = {"listen_backlog"}
 
     def apply_config(self, parameter: str, value: str) -> bool:
+        # Handle listen_backlog specially — modifies existing listen directives
+        if parameter == "listen_backlog":
+            return self._set_listen_backlog(value)
         if parameter in self.SKIP_DIRECTIVES:
             return False
+        if parameter in self.SERVER_DIRECTIVES:
+            return False  # server block directives need special handling
 
         config_path = self._cfg["config_path"]
         current = self._ssh.execute(f"cat {config_path}").stdout
         lines = current.splitlines()
+
+        # Backup before modifying
+        self._ssh.execute(f"cp {config_path} {config_path}.bak")
 
         # Determine block and indent
         if parameter in self.MAIN_DIRECTIVES:
@@ -50,13 +62,12 @@ class NginxAdapter(ServiceAdapter):
         new_directive = f"{indent}{parameter} {value};"
 
         # First: remove ALL existing occurrences of this directive (prevent duplicates)
-        pattern = re.compile(rf"^\s*{re.escape(parameter)}\s+[^;]*;", re.MULTILINE)
+        pattern = re.compile(rf"^\s*{re.escape(parameter)}\s+[^;]*;")
         cleaned = [l for l in lines if not pattern.match(l)]
 
         # Find insertion point based on block
         insert_idx = None
         if block == "main":
-            # Insert after the last main-level directive before events/http
             for i, line in enumerate(cleaned):
                 if re.match(r"^(worker_processes|pid|error_log)\s", line):
                     insert_idx = i + 1
@@ -76,12 +87,57 @@ class NginxAdapter(ServiceAdapter):
         if insert_idx is not None:
             cleaned.insert(insert_idx, new_directive)
 
-        # Write back
+        # Write to temp, test, then apply
         new_config = "\n".join(cleaned) + "\n"
-        # Use a temp file to avoid partial writes
         self._ssh.execute(f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF")
         self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
+        # Validate — rollback if broken
+        test = self._ssh.execute("nginx -t 2>&1")
+        if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            return False
+
+        return True
+
+    def _set_listen_backlog(self, backlog: str) -> bool:
+        """Add backlog= to listen directives inside server {} blocks only."""
+        config_path = self._cfg["config_path"]
+        current = self._ssh.execute(f"cat {config_path}").stdout
+        self._ssh.execute(f"cp {config_path} {config_path}.bak")
+
+        lines = current.splitlines()
+        new_lines = []
+        in_server = False
+        brace_depth = 0
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Track server block depth
+            if re.match(r"server\s*\{", stripped):
+                in_server = True
+                brace_depth = 0
+            if in_server:
+                brace_depth += stripped.count("{") - stripped.count("}")
+                if brace_depth <= 0 and "}" in stripped:
+                    in_server = False
+
+            # Only modify listen inside server blocks.
+            if in_server and re.match(r"listen\s+", stripped):
+                line = _rewrite_listen_backlog_line(line, backlog)
+
+            new_lines.append(line)
+
+        new_config = "\n".join(new_lines) + "\n"
+        self._ssh.execute(f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF")
+        self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
+
+        # Validate — rollback if broken
+        test = self._ssh.execute("nginx -t 2>&1")
+        if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            return False
         return True
 
     def benchmark(self, duration: int = 30, url: str = "") -> BenchmarkResult:
@@ -194,6 +250,30 @@ def _extract_latency(text: str, percentile: str) -> float:
     if unit == "s":
         return value * 1000
     return value
+
+
+def _rewrite_listen_backlog_line(line: str, backlog: str) -> str:
+    """Rewrite one listen directive line to set backlog=<value>, preserving comments."""
+    comment = ""
+    hash_idx = line.find("#")
+    if hash_idx != -1:
+        comment = line[hash_idx:]
+        line = line[:hash_idx]
+
+    m = re.match(r"^(\s*listen\s+)([^;]*)(;\s*)?$", line.rstrip())
+    if not m:
+        return line + (f" {comment}" if comment else "")
+
+    prefix = m.group(1)
+    args = m.group(2).strip()
+
+    parts = [p for p in args.split() if not p.startswith("backlog=")]
+    parts.append(f"backlog={backlog}")
+    rewritten = f"{prefix}{' '.join(parts)};"
+
+    if comment:
+        rewritten = f"{rewritten} {comment}"
+    return rewritten
 
 
 def _parse_sar_avg(sar_output: str) -> float:

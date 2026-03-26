@@ -11,7 +11,7 @@ _log_file = None
 _verbose = False
 
 
-def init(session_id: str, verbose: bool = False, log_dir: str = "report") -> None:
+def init(session_id: str, verbose: bool = False, log_dir: str = "report") -> str:
     global _log_file, _verbose
     _verbose = verbose
     os.makedirs(log_dir, exist_ok=True)
@@ -22,6 +22,8 @@ def init(session_id: str, verbose: bool = False, log_dir: str = "report") -> Non
     _log_file.write(f"Started: {datetime.now().isoformat()}\n\n")
     _log_file.flush()
     _console.print(f"[dim]Log file:[/dim] {path}")
+    _console.print(f"[dim]Report will be saved to:[/dim] {log_dir}/report_*_{session_id}.md")
+    return path
 
 
 def log(agent: str, message: str, level: str = "info") -> None:

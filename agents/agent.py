@@ -43,6 +43,7 @@ Rules:
 - Use the batch tools — do not run individual commands for config changes
 - Keep it to 3 fixes maximum
 - If inspect shows something is already configured correctly, skip it
+- query_memory is capped at 3 calls; use it only for high-value lookups
 """
 
 
@@ -265,10 +266,20 @@ def build(model) -> Agent:
         ctx.deps.token_counter.tool_calls += 1
         return result.__dict__
 
+    _memory_query_count = 0
+    MAX_MEMORY_QUERIES = 3
+
     @agent.tool
     async def query_memory(ctx: RunContext[AgentDeps], symptom: str) -> list[dict]:
-        """Search the knowledge base and past findings for similar symptoms."""
-        tool_call("memory", f"query: {symptom[:80]}")
+        """Search the knowledge base and past findings. Limited to 3 queries — use wisely."""
+        nonlocal _memory_query_count
+        _memory_query_count += 1
+        if _memory_query_count > MAX_MEMORY_QUERIES:
+            tool_call("memory", f"BLOCKED — limit reached ({MAX_MEMORY_QUERIES})")
+            tool_result("memory", "limit reached; returning no additional memory results")
+            ctx.deps.token_counter.tool_calls += 1
+            return []
+        tool_call("memory", f"query {_memory_query_count}/{MAX_MEMORY_QUERIES}: {symptom[:80]}")
         results = ctx.deps.memory.semantic_search(symptom, ctx.deps.session_id, top_k=5)
         tool_result("memory", f"{len(results)} results found")
         ctx.deps.token_counter.tool_calls += 1
