@@ -1,5 +1,5 @@
 llm:
-  active_profile: granite-local        # change this one line to switch LLM
+  active_profile: claude-haiku          # change this one line to switch LLM
 
   profiles:
     granite-local:                     # default: fully local, air-gapped
