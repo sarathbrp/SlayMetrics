@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Agent output
+report/
+
+# Internal planning docs (not for sharing)
+idea.txt
+problem-statement.txt
+perfConfHackathon2026
+REQUIREMENT-MATRIX.md
+REQUIREMENTS.md
+
+# Claude Code
+.claude/
+
+# TiDB data
+/data/
+
+# SSH keys
+*.pem
+id_rsa
+id_ed25519
+
+# Environment
+.env
+.env.*

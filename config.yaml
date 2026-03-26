@@ -1,0 +1,76 @@
+llm:
+  active_profile: granite-local        # change this one line to switch LLM
+
+  profiles:
+    granite-local:                     # default: fully local, air-gapped
+      backend: vllm
+      model: granite-3.1-8b-lab-v2.1
+      base_url: http://localhost:8000/v1
+
+    claude-remote:                     # best reasoning, requires API key
+      backend: claude
+      model: claude-opus-4-6
+      api_key_env: ANTHROPIC_API_KEY
+
+    ollama-local:                      # lightweight alternative, zero infra
+      backend: ollama
+      model: llama3.2
+      base_url: http://localhost:11434/v1
+
+memory:
+  backend: tidb
+  host: localhost
+  port: 4000
+  database: perfagent
+  user: root
+  password_env: TIDB_PASSWORD          # leave unset for local tiup playground
+
+target:
+  host: 192.168.1.100
+  ssh_user: root
+  ssh_key: ~/.ssh/id_rsa
+  ssh_timeout: 30
+
+service:
+  name: nginx
+  type: webserver
+  config_path: /etc/nginx/nginx.conf
+  systemd_unit: nginx.service
+  log_path: /var/log/nginx/access.log
+  benchmark:
+    tool: wrk2
+    duration: 30
+    threads: 4
+    connections: 100
+    rate: 2000
+    small_file_url: "http://localhost/1kb.html"
+    medium_file_url: "http://localhost/100kb.html"
+    large_file_url: "http://localhost/1mb.html"
+  metrics:
+    - requests_per_sec
+    - latency_p50
+    - latency_p99
+    - error_rate
+
+rhel:
+  checks:
+    - cpu_governor
+    - transparent_hugepages
+    - selinux_mode
+    - sysctl_net_params
+    - irq_affinity
+    - filesystem_mount_options
+    - numa_topology
+    - open_file_limits
+    - nic_offloading
+    - kernel_version
+
+agent:
+  improvement_threshold_pct: 5        # min % improvement to count a fix as worthwhile
+  max_iterations: 50                   # safety cap on hypothesis loop
+  benchmark_after_every_fix: true
+  stability:
+    enabled: true                      # run sustained stability test after all fixes
+    duration_sec: 1800                 # 30 minutes total
+    sample_interval_sec: 60            # one wrk2 run per minute
+    url_key: small_file_url            # which payload to use for stability
