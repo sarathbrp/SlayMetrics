@@ -208,29 +208,20 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6.5: Capture system throughput limits (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
-    logger.step("Step 6.5: Capturing system throughput limits...")
+    # Capture system throughput limits silently (for report only)
     throughput_info = {}
-
-    # NIC speed
     r = ssh.execute("ethtool ens3 2>/dev/null | grep Speed || "
                     "cat /sys/class/net/$(ip route | awk '/default/{print $5}')/speed 2>/dev/null")
     throughput_info["nic_speed"] = r.stdout.strip()[:50]
-
-    # Disk throughput (quick dd test)
     r = ssh.execute("dd if=/dev/zero of=/tmp/disktest bs=1M count=256 oflag=direct 2>&1 | tail -1")
     throughput_info["disk_write"] = r.stdout.strip()[:80]
     ssh.execute("rm -f /tmp/disktest")
-
-    # Network throughput per payload
     for size in PAYLOAD_SIZES:
         data = finals.get(size, {})
         rps = data.get("rps", 0)
-        file_sizes = {"small": 1, "medium": 100, "large": 1024}  # KB
-        throughput_mbps = (rps * file_sizes.get(size, 1)) / 1024  # MB/s
-        throughput_info[f"{size}_throughput_mb_s"] = round(throughput_mbps, 1)
-
-    for k, v in throughput_info.items():
-        logger.status("throughput", f"{k}: {v}")
+        file_sizes = {"small": 1, "medium": 100, "large": 1024}
+        throughput_info[f"{size}_throughput_mb_s"] = round(
+            (rps * file_sizes.get(size, 1)) / 1024, 1)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 7: Stability test (direct wrk2 loop — no LLM)

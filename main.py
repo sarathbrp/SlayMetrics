@@ -229,7 +229,7 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
         logger.log("main", f"Error: {e}", "error")
         raise
     finally:
-        logger.log("main", "Cleaning up...", "info")
+        # Silent cleanup
         logger.close()
         ssh.disconnect()
         memory.disconnect()

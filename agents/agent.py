@@ -26,7 +26,8 @@ Steps:
 2. Apply all missing nginx fixes in ONE batch using apply_nginx_tuning
 3. Apply all missing system fixes in ONE batch using apply_system_tuning
 4. Benchmark AFTER fixes (baseline numbers are already provided — do NOT benchmark before)
-5. Save findings and return DiagnosisOutput
+5. Save TWO findings only: one for "nginx_tuning" batch, one for "system_tuning" batch
+6. Return DiagnosisOutput with fixes_applied containing 2 entries (one per batch)
 
 Proven fixes (apply ALL that are not already configured):
 
@@ -56,7 +57,10 @@ SYSTEM (apply via apply_system_tuning):
 Rules:
 - Do NOT repeat previously applied fixes
 - Do NOT install packages or reboot
+- Do NOT benchmark before applying fixes — baselines are already provided
 - If inspect shows a fix is already applied, skip it
+- Save exactly 2 findings: one for nginx batch, one for system batch
+- Use baseline RPS from context as before_rps, benchmark result as after_rps
 """
 
 
@@ -91,100 +95,118 @@ def build(model) -> Agent:
                 normalized[key] = str(value)
         return normalized, None
 
+    # Proven optimal values — inspect compares against these
+    NGINX_TARGETS = {
+        "worker_connections": "8192",
+        "open_file_cache": "max=10000 inactive=60s",
+        "open_file_cache_valid": "30s",
+        "open_file_cache_min_uses": "2",
+        "worker_rlimit_nofile": "65536",
+        "access_log": "off",
+        "tcp_nodelay": "on",
+        "keepalive_requests": "1000",
+        "gzip": "on",
+        "gzip_comp_level": "1",
+        "listen_backlog": "65535",
+    }
+
+    SYSTEM_TARGETS = {
+        "net.core.somaxconn": "65535",
+        "net.ipv4.tcp_max_syn_backlog": "65535",
+        "net.core.netdev_max_backlog": "65535",
+        "transparent_hugepage": "never",
+        "selinux": "permissive",
+        "net.ipv4.tcp_tw_reuse": "1",
+        "net.core.rmem_max": "16777216",
+        "net.core.wmem_max": "16777216",
+    }
+
     @agent.tool
     async def inspect_nginx_config(ctx: RunContext[AgentDeps]) -> dict:
-        """Inspect all performance-relevant nginx configuration directives in one call."""
-        tool_call("inspect", "nginx config — all tunable directives")
+        """Inspect nginx config and return only what needs fixing vs proven targets."""
+        tool_call("inspect", "nginx config — comparing against proven fixes")
         ssh = ctx.deps.ssh
 
-        # Get full config via nginx -T
         raw = ssh.execute("nginx -T 2>/dev/null").stdout
 
-        # Parse key directives
-        directives = {}
-        patterns = [
-            "worker_processes", "worker_connections", "sendfile",
-            "tcp_nopush", "tcp_nodelay", "keepalive_timeout",
-            "keepalive_requests", "open_file_cache", "access_log",
-            "worker_rlimit_nofile", "gzip", "gzip_comp_level",
-            "gzip_types", "reset_timedout_connection", "lingering_close",
-        ]
-        for d in patterns:
-            m = re.search(rf"^\s*{d}\s+(.+?);", raw, re.MULTILINE)
-            directives[d] = m.group(1).strip() if m else "not set"
+        # Parse current values
+        current = {}
+        for d in NGINX_TARGETS:
+            if d == "listen_backlog":
+                m = re.search(r"listen\s+.*backlog=(\d+)", raw)
+                current[d] = m.group(1) if m else "not set"
+            else:
+                m = re.search(rf"^\s*{d}\s+(.+?);", raw, re.MULTILINE)
+                current[d] = m.group(1).strip() if m else "not set"
 
-        # Listen backlog
-        m = re.search(r"listen\s+.*backlog=(\d+)", raw)
-        directives["listen_backlog"] = m.group(1) if m else "not set (default 511)"
+        # Compare against targets
+        needs_fixing = {}
+        already_ok = []
+        for param, target in NGINX_TARGETS.items():
+            cur = current.get(param, "not set")
+            if cur == "not set" or cur != target:
+                needs_fixing[param] = {"current": cur, "target": target}
+            else:
+                already_ok.append(param)
 
-        # Worker count vs CPU
-        nproc = ssh.execute("nproc").stdout.strip().splitlines()[0]
-        workers = ssh.execute("pgrep -c 'nginx: worker' 2>/dev/null || echo 0").stdout.strip().splitlines()[0]
-        try:
-            directives["cpu_cores"] = int(nproc)
-            directives["active_workers"] = int(workers)
-        except ValueError:
-            directives["cpu_cores"] = 0
-            directives["active_workers"] = 0
+        result = {
+            "needs_fixing": needs_fixing,
+            "already_ok": already_ok,
+        }
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(
             ctx.deps.session_id, "command_output", "inspect_nginx",
-            str(directives), "nginx config inspection",
+            str(result), f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
         )
-        tool_result("inspect", f"nginx: {len(directives)} directives inspected")
-        return directives
+        tool_result("inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok")
+        return result
 
     @agent.tool
     async def inspect_system_tuning(ctx: RunContext[AgentDeps]) -> dict:
-        """Inspect all performance-relevant OS/kernel parameters in one call."""
-        tool_call("inspect", "system tuning — sysctl, THP, SELinux, limits")
+        """Inspect system tuning and return only what needs fixing vs proven targets."""
+        tool_call("inspect", "system tuning — comparing against proven fixes")
         ssh = ctx.deps.ssh
 
-        state = {}
+        current = {}
 
         # Sysctl params
-        sysctl_keys = [
-            "net.core.somaxconn", "net.ipv4.tcp_max_syn_backlog",
-            "net.core.netdev_max_backlog", "net.ipv4.tcp_tw_reuse",
-            "net.ipv4.tcp_autocorking", "net.core.rmem_max",
-            "net.core.wmem_max", "net.ipv4.ip_local_port_range",
-            "net.ipv4.tcp_fin_timeout",
-        ]
-        r = ssh.execute(f"sysctl {' '.join(sysctl_keys)} 2>/dev/null")
-        for line in r.stdout.strip().splitlines():
-            if "=" in line:
-                k, _, v = line.partition("=")
-                state[k.strip()] = v.strip()
+        for key in ["net.core.somaxconn", "net.ipv4.tcp_max_syn_backlog",
+                     "net.core.netdev_max_backlog", "net.ipv4.tcp_tw_reuse",
+                     "net.core.rmem_max", "net.core.wmem_max"]:
+            r = ssh.execute(f"sysctl -n {key} 2>/dev/null")
+            current[key] = r.stdout.strip()
 
         # THP
         r = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
         m = re.search(r"\[(\w+)\]", r.stdout)
-        state["transparent_hugepages"] = m.group(1) if m else "unknown"
+        current["transparent_hugepage"] = m.group(1) if m else "unknown"
 
         # SELinux
-        state["selinux"] = ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip()
+        current["selinux"] = ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip().lower()
 
-        # CPU governor
-        r = ssh.execute("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null")
-        state["cpu_governor"] = r.stdout.strip() or "not available (VM)"
+        # Compare against targets
+        needs_fixing = {}
+        already_ok = []
+        for param, target in SYSTEM_TARGETS.items():
+            cur = current.get(param, "unknown")
+            if cur != target:
+                needs_fixing[param] = {"current": cur, "target": target}
+            else:
+                already_ok.append(param)
 
-        # File limits
-        state["ulimit_nofile"] = ssh.execute("ulimit -n").stdout.strip()
-        state["fs_file_max"] = ssh.execute("cat /proc/sys/fs/file-max").stdout.strip()
-
-        # Tuned profile
-        state["tuned_profile"] = ssh.execute(
-            "tuned-adm active 2>/dev/null | awk -F': ' '{print $2}' || echo 'not installed'"
-        ).stdout.strip()
+        result = {
+            "needs_fixing": needs_fixing,
+            "already_ok": already_ok,
+        }
 
         ctx.deps.token_counter.tool_calls += 1
         ctx.deps.memory.save_context(
             ctx.deps.session_id, "command_output", "inspect_system",
-            str(state), "system tuning inspection",
+            str(result), f"system: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
         )
-        tool_result("inspect", f"system: {len(state)} parameters inspected")
-        return state
+        tool_result("inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok")
+        return result
 
     @agent.tool
     async def apply_nginx_tuning(ctx: RunContext[AgentDeps],
@@ -211,7 +233,7 @@ def build(model) -> Agent:
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
         tool_call("apply_nginx", f"{len(changes)} changes: {', '.join(changes.keys())}")
-        log("agent", f"Reason: {reason[:150]}", "info")
+        log("agent", f"Reason: {reason}", "info")
 
         config_path = ctx.deps.config["service"]["config_path"]
         batch_backup = f"/tmp/slay_nginx_batch_{ctx.deps.session_id}.conf"
@@ -259,7 +281,7 @@ def build(model) -> Agent:
                 f"apply_nginx:{','.join(changes.keys())}"[:250],
                 str(result), reason,
             )
-            tool_result("apply_nginx", f"FAILED: {error_msg[:100]}")
+            tool_result("apply_nginx", f"FAILED: {error_msg}")
             return result
 
         # Config valid — reload
@@ -295,7 +317,7 @@ def build(model) -> Agent:
 
         changes = normalized_changes
         tool_call("apply_system", f"{len(changes)} changes: {', '.join(changes.keys())}")
-        log("agent", f"Reason: {reason[:150]}", "info")
+        log("agent", f"Reason: {reason}", "info")
 
         ssh = ctx.deps.ssh
         applied = {}
@@ -307,7 +329,7 @@ def build(model) -> Agent:
                 if r.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()[:100]
+                    failed[param] = r.stderr.strip()
             elif param == "selinux":
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
                 r = ssh.execute(f"setenforce {mode} 2>&1")
@@ -317,7 +339,7 @@ def build(model) -> Agent:
                 if r.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()[:100]
+                    failed[param] = r.stderr.strip()
 
         result = {"applied": applied, "failed": failed}
 
@@ -361,7 +383,7 @@ def build(model) -> Agent:
             tool_result("memory", "limit reached; returning no additional memory results")
             ctx.deps.token_counter.tool_calls += 1
             return []
-        tool_call("memory", f"query {_memory_query_count}/{MAX_MEMORY_QUERIES}: {symptom[:80]}")
+        tool_call("memory", f"query {_memory_query_count}/{MAX_MEMORY_QUERIES}: {symptom}")
         results = ctx.deps.memory.semantic_search(symptom, ctx.deps.session_id, top_k=5)
         tool_result("memory", f"{len(results)} results found")
         ctx.deps.token_counter.tool_calls += 1

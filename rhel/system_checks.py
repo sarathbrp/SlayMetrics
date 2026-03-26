@@ -38,7 +38,9 @@ def _cpu_governor(ssh: SSHClient) -> CheckResult:
     r = ssh.execute(
         "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u"
     )
-    value = r.stdout.strip() or "unknown"
+    value = r.stdout.strip()
+    if not value:
+        return CheckResult("cpu_governor", "not available (VM)", "ok", "")
     if "performance" in value:
         return CheckResult("cpu_governor", value, "ok", "")
     return CheckResult(
@@ -49,11 +51,15 @@ def _cpu_governor(ssh: SSHClient) -> CheckResult:
 
 def _transparent_hugepages(ssh: SSHClient) -> CheckResult:
     r = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled")
-    value = r.stdout.strip()
-    if "[never]" in value or "[madvise]" in value:
-        return CheckResult("transparent_hugepages", value, "ok", "")
+    raw = r.stdout.strip()
+    # Extract the active value from [brackets]
+    import re as _re
+    m = _re.search(r"\[(\w+)\]", raw)
+    active = m.group(1) if m else raw
+    if active in ("never", "madvise"):
+        return CheckResult("transparent_hugepages", active, "ok", "")
     return CheckResult(
-        "transparent_hugepages", value, "warning",
+        "transparent_hugepages", active, "warning",
         "echo never > /sys/kernel/mm/transparent_hugepage/enabled",
     )
 
@@ -70,25 +76,31 @@ def _selinux_mode(ssh: SSHClient) -> CheckResult:
 
 
 def _sysctl_net_params(ssh: SSHClient) -> CheckResult:
-    params = [
-        "net.core.somaxconn",
-        "net.ipv4.tcp_max_syn_backlog",
-        "net.core.netdev_max_backlog",
-        "net.ipv4.tcp_tw_reuse",
-    ]
-    r = ssh.execute(f"sysctl {' '.join(params)} 2>/dev/null")
-    value = r.stdout.strip()
+    params = {
+        "net.core.somaxconn": 4096,
+        "net.ipv4.tcp_max_syn_backlog": 4096,
+        "net.core.netdev_max_backlog": 1000,
+        "net.ipv4.tcp_tw_reuse": 0,
+    }
+    values = {}
+    for p in params:
+        r = ssh.execute(f"sysctl -n {p} 2>/dev/null")
+        values[p] = r.stdout.strip()
+
+    # Build compact summary
+    summary = ", ".join(f"{k.split('.')[-1]}={v}" for k, v in values.items())
+
     recommendations = []
-    if "net.core.somaxconn = " in value:
-        val = int(_sysctl_val(value, "net.core.somaxconn"))
-        if val < 4096:
+    try:
+        if int(values.get("net.core.somaxconn", "0")) < 4096:
             recommendations.append("sysctl -w net.core.somaxconn=65535")
-    if "net.ipv4.tcp_max_syn_backlog = " in value:
-        val = int(_sysctl_val(value, "net.ipv4.tcp_max_syn_backlog"))
-        if val < 4096:
+        if int(values.get("net.ipv4.tcp_max_syn_backlog", "0")) < 4096:
             recommendations.append("sysctl -w net.ipv4.tcp_max_syn_backlog=65535")
+    except ValueError:
+        pass
+
     status = "warning" if recommendations else "ok"
-    return CheckResult("sysctl_net_params", value, status,
+    return CheckResult("sysctl_net_params", summary, status,
                        " && ".join(recommendations))
 
 
@@ -116,28 +128,37 @@ def _filesystem_mount_options(ssh: SSHClient) -> CheckResult:
 
 def _numa_topology(ssh: SSHClient) -> CheckResult:
     r = ssh.execute("numactl --hardware 2>/dev/null || echo 'numactl not installed'")
-    value = r.stdout.strip()
-    nodes = value.count("node") if "node" in value else 0
-    if nodes > 1:
+    raw = r.stdout.strip()
+    # Count nodes and extract CPU list
+    node_count = len([l for l in raw.splitlines() if l.startswith("node") and "cpus:" in l])
+    cpus_line = next((l for l in raw.splitlines() if "cpus:" in l), "")
+    summary = f"{node_count} node(s)"
+    if cpus_line:
+        summary += f", {cpus_line.strip()}"
+    if node_count > 1:
         return CheckResult(
-            "numa_topology", value[:300], "warning",
-            f"System has {nodes} NUMA nodes — consider numactl --cpunodebind=0 --membind=0",
+            "numa_topology", summary, "warning",
+            f"System has {node_count} NUMA nodes — consider numactl --cpunodebind=0 --membind=0",
         )
-    return CheckResult("numa_topology", value[:200], "ok", "")
+    return CheckResult("numa_topology", summary, "ok", "")
 
 
 def _open_file_limits(ssh: SSHClient) -> CheckResult:
-    r = ssh.execute("ulimit -n && cat /proc/sys/fs/file-max")
-    value = r.stdout.strip()
+    soft_r = ssh.execute("ulimit -n")
+    hard_r = ssh.execute("ulimit -Hn")
+    sysmax_r = ssh.execute("cat /proc/sys/fs/file-max")
     try:
-        soft = int(value.split("\n")[0])
-        if soft < 65536:
-            return CheckResult(
-                "open_file_limits", value, "warning",
-                "echo '* soft nofile 65536\n* hard nofile 65536' >> /etc/security/limits.conf",
-            )
-    except (ValueError, IndexError):
-        pass
+        soft = int(soft_r.stdout.strip())
+        hard = int(hard_r.stdout.strip())
+    except ValueError:
+        soft, hard = 0, 0
+    sysmax = sysmax_r.stdout.strip()
+    value = f"soft={soft}, hard={hard}, system-max={sysmax}"
+    if soft < 65536:
+        return CheckResult(
+            "open_file_limits", value, "warning",
+            "echo '* soft nofile 65536\\n* hard nofile 65536' >> /etc/security/limits.conf",
+        )
     return CheckResult("open_file_limits", value, "ok", "")
 
 
@@ -148,9 +169,15 @@ def _nic_offloading(ssh: SSHClient) -> CheckResult:
     iface = r.stdout.strip()
     if not iface:
         return CheckResult("nic_offloading", "no interface found", "ok", "")
-    r2 = ssh.execute(f"ethtool -k {iface} 2>/dev/null | grep -E 'tx-checksum|rx-checksum|scatter'")
-    value = r2.stdout.strip() or "ethtool not available"
-    return CheckResult("nic_offloading", f"{iface}: {value[:200]}", "ok", "")
+    r2 = ssh.execute(f"ethtool -k {iface} 2>/dev/null | grep -E 'rx-checksum|tx-checksum|tcp-seg|generic-receive'")
+    # Compact: extract on/off status
+    features = {}
+    for line in r2.stdout.strip().splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            features[k.strip()] = v.strip().split()[0]  # "on [fixed]" → "on"
+    summary = f"{iface}: " + ", ".join(f"{k}={v}" for k, v in features.items())
+    return CheckResult("nic_offloading", summary[:120], "ok", "")
 
 
 def _kernel_version(ssh: SSHClient) -> CheckResult:
