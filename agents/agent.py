@@ -13,56 +13,29 @@ from core.log import llm_call, log, tokens, tool_call, tool_result
 
 
 class DiagnosisOutput(BaseModel):
-    """Final output after the agent has diagnosed and fixed issues."""
+    """Minimal output — orchestrator builds the full report from tool returns."""
 
-    fixes_applied: list[dict]
-    summary: str
-    total_improvement_pct: float
+    nginx_applied: bool
+    system_applied: bool
+    after_rps: float
+    improvement_pct: float
+    notes: str = ""
 
 
 SYSTEM_PROMPT = """\
-You are SlayMetricsAgent — an autonomous performance diagnostics and remediation agent.
+You are SlayMetricsAgent. Steps:
+1. Inspect nginx and system tuning
+2. Apply missing nginx fixes via apply_nginx_tuning
+3. Apply missing system fixes via apply_system_tuning
+4. Benchmark AFTER (baselines are provided — do NOT benchmark before)
+5. Call save_findings with both results in one call
+6. Return DiagnosisOutput
 
-Steps:
-1. Inspect current nginx config and system tuning
-2. Apply all missing nginx fixes in ONE batch using apply_nginx_tuning
-3. Apply all missing system fixes in ONE batch using apply_system_tuning
-4. Benchmark AFTER fixes (baseline numbers are already provided — do NOT benchmark before)
-5. Save TWO findings only: one for "nginx_tuning" batch, one for "system_tuning" batch
-6. Return DiagnosisOutput with fixes_applied containing 2 entries (one per batch)
+Proven nginx fixes: worker_connections=8192, open_file_cache=max=10000 inactive=60s, open_file_cache_valid=30s, open_file_cache_min_uses=2, worker_rlimit_nofile=65536, access_log=off, tcp_nodelay=on, keepalive_requests=1000, gzip=on, gzip_comp_level=1, listen_backlog=65535
 
-Proven fixes (apply ALL that are not already configured):
+Proven system fixes: net.core.somaxconn=65535, net.ipv4.tcp_max_syn_backlog=65535, net.core.netdev_max_backlog=65535, transparent_hugepage=never, selinux=permissive, net.ipv4.tcp_tw_reuse=1, net.core.rmem_max=16777216, net.core.wmem_max=16777216
 
-NGINX (apply via apply_nginx_tuning):
-- worker_connections: 8192
-- open_file_cache: max=10000 inactive=60s
-- open_file_cache_valid: 30s
-- open_file_cache_min_uses: 2
-- worker_rlimit_nofile: 65536
-- access_log: off
-- tcp_nodelay: on
-- keepalive_requests: 1000
-- gzip: on
-- gzip_comp_level: 1
-- listen_backlog: 65535
-
-SYSTEM (apply via apply_system_tuning):
-- net.core.somaxconn: 65535
-- net.ipv4.tcp_max_syn_backlog: 65535
-- net.core.netdev_max_backlog: 65535
-- transparent_hugepage: never
-- selinux: permissive
-- net.ipv4.tcp_tw_reuse: 1
-- net.core.rmem_max: 16777216
-- net.core.wmem_max: 16777216
-
-Rules:
-- Do NOT repeat previously applied fixes
-- Do NOT install packages or reboot
-- Do NOT benchmark before applying fixes — baselines are already provided
-- If inspect shows a fix is already applied, skip it
-- Save exactly 2 findings: one for nginx batch, one for system batch
-- Use baseline RPS from context as before_rps, benchmark result as after_rps
+Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
 """
 
 
@@ -229,7 +202,7 @@ def build(model) -> Agent:
 
     @agent.tool
     async def apply_nginx_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str, reason: str
+        ctx: RunContext[AgentDeps], changes: dict[str, str] | str
     ) -> dict:
         """Apply multiple nginx config changes in one batch, then reload.
         Example: {"sendfile": "on", "tcp_nopush": "on",
@@ -258,7 +231,6 @@ def build(model) -> Agent:
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
         tool_call("apply_nginx", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
-        log("agent", f"Reason: {reason}", "info")
 
         config_path = ctx.deps.config["service"]["config_path"]
         batch_backup = f"/tmp/slay_nginx_batch_{ctx.deps.session_id}.conf"
@@ -284,8 +256,8 @@ def build(model) -> Agent:
                     ctx.deps.session_id,
                     "command_output",
                     f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
-                    str(result),
-                    reason,
+                    f"applied={applied} failed={failed}",
+                    "nginx batch apply",
                 )
                 tool_result("apply_nginx", f"FAILED: {result['error']}")
                 return result
@@ -307,8 +279,8 @@ def build(model) -> Agent:
                 ctx.deps.session_id,
                 "command_output",
                 f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
-                str(result),
-                reason,
+                f"applied={applied} failed={failed}",
+                "nginx batch apply failed",
             )
             tool_result("apply_nginx", f"FAILED: {error_msg}")
             return result
@@ -325,22 +297,20 @@ def build(model) -> Agent:
             result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
         ctx.deps.token_counter.tool_calls += 1
+        summary = f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}"
         ctx.deps.memory.save_context(
             ctx.deps.session_id,
             "command_output",
             f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
-            str(result),
-            reason,
+            summary,
+            "nginx batch apply",
         )
-        tool_result(
-            "apply_nginx",
-            f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}",
-        )
+        tool_result("apply_nginx", summary)
         return result
 
     @agent.tool
     async def apply_system_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str, reason: str
+        ctx: RunContext[AgentDeps], changes: dict[str, str] | str
     ) -> dict:
         """Apply multiple sysctl/kernel changes in one batch.
         Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never",
@@ -360,7 +330,6 @@ def build(model) -> Agent:
             "apply_system",
             f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}",
         )
-        log("agent", f"Reason: {reason}", "info")
 
         ssh = ctx.deps.ssh
         applied = {}
@@ -387,14 +356,15 @@ def build(model) -> Agent:
         result = {"applied": applied, "failed": failed}
 
         ctx.deps.token_counter.tool_calls += 1
+        summary = f"applied={list(applied.keys())} failed={list(failed.keys())}"
         ctx.deps.memory.save_context(
             ctx.deps.session_id,
             "command_output",
             f"apply_system:{','.join(changes_dict.keys())}"[:250],
-            str(result),
-            reason,
+            summary,
+            "system batch apply",
         )
-        tool_result("apply_system", f"applied={list(applied.keys())} failed={list(failed.keys())}")
+        tool_result("apply_system", summary)
         return result
 
     @agent.tool
@@ -413,8 +383,8 @@ def build(model) -> Agent:
             ctx.deps.session_id,
             "benchmark",
             url,
-            str(result.__dict__),
-            f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms",
+            f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms CPU={result.cpu_pct:.1f}%",
+            "post-fix benchmark",
         )
         ctx.deps.token_counter.tool_calls += 1
         return result.__dict__
@@ -439,29 +409,28 @@ def build(model) -> Agent:
         return results
 
     @agent.tool
-    async def save_finding(
+    async def save_findings(
         ctx: RunContext[AgentDeps],
-        parameter: str,
-        reasoning: str,
-        before_value: str = "",
-        after_value: str = "",
-        before_rps: float = 0,
-        after_rps: float = 0,
-        impact_pct: float = 0,
+        findings: list[dict[str, Any]],
     ) -> bool:
-        """Save a fix result to long-term memory."""
-        tool_call("save", f"{parameter} ({impact_pct:+.1f}%)")
-        ctx.deps.memory.save_fact(
-            session_id=ctx.deps.session_id,
-            type="fix",
-            parameter=parameter,
-            reasoning=reasoning,
-            before_value=before_value,
-            after_value=after_value,
-            before_rps=before_rps,
-            after_rps=after_rps,
-            impact_pct=impact_pct,
-        )
+        """Save all fix results to memory in one call.
+        Each finding: {parameter, before_value, after_value, before_rps, after_rps, impact_pct}
+        """
+        tool_call("save", f"{len(findings)} findings")
+        for f in findings:
+            param = f.get("parameter", "unknown")
+            ctx.deps.memory.save_fact(
+                session_id=ctx.deps.session_id,
+                type="fix",
+                parameter=param,
+                reasoning=f.get("reasoning", "proven fix applied"),
+                before_value=f.get("before_value", ""),
+                after_value=f.get("after_value", ""),
+                before_rps=f.get("before_rps", 0),
+                after_rps=f.get("after_rps", 0),
+                impact_pct=f.get("impact_pct", 0),
+            )
+            tool_result("save", f"{param} ({f.get('impact_pct', 0):+.1f}%)")
         ctx.deps.token_counter.tool_calls += 1
         return True
 

@@ -144,25 +144,8 @@ async def run(model, deps: AgentDeps) -> str:
     else:
         logger.status("context", "No prior fixes found — fresh diagnosis")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4b: Query RAG knowledge base (vector search — no LLM)
-    # ══════════════════════════════════════════════════════════════════════════
-    logger.step("Step 4b: Querying knowledge base...")
-    rag_queries = [
-        "nginx performance tuning sendfile worker_processes tcp_nopush",
-        "RHEL sysctl network tuning somaxconn backlog",
-        "nginx open_file_cache static file serving optimization",
-    ]
-    knowledge_chunks = []
-    for q in rag_queries:
-        results = memory.semantic_search(q, top_k=2)
-        for r in results:
-            chunk = f"{r.get('parameter', '')}: {r.get('reasoning', '')[:200]}"
-            if chunk not in knowledge_chunks:
-                knowledge_chunks.append(chunk)
-                logger.log("rag", f"  {r.get('parameter', '')[:60]}", "info")
-
-    logger.status("rag", f"Retrieved {len(knowledge_chunks)} knowledge chunks")
+    # Step 4b removed — RAG knowledge is in system prompt (proven fixes list).
+    # Knowledge base stays in TiDB for query_memory tool if agent needs it.
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5: LLM diagnosis + remediation (ONE agent, ONE context)
@@ -176,8 +159,6 @@ async def run(model, deps: AgentDeps) -> str:
         ram_gb=ram_gb,
         checks_summary=checks_summary,
         baselines=baselines,
-        nginx_config=nginx_config[:3000],
-        knowledge_chunks=knowledge_chunks,
         prior_fixes=prior_fixes,
     )
 
@@ -185,15 +166,12 @@ async def run(model, deps: AgentDeps) -> str:
 
     diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
 
-    logger.log("agent", f"Summary: {diagnosis.summary}", "result")
-    logger.log("agent", f"Fixes applied: {len(diagnosis.fixes_applied)}", "result")
+    logger.log("agent", f"Summary: {diagnosis.notes}", "result")
 
-    # Update best RPS from agent's fixes
+    # Update best RPS from agent's result
     best_rps = baseline_rps
-    for fix in diagnosis.fixes_applied:
-        after = fix.get("after_rps", 0)
-        if after > best_rps:
-            best_rps = after
+    if diagnosis.after_rps > best_rps:
+        best_rps = diagnosis.after_rps
     memory.update_profile(session_id, best_rps=best_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -349,7 +327,7 @@ async def run(model, deps: AgentDeps) -> str:
         f"Baseline (small): {baseline_rps:.1f} req/sec\n"
         f"Best (small):     {best_rps:.1f} req/sec\n"
         f"Improvement: {total_improvement:+.1f}%\n"
-        f"Fixes applied: {len(diagnosis.fixes_applied)}\n"
+        f"Nginx applied: {diagnosis.nginx_applied}, System applied: {diagnosis.system_applied}\n"
         f"Tokens used: {deps.token_counter.summary()}\n"
         f"Report: {report_path}\n"
         f"Log: report/log_*_{session_id}.md",
@@ -364,8 +342,6 @@ def _build_context_prompt(
     ram_gb,
     checks_summary,
     baselines,
-    nginx_config,
-    knowledge_chunks,
     prior_fixes=None,
 ) -> str:
     checks_text = "\n".join(checks_summary)
@@ -373,38 +349,20 @@ def _build_context_prompt(
     baselines_text = ""
     for size, data in baselines.items():
         baselines_text += (
-            f"  {size}: {data['rps']:.1f} RPS, p50={data['p50']:.1f}ms, "
-            f"p99={data['p99']:.1f}ms, CPU={data['cpu_pct']:.1f}%, "
-            f"error_rate={data['error_rate']:.1f}%\n"
+            f"  {size}: {data['rps']:.1f} RPS, p99={data['p99']:.1f}ms, "
+            f"CPU={data['cpu_pct']:.1f}%\n"
         )
 
-    knowledge_text = "\n".join(knowledge_chunks[:10])
-
-    # Prior fixes section
     prior_text = ""
     if prior_fixes:
-        prior_text = "## Already Applied (skip these)\n"
-        for pf in prior_fixes:
-            prior_text += f"- {pf['parameter']} = {pf['value']} ({pf['impact']:+.1f}%)\n"
+        prior_text = "Already applied (skip): "
+        prior_text += ", ".join(f"{pf['parameter']}" for pf in prior_fixes)
         prior_text += "\n"
 
-    return f"""## System
-{rhel_ver} | Kernel {kernel_ver} | {cpu_cores} CPU | {ram_gb} GB RAM
-
-## RHEL Checks
-{checks_text}
-
-## Baselines
+    return f"""{rhel_ver} | {kernel_ver} | {cpu_cores} CPU | {ram_gb}GB
+Checks: {checks_text}
+Baselines:
 {baselines_text}
-
-{prior_text}## Knowledge
-{knowledge_text}
-
-## Nginx Config
-```
-{nginx_config}
-```
-
-Inspect the system, apply all proven fixes from your list that are not already
-configured, benchmark before and after, save findings.
+{prior_text}
+Inspect, apply proven fixes, benchmark after, save_findings.
 """

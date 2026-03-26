@@ -286,9 +286,12 @@ def _md_report(
     lines += ["## Decision Log", ""]
 
     for f in fixes + findings:
+        reasoning = f.get("reasoning", "")
+        if not reasoning or reasoning == "proven fix applied":
+            reasoning = _template_reasoning(f.get("parameter", ""))
         lines += [
             f"### {f.get('parameter', 'N/A')} ({f.get('type', '')})",
-            f"**Reasoning:** {f.get('reasoning', '')}",
+            f"**Reasoning:** {reasoning}",
             "",
         ]
 
@@ -358,6 +361,38 @@ def _md_report(
         lines += ["", "---", ""]
 
     return "\n".join(lines)
+
+
+REASONING_TEMPLATES = {
+    "worker_connections": "Increased worker_connections to handle more concurrent connections per worker process.",
+    "open_file_cache": "Enabled open_file_cache to eliminate repeated stat() and open() syscalls on static files.",
+    "access_log": "Disabled access logging to remove per-request disk I/O overhead.",
+    "tcp_nodelay": "Enabled tcp_nodelay to disable Nagle's algorithm, reducing latency for small responses.",
+    "worker_rlimit_nofile": "Increased file descriptor limit to support higher concurrency.",
+    "keepalive_requests": "Increased keepalive_requests for better connection reuse under high load.",
+    "gzip": "Enabled gzip compression at level 1 for bandwidth reduction with minimal CPU cost.",
+    "listen_backlog": "Aligned listen backlog with somaxconn to prevent connection queue drops.",
+    "net.core.somaxconn": "Increased TCP listen backlog to handle burst connections.",
+    "net.ipv4.tcp_max_syn_backlog": "Increased SYN queue to prevent drops under high connection rates.",
+    "net.core.netdev_max_backlog": "Increased NIC packet buffer to prevent kernel-level packet drops.",
+    "transparent_hugepage": "Disabled THP to eliminate memory compaction latency spikes.",
+    "selinux": "Set SELinux to permissive to reduce syscall overhead on file access.",
+    "net.ipv4.tcp_tw_reuse": "Enabled TIME_WAIT socket reuse for faster connection recycling.",
+    "net.core.rmem_max": "Increased socket receive buffer maximum for better TCP throughput.",
+    "net.core.wmem_max": "Increased socket send buffer maximum for better TCP throughput.",
+}
+
+
+def _template_reasoning(parameter: str) -> str:
+    """Generate reasoning text from template based on parameter name."""
+    # Check for exact match
+    if parameter in REASONING_TEMPLATES:
+        return REASONING_TEMPLATES[parameter]
+    # Check if any key is a substring of the parameter (for batch names)
+    for key, reason in REASONING_TEMPLATES.items():
+        if key in parameter:
+            return reason
+    return "Applied proven performance tuning parameter."
 
 
 def _clean(row: dict) -> dict:
