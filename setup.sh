@@ -273,8 +273,12 @@ if contains "wrk2" "${MISSING[@]}"; then
     [ -d wrk2 ] && rm -rf wrk2
     git clone https://github.com/giltene/wrk2.git 2>/dev/null
     cd wrk2
-    grep -q "stdint.h" deps/hdr_histogram/hdr_histogram.c || \
-        sed -i '1i #include <stdint.h>' deps/hdr_histogram/hdr_histogram.c
+    # Fix stdint.h — check both possible locations (src/ or deps/)
+    for hdr in src/hdr_histogram.c deps/hdr_histogram/hdr_histogram.c; do
+        if [ -f "$hdr" ]; then
+            grep -q "stdint.h" "$hdr" || sed -i '1i #include <stdint.h>' "$hdr"
+        fi
+    done
     make -j$(nproc) 2>&1 | tail -3
     cp wrk /usr/local/bin/wrk2
     cd /

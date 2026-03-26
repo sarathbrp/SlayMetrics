@@ -39,7 +39,8 @@ id_ed25519
 
 # Environment
 .env
-.env.*
+.env.local
+!.env.example
 source_env
 facts/default_nginx.conf
 scripts/
