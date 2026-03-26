@@ -17,6 +17,10 @@ select = [
 quote-style = "double"
 indent-style = "space"
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
 [tool.mypy]
 python_version = "3.12"
 pretty = true
