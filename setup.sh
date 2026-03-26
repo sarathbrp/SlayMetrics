@@ -5,7 +5,6 @@
 # Usage:
 #   chmod +x setup.sh
 #   sudo ./setup.sh
-#   sudo ./setup.sh --yes    # skip confirmation prompt
 
 set -e
 
@@ -20,9 +19,8 @@ NC='\033[0m'
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 TIDB_VERSION="v8.4.0"
 TIDB_TAG="perfagent"
-AUTO_YES=false
 
-[ "$1" = "--yes" ] || [ "$1" = "-y" ] && AUTO_YES=true
+
 
 log()  { echo -e "${GREEN}[setup]${NC} $1"; }
 warn() { echo -e "${YELLOW}[warn]${NC}  $1"; }
@@ -197,7 +195,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: REPORT — Show what will be installed
+# SUMMARY + INSTALL — Show what's missing and install it
 # ══════════════════════════════════════════════════════════════════════════════
 
 echo ""
@@ -217,52 +215,8 @@ if [ ${#MISSING[@]} -eq 0 ]; then
 fi
 
 echo ""
-echo -e "${BOLD}The following will be installed/configured:${NC}"
+log "Installing ${#MISSING[@]} missing components..."
 echo ""
-
-for item in "${MISSING[@]}"; do
-    case $item in
-        python3)      echo "  - Python 3               ($PKG install python3)" ;;
-        pip3)         echo "  - pip3                    ($PKG install python3-pip)" ;;
-        pydeps)       echo "  - Python dependencies     (pip3 install -r requirements.txt)" ;;
-        nginx)        echo "  - Nginx webserver         ($PKG install nginx)" ;;
-        nginx-start)  echo "  - Start nginx service     (systemctl enable --now nginx)" ;;
-        testfiles)    echo "  - Benchmark test files    (1kb, 100kb, 1mb in $WEBROOT)" ;;
-        wrk2)         echo "  - wrk2 benchmark tool     (build from source)" ;;
-        buildtools)   echo "  - Build tools             ($PKG install gcc make openssl-devel zlib-devel)" ;;
-        tiup)         echo "  - TiDB v8.4.0             (tiup installer + playground)" ;;
-        tidb-start)   echo "  - Start TiDB server       (tiup playground v8.4.0)" ;;
-        mysql)        echo "  - MySQL client            ($PKG install mariadb)" ;;
-        schema)       echo "  - TiDB schema             (bootstrap perfagent database)" ;;
-        sar)          echo "  - sysstat (sar)           ($PKG install sysstat)" ;;
-        numactl)      echo "  - numactl                 ($PKG install numactl)" ;;
-        ethtool)      echo "  - ethtool                 ($PKG install ethtool)" ;;
-        ssh)          echo "  - Localhost SSH access     (generate key + authorized_keys)" ;;
-    esac
-done
-
-echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 3: CONFIRM — Ask user before proceeding
-# ══════════════════════════════════════════════════════════════════════════════
-
-if [ "$AUTO_YES" = false ]; then
-    echo -n -e "${BOLD}Proceed with installation? [Y/n] ${NC}"
-    read -r answer
-    case "$answer" in
-        [nN]|[nN][oO])
-            echo "Aborted."
-            exit 0
-            ;;
-    esac
-fi
-
-echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 4: INSTALL — Only install what's missing
-# ══════════════════════════════════════════════════════════════════════════════
 
 contains() { local item="$1"; shift; for x in "$@"; do [ "$x" = "$item" ] && return 0; done; return 1; }
 
