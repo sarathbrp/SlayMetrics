@@ -84,12 +84,13 @@ else
     MISSING+=("pip3")
 fi
 
-# ── 3. Python deps ──────────────────────────────────────────────────────────
-if python3 -c "import pydantic_ai" &>/dev/null 2>&1; then
-    ok "Python deps      pydantic-ai installed"
+# ── 3. Python venv + deps ────────────────────────────────────────────────────
+VENV_DIR="$INSTALL_DIR/venv"
+if [ -f "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -c "import pydantic_ai" &>/dev/null 2>&1; then
+    ok "Python venv      $VENV_DIR (pydantic-ai installed)"
     PRESENT+=("pydeps")
 else
-    miss "Python deps      pydantic-ai not found"
+    miss "Python venv      not found or deps missing"
     MISSING+=("pydeps")
 fi
 
@@ -286,11 +287,14 @@ if contains "wrk2" "${MISSING[@]}"; then
     log "wrk2 installed: $(wrk2 --version 2>&1 | head -1)"
 fi
 
-# ── Python deps ──────────────────────────────────────────────────────────────
+# ── Python venv + deps ────────────────────────────────────────────────────────
 if contains "pydeps" "${MISSING[@]}"; then
-    log "Installing Python dependencies..."
-    cd "$INSTALL_DIR"
-    pip3 install -r requirements.txt 2>&1 | tail -5
+    log "Creating Python virtual environment..."
+    python3 -m venv "$VENV_DIR"
+    log "Installing Python dependencies in venv..."
+    "$VENV_DIR/bin/pip" install --upgrade pip 2>&1 | tail -1
+    "$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt" 2>&1 | tail -5
+    log "Venv ready: $VENV_DIR"
 fi
 
 # ── TiDB ─────────────────────────────────────────────────────────────────────
@@ -359,17 +363,18 @@ echo ""
 echo "  Nginx:    $(curl -s -o /dev/null -w '%{http_code}' http://localhost/1kb.html) on :80"
 echo "  wrk2:     $(which wrk2 2>/dev/null || echo 'not found')"
 echo "  TiDB:     :4000"
-echo "  Python:   $(python3 --version 2>&1)"
+echo "  Python:   $($VENV_DIR/bin/python3 --version 2>&1)"
+echo "  Venv:     $VENV_DIR"
 echo "  Agent:    $INSTALL_DIR"
 echo ""
 echo "  To run the agent:"
 echo "    cd $INSTALL_DIR"
-echo "    export ANTHROPIC_API_KEY=<your-key>  # if using claude-remote profile"
-echo "    python3 main.py"
+echo "    cp .env.example .env  # add your API key"
+echo "    $VENV_DIR/bin/python3 main.py -v"
 echo ""
 echo "  To degrade the system for testing:"
-echo "    python3 tools/degrade.py --host 127.0.0.1"
+echo "    $VENV_DIR/bin/python3 tools/degrade.py --host 127.0.0.1"
 echo ""
-echo "  To load knowledge base:"
-echo "    python3 tools/load_facts.py"
+echo "  To reset the system:"
+echo "    $VENV_DIR/bin/python3 tools/reset.py --clear-db"
 echo ""
