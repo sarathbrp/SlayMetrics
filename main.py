@@ -189,6 +189,9 @@ def _chunk_markdown(text: str, source_file: str) -> list[dict]:
 
 
 async def main(config_path: str, session_id: str | None, verbose: bool = False) -> None:
+    # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
+    load_dotenv()
+
     cfg = load_config(config_path)
 
     # Session ID — generate or reuse
@@ -198,9 +201,6 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
     # Init logger first so everything gets captured
     logger.init(session_id, verbose=verbose)
     logger.status("main", f"Session: {session_id}")
-
-    # Load .env
-    load_dotenv()
 
     # Wire up dependencies
     embedder = embedder_from_config(cfg)
