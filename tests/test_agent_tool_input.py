@@ -100,7 +100,10 @@ def _ctx():
         memory=FakeMemory(),
         session_id="s1",
         token_counter=TokenCounter(),
-        config={"service": {"benchmark": {}, "config_path": "/etc/nginx/nginx.conf"}},
+        config={
+            "agent": {"debug_planner_payloads": False},
+            "service": {"benchmark": {}, "config_path": "/etc/nginx/nginx.conf"},
+        },
     )
     return SimpleNamespace(deps=deps)
 
@@ -412,6 +415,31 @@ def test_save_recommendations_skips_non_nginx_performance_changes():
     rejected = [entry for entry in ctx.deps.memory.saved if entry[2] == "recommendation_rejected_1"]
     assert rejected
     assert "no allowed performance changes" in rejected[0][4]
+
+
+def test_save_recommendations_debug_mode_keeps_same_filtering(monkeypatch):
+    agent = build("model")
+    tool = agent._function_toolset.tools["save_recommendations"].function
+    ctx = _ctx()
+    ctx.deps.config["agent"]["debug_planner_payloads"] = True
+    debug_lines = []
+    monkeypatch.setattr(diagnosis_agent, "tool_result", lambda tool_name, message: debug_lines.append((tool_name, message)))
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "title": "Bad shape",
+                    "scope": "nginx",
+                    "changes": {"not_supported": "1"},
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    assert any(tool_name == "debug" for tool_name, _ in debug_lines)
 
 
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):

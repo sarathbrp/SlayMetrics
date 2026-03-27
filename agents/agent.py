@@ -186,6 +186,20 @@ def build(model) -> DiagnosisWorkflow:
                 normalized[key_str] = str(value)
         return normalized, None
 
+    def _debug_enabled(deps: AgentDeps) -> bool:
+        cfg = getattr(deps, "config", {}) or {}
+        return bool((cfg.get("agent") or {}).get("debug_planner_payloads", False))
+
+    def _debug_planner(deps: AgentDeps, label: str, payload: Any) -> None:
+        if not _debug_enabled(deps):
+            return
+        text = (
+            json.dumps(payload, ensure_ascii=True)
+            if isinstance(payload, (dict, list))
+            else str(payload)
+        )
+        tool_result("debug", f"{label}: {text[:800]}")
+
     def _coerce_tool_changes(
         raw_changes: dict[str, str] | str | None,
         extra_changes: dict[str, Any],
@@ -664,6 +678,7 @@ def build(model) -> DiagnosisWorkflow:
 
     def save_rca_impl(deps: AgentDeps, records: list[dict[str, Any]]) -> bool:
         tool_call("rca", f"{len(records)} records")
+        _debug_planner(deps, "raw_rca_records", records[:3])
         deps.memory.save_context(
             deps.session_id,
             "command_output",
@@ -691,6 +706,16 @@ def build(model) -> DiagnosisWorkflow:
                 "recommendation": recommendation,
                 "evidence": evidence_list,
             }
+            if _debug_enabled(deps) and (
+                symptom == "unknown symptom" or root_cause == "unknown root cause"
+            ):
+                tool_result(
+                    "debug",
+                    (
+                        f"rca_{idx} malformed: raw={json.dumps(record, ensure_ascii=True)[:500]} "
+                        f"normalized={json.dumps(normalized, ensure_ascii=True)[:300]}"
+                    ),
+                )
             deps.memory.save_context(
                 deps.session_id,
                 "rca",
@@ -706,6 +731,7 @@ def build(model) -> DiagnosisWorkflow:
 
     def save_recommendations_impl(deps: AgentDeps, recommendations: list[dict[str, Any]]) -> bool:
         tool_call("recommend", f"{len(recommendations)} recommendations")
+        _debug_planner(deps, "raw_recommendations", recommendations[:3])
         deps.memory.save_context(
             deps.session_id,
             "command_output",
@@ -717,6 +743,14 @@ def build(model) -> DiagnosisWorkflow:
         for idx, item in enumerate(recommendations, start=1):
             scope = str(item.get("scope", "nginx")).strip().lower() or "nginx"
             if scope not in {"nginx", "system"}:
+                if _debug_enabled(deps):
+                    tool_result(
+                        "debug",
+                        (
+                            f"recommendation_{idx} reject invalid scope: "
+                            f"raw={json.dumps(item, ensure_ascii=True)[:500]}"
+                        ),
+                    )
                 deps.memory.save_context(
                     deps.session_id,
                     "command_output",
@@ -741,6 +775,18 @@ def build(model) -> DiagnosisWorkflow:
                 key: value for key, value in (changes or {}).items() if key in allowed_params
             }
             if not filtered_changes:
+                if _debug_enabled(deps):
+                    tool_result(
+                        "debug",
+                        (
+                            f"recommendation_{idx} reject no allowed changes: "
+                            f"title={str(item.get('title', ''))[:80]!r} "
+                            f"scope={scope} "
+                            f"raw_changes="
+                            f"{json.dumps(item.get('changes', {}), ensure_ascii=True)[:300]} "
+                            f"normalized={json.dumps(changes or {}, ensure_ascii=True)[:300]}"
+                        ),
+                    )
                 deps.memory.save_context(
                     deps.session_id,
                     "command_output",
