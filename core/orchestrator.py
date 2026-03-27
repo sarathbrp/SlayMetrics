@@ -332,6 +332,24 @@ Inspect, apply proven fixes, benchmark after, save_findings.
 HACKATHON_WORKLOADS = ["homepage", "small", "medium", "large", "mixed"]
 
 
+def _parse_latency(val: str) -> float:
+    """Parse wrk latency string like '2.43ms', '496.00us', '1.53s' to milliseconds."""
+    if not val:
+        return 0.0
+    val = val.strip()
+    try:
+        if val.endswith("us"):
+            return float(val[:-2]) / 1000
+        elif val.endswith("ms"):
+            return float(val[:-2])
+        elif val.endswith("s"):
+            return float(val[:-1]) * 1000
+        else:
+            return float(val)
+    except ValueError:
+        return 0.0
+
+
 def _run_hackathon_benchmark(deps, cfg, label, session_id):
     """Run the hackathon's official benchmark.sh and parse results."""
     bench_cfg = cfg["service"]["benchmark"]
@@ -361,11 +379,11 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
                 res = data.get("results", {})
                 rps = res.get("requests", {}).get("per_sec", 0)
                 lat = res.get("latency", {})
-                p99_str = lat.get("percentiles", {}).get("p99", "0ms")
-                p99 = float(p99_str.replace("ms", "").replace("s", "000"))
+                p99 = _parse_latency(lat.get("percentiles", {}).get("p99", "0ms"))
+                p50 = _parse_latency(lat.get("percentiles", {}).get("p50", "0ms"))
                 results[workload] = {
                     "rps": rps,
-                    "p50": float(lat.get("percentiles", {}).get("p50", "0ms").replace("ms", "").replace("s", "000")),
+                    "p50": p50,
                     "p99": p99,
                     "cpu_pct": 0,
                     "mem_mb": 0,
