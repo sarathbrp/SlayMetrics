@@ -661,14 +661,38 @@ def build(model) -> DiagnosisWorkflow:
         return True
 
     def _evaluate_nginx_guardrails(deps: AgentDeps, benchmark_result: dict[str, Any]) -> dict[str, Any]:
+        def _load_baseline_benchmark() -> dict[str, Any]:
+            for source in ("baseline_small", "baseline_homepage"):
+                try:
+                    rows = deps.memory.get_contexts(
+                        deps.session_id, type="benchmark", source_prefix=source, limit=1
+                    )
+                except Exception:
+                    rows = []
+                if not rows:
+                    continue
+                content = rows[0].get("content", "")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                try:
+                    parsed = json.loads(content)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+            return {}
+
         try:
             profile = deps.memory.get_profile(deps.session_id) or {}
         except Exception:
             profile = {}
+        baseline_benchmark = _load_baseline_benchmark()
 
-        baseline_rps = _coerce_float(profile.get("baseline_rps"))
-        baseline_p99 = _coerce_float(profile.get("baseline_p99"))
-        baseline_error_rate = _coerce_float(profile.get("baseline_error_rate"))
+        baseline_rps = _coerce_float(profile.get("baseline_rps")) or _coerce_float(
+            baseline_benchmark.get("rps")
+        )
+        baseline_p99 = _coerce_float(baseline_benchmark.get("p99"))
+        baseline_error_rate = _coerce_float(baseline_benchmark.get("error_rate"))
         after_rps = _coerce_float(benchmark_result.get("requests_per_sec"))
         after_p99 = _coerce_float(benchmark_result.get("latency_p99_ms"))
         after_error_rate = _coerce_float(benchmark_result.get("error_rate"))
@@ -893,7 +917,8 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     state = getattr(agent, "_slaymetrics_state", {})
     result = await agent.run(context_prompt, deps=deps)
     apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
-    max_phase = int((deps.config.get("agent") or {}).get("max_phase", 4))
+    config = getattr(deps, "config", {}) or {}
+    max_phase = int((config.get("agent") or {}).get("max_phase", 4))
     if callable(apply_from_recommendations) and max_phase >= 4:
         apply_from_recommendations(deps)
     inp, out = result.usage().input_tokens or 0, result.usage().output_tokens or 0

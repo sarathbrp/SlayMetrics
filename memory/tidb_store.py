@@ -55,6 +55,19 @@ def _coerce_optional_float(value) -> float | None:
 
 
 class TiDBStore:
+    PROFILE_FIELDS = {
+        "service",
+        "host",
+        "rhel_version",
+        "kernel_version",
+        "cpu_cores",
+        "ram_gb",
+        "baseline_rps",
+        "best_rps",
+        "target_rps",
+        "llm_profile",
+        "status",
+    }
     CONTEXT_TYPE_MAP = {
         "metric": "metric",
         "log": "log",
@@ -110,13 +123,14 @@ class TiDBStore:
             )
 
     def update_profile(self, session_id: str, **kwargs) -> None:
-        if not kwargs:
+        filtered = {k: v for k, v in kwargs.items() if k in self.PROFILE_FIELDS}
+        if not filtered:
             return
-        cols = ", ".join(f"{k} = %s" for k in kwargs)
+        cols = ", ".join(f"{k} = %s" for k in filtered)
         with self._cursor() as cur:
             cur.execute(
                 f"UPDATE profile SET {cols}, updated_at = NOW() WHERE session_id = %s",
-                (*kwargs.values(), session_id),
+                (*filtered.values(), session_id),
             )
 
     def get_profile(self, session_id: str) -> dict | None:

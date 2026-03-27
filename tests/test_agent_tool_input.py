@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 from adapters.base import BenchmarkResult
@@ -24,7 +25,17 @@ class FakeMemory:
 
     def get_profile(self, session_id):
         del session_id
-        return {"baseline_rps": 100.0, "baseline_p99": 2.0, "baseline_error_rate": 0.0}
+        return {"baseline_rps": 100.0}
+
+    def get_contexts(self, session_id, type=None, source_prefix=None, limit=None):
+        del session_id, type, limit
+        if source_prefix == "baseline_small":
+            return [
+                {
+                    "content": json.dumps({"rps": 100.0, "p99": 2.0, "error_rate": 0.0}),
+                }
+            ]
+        return []
 
 
 class FakeAdapter:

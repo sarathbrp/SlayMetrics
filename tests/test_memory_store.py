@@ -153,3 +153,18 @@ def test_save_fact_coerces_non_numeric_float_fields(monkeypatch):
     assert params[6] == 0.0
     assert params[7] == 0.0
     assert params[8] is None
+
+
+def test_update_profile_ignores_unknown_columns(monkeypatch):
+    conn = FakeConn()
+    monkeypatch.setattr("pymysql.connect", lambda **kwargs: conn)
+    store = _store()
+    store.connect()
+
+    store.update_profile("s1", baseline_rps=1.2, baseline_p99=9.9, status="completed")
+
+    query, params = conn.executed[-1]
+    assert "baseline_rps = %s" in query
+    assert "status = %s" in query
+    assert "baseline_p99" not in query
+    assert params == (1.2, "completed", "s1")
