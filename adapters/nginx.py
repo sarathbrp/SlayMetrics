@@ -25,11 +25,12 @@ HTTP_DIRECTIVES = {
 
 
 class NginxAdapter(ServiceAdapter):
-    def __init__(self, cfg: dict, ssh: LocalClient | SSHClient,
-                 bench: LocalClient | SSHClient | None = None):
+    def __init__(
+        self, cfg: dict, ssh: LocalClient | SSHClient, bench: LocalClient | SSHClient | None = None
+    ):
         self._cfg = cfg["service"]
         self._bench_cfg = self._cfg["benchmark"]
-        self._ssh = ssh        # DUT — config changes, sar monitoring
+        self._ssh = ssh  # DUT — config changes, sar monitoring
         self._bench = bench or ssh  # Bench node — wrk2 runs here
 
     def get_config(self) -> dict:
@@ -153,22 +154,15 @@ class NginxAdapter(ServiceAdapter):
         rate = self._bench_cfg.get("rate", 150000)
 
         # Start sar on DUT for resource monitoring
-        self._ssh.execute(
-            f"sar -u {duration} 1 > /tmp/slay_sar.log 2>&1 &"
-        )
+        self._ssh.execute(f"sar -u {duration} 1 > /tmp/slay_sar.log 2>&1 &")
 
         # Run wrk2 on bench node (may be same machine or separate)
-        wrk_cmd = (
-            f"wrk2 -t{threads} -c{connections} -d{duration}s -R{rate} "
-            f"--latency {target_url}"
-        )
+        wrk_cmd = f"wrk2 -t{threads} -c{connections} -d{duration}s -R{rate} --latency {target_url}"
         result = self._bench.execute(wrk_cmd, timeout=duration + 60)
         bench = _parse_wrk2(result.stdout, duration, target_url)
 
         # Collect resource data from DUT
-        sar_result = self._ssh.execute(
-            "sleep 2; cat /tmp/slay_sar.log 2>/dev/null"
-        )
+        sar_result = self._ssh.execute("sleep 2; cat /tmp/slay_sar.log 2>/dev/null")
         bench.cpu_pct = _parse_sar_avg(sar_result.stdout)
 
         mem_result = self._ssh.execute("free -m 2>/dev/null | grep Mem")

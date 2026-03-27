@@ -201,9 +201,7 @@ def build(model) -> Agent:
         return result
 
     @agent.tool
-    async def apply_nginx_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str
-    ) -> dict:
+    async def apply_nginx_tuning(ctx: RunContext[AgentDeps], changes: dict[str, str] | str) -> dict:
         """Apply multiple nginx config changes in one batch, then reload.
         Example: {"sendfile": "on", "tcp_nopush": "on",
         "open_file_cache": "max=10000 inactive=60s"}

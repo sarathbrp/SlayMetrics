@@ -42,10 +42,12 @@ def load_config(path: str) -> dict:
         raw = f.read()
     # Resolve ${VAR:-default} patterns from environment
     import re
+
     def _resolve(m):
         var = m.group(1)
         default = m.group(2) if m.group(2) is not None else ""
         return os.environ.get(var, default)
+
     raw = re.sub(r"\$\{(\w+):-([^}]*)\}", _resolve, raw)
     raw = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), raw)
     return yaml.safe_load(raw)
@@ -221,7 +223,11 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
     bench = ssh_from_config(cfg, section="bench") if "bench" in cfg else ssh
     bench.connect()
     bench_host = cfg.get("bench", {}).get("host", host)
-    bench_mode = "local (subprocess)" if bench_host in ("localhost", "127.0.0.1", "::1") else f"SSH ({bench_host})"
+    bench_mode = (
+        "local (subprocess)"
+        if bench_host in ("localhost", "127.0.0.1", "::1")
+        else f"SSH ({bench_host})"
+    )
     logger.status("main", f"Bench: {bench_host} via {bench_mode}")
 
     adapter = load_adapter(cfg, ssh, bench=bench)
