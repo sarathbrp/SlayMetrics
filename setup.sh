@@ -94,12 +94,15 @@ else
     MISSING+=("pydeps")
 fi
 
-# ── 4. wrk2 ─────────────────────────────────────────────────────────────────
-if command -v wrk2 &>/dev/null; then
+# ── 4. wrk / wrk2 ──────────────────────────────────────────────────────────
+if command -v wrk &>/dev/null; then
+    ok "wrk              $(wrk --version 2>&1 | head -1)"
+    PRESENT+=("wrk2")
+elif command -v wrk2 &>/dev/null; then
     ok "wrk2             $(wrk2 --version 2>&1 | head -1)"
     PRESENT+=("wrk2")
 else
-    miss "wrk2             not found (will build from source)"
+    miss "wrk/wrk2         not found (will build from source)"
     MISSING+=("wrk2")
 fi
 
@@ -205,23 +208,24 @@ if [ ${#SYS_PKGS[@]} -gt 0 ]; then
     $PKG install -y "${SYS_PKGS[@]}" 2>&1 | tail -5
 fi
 
-# ── wrk2 ─────────────────────────────────────────────────────────────────────
+# ── wrk/wrk2 ─────────────────────────────────────────────────────────────────
 if contains "wrk2" "${MISSING[@]}"; then
-    log "Building wrk2 from source..."
+    # Install zlib-devel if needed for build
+    $PKG install -y zlib-devel 2>&1 | tail -2
+    log "Building wrk from source..."
     cd /tmp
-    [ -d wrk2 ] && rm -rf wrk2
-    git clone https://github.com/giltene/wrk2.git 2>/dev/null
-    cd wrk2
-    for hdr in src/hdr_histogram.c deps/hdr_histogram/hdr_histogram.c; do
-        if [ -f "$hdr" ]; then
-            grep -q "stdint.h" "$hdr" || sed -i '1i #include <stdint.h>' "$hdr"
-        fi
-    done
+    [ -d wrk ] && rm -rf wrk
+    git clone https://github.com/wg/wrk.git 2>/dev/null
+    cd wrk
     make -j$(nproc) 2>&1 | tail -3
-    cp wrk /usr/local/bin/wrk2
+    cp wrk /usr/local/bin/wrk
     cd /
-    rm -rf /tmp/wrk2
-    log "wrk2 installed: $(wrk2 --version 2>&1 | head -1)"
+    rm -rf /tmp/wrk
+    if command -v wrk &>/dev/null; then
+        log "wrk installed: $(wrk --version 2>&1 | head -1)"
+    else
+        warn "wrk build failed — benchmark.sh may not work"
+    fi
 fi
 
 # ── Python venv + deps ────────────────────────────────────────────────────────
