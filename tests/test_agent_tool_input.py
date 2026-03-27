@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from pydantic_ai.models.test import TestModel
 
 from agents import TokenCounter
-from agents.agent import build
+import agents.agent as diagnosis_agent
+from agents.agent import DiagnosisOutput, build
 from tools.ssh import SSHResult
 
 
@@ -237,3 +238,60 @@ def test_save_findings_coerces_non_numeric_impact_pct():
     assert ctx.deps.memory.saved_facts[0]["before_rps"] == 0.0
     assert ctx.deps.memory.saved_facts[0]["after_rps"] == 0.0
     assert ctx.deps.memory.saved_facts[0]["impact_pct"] is None
+
+
+def test_diagnosis_output_coerces_granite_friendly_shapes():
+    output = DiagnosisOutput(
+        nginx_applied=True,
+        system_applied=True,
+        after_rps="1918406.5",
+        improvement_pct=None,
+        notes=[
+            {"parameter": "nginx.access_log", "before_value": "/var/log/nginx/access.log main"},
+        ],
+    )
+
+    assert output.after_rps == 1918406.5
+    assert output.improvement_pct == 0.0
+    assert output.notes.startswith("[")
+
+
+def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
+    deps = SimpleNamespace(
+        memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
+        session_id="s1",
+        token_counter=TokenCounter(),
+    )
+
+    class FakeRunResult:
+        output = "Applied tuning successfully."
+
+        def usage(self):
+            return SimpleNamespace(input_tokens=1, output_tokens=2)
+
+        def all_messages(self):
+            return []
+
+    class FakeAgent:
+        _slaymetrics_state = {
+            "nginx_applied": True,
+            "system_applied": True,
+            "after_rps": 150.0,
+            "findings": [{"parameter": "nginx.access_log"}],
+        }
+
+        async def run(self, prompt, deps):
+            return FakeRunResult()
+
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
+
+    output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
+
+    assert output.nginx_applied is True
+    assert output.system_applied is True
+    assert output.after_rps == 150.0
+    assert output.improvement_pct == 50.0
+    assert output.notes == "Applied tuning successfully."

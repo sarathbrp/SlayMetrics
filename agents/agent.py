@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from pydantic_ai import Agent, RunContext
 
 from adapters.base import BenchmarkResult
@@ -17,9 +17,34 @@ class DiagnosisOutput(BaseModel):
 
     nginx_applied: bool
     system_applied: bool
-    after_rps: float
-    improvement_pct: float
-    notes: str = ""
+    after_rps: float = 0.0
+    improvement_pct: float = 0.0
+    notes: str = Field(default="")
+
+    @field_validator("after_rps", "improvement_pct", mode="before")
+    @classmethod
+    def _coerce_float(cls, value: Any) -> float:
+        if value in (None, ""):
+            return 0.0
+        if isinstance(value, bool):
+            return float(value)
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            return 0.0
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _coerce_notes(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, dict)):
+            return json.dumps(value, ensure_ascii=True)
+        return str(value)
 
 
 SYSTEM_PROMPT = """\
@@ -29,7 +54,7 @@ You are SlayMetricsAgent. Steps:
 3. Apply missing system fixes via apply_system_tuning
 4. Benchmark AFTER (baselines are provided — do NOT benchmark before)
 5. Call save_findings with both results in one call
-6. Return DiagnosisOutput
+6. Return one short plain-text summary sentence
 
 Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
 - worker_connections=65536
@@ -66,12 +91,20 @@ Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
 
 
 def build(model) -> Agent:
-    agent: Agent[AgentDeps, DiagnosisOutput] = Agent(
+    state: dict[str, Any] = {
+        "nginx_applied": False,
+        "system_applied": False,
+        "after_rps": 0.0,
+        "findings": [],
+    }
+
+    agent: Agent[AgentDeps, str] = Agent(
         model,
         deps_type=AgentDeps,
-        output_type=DiagnosisOutput,
+        output_type=str,
         system_prompt=SYSTEM_PROMPT,
     )
+    setattr(agent, "_slaymetrics_state", state)
 
     def _normalize_changes(
         raw_changes: dict[str, str] | str | None, tool_name: str
@@ -359,6 +392,7 @@ def build(model) -> Agent:
             result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
         ctx.deps.token_counter.tool_calls += 1
+        state["nginx_applied"] = state["nginx_applied"] or bool(applied and reload_ok)
         summary = f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}"
         ctx.deps.memory.save_context(
             ctx.deps.session_id,
@@ -433,6 +467,7 @@ def build(model) -> Agent:
         result = {"applied": applied, "failed": failed}
 
         ctx.deps.token_counter.tool_calls += 1
+        state["system_applied"] = state["system_applied"] or bool(applied)
         summary = f"applied={list(applied.keys())} failed={list(failed.keys())}"
         ctx.deps.memory.save_context(
             ctx.deps.session_id,
@@ -449,7 +484,9 @@ def build(model) -> Agent:
         """Run wrk2 benchmark against the small file URL. Returns RPS and latency."""
         bench_cfg = ctx.deps.config["service"]["benchmark"]
         url = bench_cfg.get("small_file_url", "http://localhost/")
-        tool_call("benchmark", f"wrk2 {duration}s -> {url}")
+        bench_tool = bench_cfg.get("tool", "wrk2")
+        benchmark_label = "benchmark.sh" if bench_tool == "hackathon" else "wrk2"
+        tool_call("benchmark", f"{benchmark_label} {duration}s -> {url}")
         result: BenchmarkResult = ctx.deps.adapter.benchmark(duration, url)
         tool_result(
             "benchmark",
@@ -464,6 +501,7 @@ def build(model) -> Agent:
             "post-fix benchmark",
         )
         ctx.deps.token_counter.tool_calls += 1
+        state["after_rps"] = float(result.requests_per_sec)
         return result.__dict__
 
     _memory_query_count = 0
@@ -528,6 +566,7 @@ def build(model) -> Agent:
             impact_label = "n/a" if impact_pct is None else f"{impact_pct:+.1f}%"
             tool_result("save", f"{param} ({impact_label})")
         ctx.deps.token_counter.tool_calls += 1
+        state["findings"] = findings
         return True
 
     return agent
@@ -537,6 +576,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     """Run the single agent with full context."""
     llm_call("agent", "Starting diagnosis — sending context to LLM...")
     agent = build(model)
+    state = getattr(agent, "_slaymetrics_state", {})
     result = await agent.run(context_prompt, deps=deps)
     _attribute_tool_tokens(result, deps.token_counter)
     inp, out = deps.token_counter.add(result.usage())
@@ -549,7 +589,32 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
             for r in sorted(rows, key=lambda x: x["total_tokens"], reverse=True)[:5]
         )
         log("agent", f"Tool token attribution: {top}", "result")
-    return result.output
+
+    profile = {}
+    try:
+        profile = deps.memory.get_profile(deps.session_id) or {}
+    except Exception:
+        profile = {}
+
+    baseline_rps = float(profile.get("baseline_rps") or 0.0)
+    after_rps = float(state.get("after_rps") or 0.0)
+    improvement_pct = ((after_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
+    notes = str(result.output).strip()
+    if not notes:
+        findings = state.get("findings") or []
+        if findings:
+            params = ", ".join(str(f.get("parameter", "unknown")) for f in findings[:4])
+            notes = f"Applied findings: {params}."
+        else:
+            notes = "Diagnosis completed."
+
+    return DiagnosisOutput(
+        nginx_applied=bool(state.get("nginx_applied", False)),
+        system_applied=bool(state.get("system_applied", False)),
+        after_rps=after_rps,
+        improvement_pct=improvement_pct,
+        notes=notes,
+    )
 
 
 def _attribute_tool_tokens(run_result: Any, token_counter: TokenCounter) -> None:
