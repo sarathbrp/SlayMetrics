@@ -55,7 +55,7 @@ vi config.yaml
 
 ```yaml
 llm:
-  active_profile: granite-local    # or: gpt-oss-local, claude-remote
+  active_profile: gpt-oss-local    # or: granite-local, claude-remote
 
 target:
   host: 127.0.0.1                  # localhost = subprocess, remote = SSH
@@ -95,9 +95,22 @@ Change one line in `config.yaml`:
 
 ```yaml
 llm:
-  active_profile: granite-local     # local Granite 4 7B A1B via Ollama — default
-  active_profile: gpt-oss-local     # local GPT-OSS 120B via Ollama
+  active_profile: gpt-oss-local     # GPT-OSS 120B via deployed OpenAI-compatible endpoint — default
+  active_profile: granite-local     # local Granite 4 7B A1B via Ollama
   active_profile: claude-remote     # Claude Opus — remote fallback
+
+`gpt-oss-local` reads its deployment settings from the environment:
+
+```bash
+export GPT_OSS_BASE_URL=http://your-gpt-oss-host:8002/v1
+export GPT_OSS_API_KEY=your-token
+```
+
+To stop after planning and inspect telemetry, RCA, and recommendations without applying remediations:
+
+```bash
+python3 main.py -v --max-phase 3
+```
 ```
 
 ## Knowledge Base

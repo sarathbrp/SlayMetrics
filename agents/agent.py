@@ -893,7 +893,8 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     state = getattr(agent, "_slaymetrics_state", {})
     result = await agent.run(context_prompt, deps=deps)
     apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
-    if callable(apply_from_recommendations):
+    max_phase = int((deps.config.get("agent") or {}).get("max_phase", 4))
+    if callable(apply_from_recommendations) and max_phase >= 4:
         apply_from_recommendations(deps)
     inp, out = result.usage().input_tokens or 0, result.usage().output_tokens or 0
     deps.token_counter.input_tokens += int(inp)

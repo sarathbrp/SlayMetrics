@@ -1,5 +1,5 @@
 llm:
-  active_profile: granite-local         # change this one line to switch LLM
+  active_profile: gpt-oss-local         # change this one line to switch LLM
 
   profiles:
     granite-local:                     # local Granite 4 via Ollama
@@ -7,10 +7,11 @@ llm:
       model: granite4:7b-a1b-h
       base_url: http://localhost:11434
 
-    gpt-oss-local:                     # local GPT-OSS via Ollama
-      backend: ollama
+    gpt-oss-local:                     # GPT-OSS via OpenAI-compatible endpoint
+      backend: openai
       model: gpt-oss-120b
-      base_url: http://localhost:11434
+      base_url: ${GPT_OSS_BASE_URL}
+      api_key_env: GPT_OSS_API_KEY
 
     claude-remote:                     # remote Anthropic fallback
       backend: claude
@@ -76,6 +77,7 @@ rhel:
 agent:
   improvement_threshold_pct: 5
   max_iterations: 50
+  max_phase: 4
   benchmark_after_every_fix: true
   stability:
     enabled: false

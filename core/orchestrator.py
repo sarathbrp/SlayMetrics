@@ -19,6 +19,7 @@ async def run(model, deps: AgentDeps) -> str:
     cfg = deps.config
     session_id = deps.session_id
     memory = deps.memory
+    max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
 
     logger.panel(
         "SlayMetricsAgent",
@@ -161,6 +162,32 @@ async def run(model, deps: AgentDeps) -> str:
     notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
     logger.log("agent", f"Summary: {notes}", "result")
 
+    if max_phase <= 3:
+        logger.status("main", "Stopping after Phase 3 planning (RCA + recommendations)")
+        memory.update_profile(session_id, status="analysis_complete")
+        _save_token_usage(memory, session_id, deps.token_counter)
+        token_history = memory.get_token_history()
+        report_path = reporter.generate(
+            session_id,
+            memory,
+            deps.token_counter,
+            baselines=baselines,
+            finals=None,
+            stability=None,
+            throughput=None,
+            token_history=token_history,
+        )
+        logger.panel(
+            "SlayMetricsAgent Planning Complete",
+            f"Baseline (small): {baseline_rps:.1f} req/sec\n"
+            f"Phase cutoff: {max_phase}\n"
+            f"Recommendations generated: {len(getattr(diagnosis, 'recommendations', []) or [])}\n"
+            f"Tokens used: {deps.token_counter.summary()}\n"
+            f"Report: {report_path}\n"
+            f"Log: report/log_*_{session_id}.md",
+        )
+        return report_path
+
     # Update best RPS from agent's result
     best_rps = baseline_rps
     diagnosis_after_rps = getattr(diagnosis, "after_rps", None)
@@ -269,24 +296,7 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 8: Generating report...")
 
-    # Save token usage to context for cross-session tracking
-    tc = deps.token_counter
-    memory.save_context(
-        session_id,
-        "metric",
-        "token_usage",
-        json.dumps(
-            {
-                "input_tokens": tc.input_tokens,
-                "output_tokens": tc.output_tokens,
-                "total_tokens": tc.total,
-                "tool_calls": tc.tool_calls,
-                "session_id": session_id,
-            }
-        ),
-        f"Tokens: in={tc.input_tokens:,} out={tc.output_tokens:,} "
-        f"total={tc.total:,} calls={tc.tool_calls}",
-    )
+    _save_token_usage(memory, session_id, deps.token_counter)
 
     memory.update_profile(session_id, status="completed")
 
@@ -317,6 +327,26 @@ async def run(model, deps: AgentDeps) -> str:
         f"Log: report/log_*_{session_id}.md",
     )
     return report_path
+
+
+def _save_token_usage(memory, session_id: str, token_counter) -> None:
+    tc = token_counter
+    memory.save_context(
+        session_id,
+        "metric",
+        "token_usage",
+        json.dumps(
+            {
+                "input_tokens": tc.input_tokens,
+                "output_tokens": tc.output_tokens,
+                "total_tokens": tc.total,
+                "tool_calls": tc.tool_calls,
+                "session_id": session_id,
+            }
+        ),
+        f"Tokens: in={tc.input_tokens:,} out={tc.output_tokens:,} "
+        f"total={tc.total:,} calls={tc.tool_calls}",
+    )
 
 
 def _build_context_prompt(

@@ -259,3 +259,34 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
     )
     assert "Already applied (skip)" in prompt
     assert "Telemetry:" in prompt
+
+
+def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
+    deps = _deps()
+    deps.config["agent"]["max_phase"] = 3
+    monkeypatch.setattr(
+        orchestrator.system_checks,
+        "run_all",
+        lambda ssh, checks: [CheckResult("cpu_governor", "ok", "ok", "")],
+    )
+    diagnosis = SimpleNamespace(summary="done", recommendations=[{"title": "Raise limits"}])
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run",
+        lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
+    )
+    monkeypatch.setattr(
+        orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_snapshot",
+        lambda *a, **k: {"scope": k["scope"], "source": k["source"], "host": "localhost", "summary": {}, "sections": {}},
+    )
+    monkeypatch.setattr(orchestrator, "persist_snapshot", lambda *a, **k: None)
+    for name in ["panel", "step", "check", "status", "benchmark", "log"]:
+        monkeypatch.setattr(orchestrator.logger, name, lambda *a, **k: None)
+
+    report = asyncio.run(orchestrator.run("model", deps))
+
+    assert report.endswith("report.md")

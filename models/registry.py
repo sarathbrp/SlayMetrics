@@ -38,5 +38,25 @@ def create_model(cfg: dict):
             temperature=0,
         )
 
+    if backend == "openai":
+        from langchain_openai import ChatOpenAI
+
+        api_key_env = profile.get("api_key_env", "OPENAI_API_KEY")
+        api_key = os.environ.get(api_key_env)
+        base_url = profile.get("base_url", "").strip()
+        if not api_key:
+            logger.log("main", f"{api_key_env} not set", "error")
+            sys.exit(1)
+        if not base_url:
+            logger.log("main", "OpenAI-compatible base_url not set", "error")
+            sys.exit(1)
+        return ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0,
+            max_retries=1,
+        )
+
     logger.log("main", f"Unknown backend: {backend}", "error")
     sys.exit(1)

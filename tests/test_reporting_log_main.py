@@ -224,8 +224,33 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         "langchain_anthropic",
         SimpleNamespace(ChatAnthropic=lambda **kwargs: ("anthropic", kwargs)),
     )
+    monkeypatch.setitem(
+        main.sys.modules,
+        "langchain_openai",
+        SimpleNamespace(ChatOpenAI=lambda **kwargs: ("openai", kwargs)),
+    )
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
     assert main.get_model(cfg)[0] == "ollama"
+
+    monkeypatch.setenv("GPT_OSS_API_KEY", "token")
+    assert (
+        main.get_model(
+            {
+                "llm": {
+                    "active_profile": "g",
+                    "profiles": {
+                        "g": {
+                            "backend": "openai",
+                            "model": "gpt-oss-120b",
+                            "base_url": "http://example-gpt-oss-host:8002/v1",
+                            "api_key_env": "GPT_OSS_API_KEY",
+                        }
+                    },
+                }
+            }
+        )[0]
+        == "openai"
+    )
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     try:
@@ -250,6 +275,7 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
+        "agent": {},
     }
     monkeypatch.setattr(main, "load_config", lambda p: cfg_main)
     monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
@@ -270,8 +296,9 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         "core.orchestrator",
         SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
     )
-    asyncio.run(main.main("cfg.yaml", None, False))
+    asyncio.run(main.main("cfg.yaml", None, False, 3))
     assert fake_memory.created is True
+    assert cfg_main["agent"]["max_phase"] == 3
 
 
 def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):

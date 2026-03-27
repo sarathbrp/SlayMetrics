@@ -161,11 +161,18 @@ def _chunk_markdown(text: str, source_file: str) -> list[dict]:
     return chunks
 
 
-async def main(config_path: str, session_id: str | None, verbose: bool = False) -> None:
+async def main(
+    config_path: str,
+    session_id: str | None,
+    verbose: bool = False,
+    max_phase: int = 4,
+) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
     load_dotenv()
 
     cfg = load_config(config_path)
+    cfg.setdefault("agent", {})
+    cfg["agent"]["max_phase"] = max_phase
 
     # Session ID — generate or reuse
     if session_id is None:
@@ -261,8 +268,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Show all agent logs (not just actions/results)",
     )
+    parser.add_argument(
+        "--max-phase",
+        type=int,
+        choices=[3, 4],
+        default=4,
+        help="Maximum phase to run: 3 stops after RCA/recommendations, 4 runs remediation",
+    )
     args = parser.parse_args()
     try:
-        asyncio.run(main(args.config, args.session, args.verbose))
+        asyncio.run(main(args.config, args.session, args.verbose, args.max_phase))
     except KeyboardInterrupt:
         print("\nAborted.")
