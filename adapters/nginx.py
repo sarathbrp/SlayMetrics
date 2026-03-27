@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import uuid
 
 from adapters.base import BenchmarkResult, ServiceAdapter
 from tools.ssh import LocalClient, SSHClient
@@ -152,6 +155,9 @@ class NginxAdapter(ServiceAdapter):
 
     def benchmark(self, duration: int = 30, url: str = "") -> BenchmarkResult:
         target_url = url or self._bench_cfg.get("small_file_url", "http://localhost/")
+        if self._bench_cfg.get("tool") == "hackathon":
+            return self._benchmark_hackathon(target_url)
+
         threads = self._bench_cfg.get("threads", 4)
         connections = self._bench_cfg.get("connections", 400)
         rate = self._bench_cfg.get("rate", 150000)
@@ -162,7 +168,13 @@ class NginxAdapter(ServiceAdapter):
         # Run wrk2 on bench node (may be same machine or separate)
         wrk_cmd = f"wrk2 -t{threads} -c{connections} -d{duration}s -R{rate} --latency {target_url}"
         result = self._bench.execute(wrk_cmd, timeout=duration + 60)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"wrk2 benchmark failed: {detail}")
         bench = _parse_wrk2(result.stdout, duration, target_url)
+        if "Requests/sec:" not in result.stdout:
+            detail = result.stderr.strip() or result.stdout.strip() or "missing Requests/sec output"
+            raise RuntimeError(f"wrk2 benchmark output was not parseable: {detail}")
 
         # Collect resource data from DUT
         sar_result = self._ssh.execute("sleep 2; cat /tmp/slay_sar.log 2>/dev/null")
@@ -172,6 +184,27 @@ class NginxAdapter(ServiceAdapter):
         bench.mem_mb = _parse_free_used(mem_result.stdout)
 
         return bench
+
+    def _benchmark_hackathon(self, target_url: str) -> BenchmarkResult:
+        script = self._bench_cfg.get("script", "/root/hackathon-tools/benchmark.sh")
+        name = self._bench_cfg.get("contestant_name", "slaymetrics")
+        target_env = self._bench_cfg.get("target_host_env", "DUT_HOST")
+        target_host = os.environ.get(target_env, target_url)
+        workload = _workload_from_url(target_url, self._bench_cfg)
+        contestant = f"{name}-agent-{workload}-{uuid.uuid4().hex[:8]}"
+
+        cmd = f"TARGET_HOST={target_host} {script} {contestant}"
+        result = self._bench.execute(cmd, timeout=600)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"hackathon benchmark failed: {detail}")
+
+        json_path = f"/root/hackathon-results/{contestant}_{workload}.json"
+        payload = self._bench.execute(f"cat {json_path} 2>/dev/null")
+        if not payload.ok or not payload.stdout.strip():
+            raise RuntimeError(f"hackathon benchmark result missing for workload {workload}")
+
+        return _parse_hackathon_result(payload.stdout, target_url)
 
     def get_metrics(self) -> dict:
         metrics = {}
@@ -251,6 +284,40 @@ def _extract_latency(text: str, percentile: str) -> float:
     if unit == "s":
         return value * 1000
     return value
+
+
+def _parse_hackathon_result(output: str, url: str) -> BenchmarkResult:
+    data = json.loads(output)
+    results = data.get("results", {})
+    requests = results.get("requests", {})
+    latency = results.get("latency", {})
+    percentiles = latency.get("percentiles", {})
+    return BenchmarkResult(
+        requests_per_sec=float(requests.get("per_sec", 0) or 0),
+        latency_p50_ms=_latency_to_ms(percentiles.get("p50", "0ms")),
+        latency_p99_ms=_latency_to_ms(percentiles.get("p99", "0ms")),
+        error_rate=0.0,
+        duration_sec=int(results.get("duration", 0) or 0),
+        url=url,
+    )
+
+
+def _latency_to_ms(value: str) -> float:
+    text = str(value).strip()
+    if text.endswith("us"):
+        return float(text[:-2]) / 1000
+    if text.endswith("ms"):
+        return float(text[:-2])
+    if text.endswith("s"):
+        return float(text[:-1]) * 1000
+    return float(text or 0)
+
+
+def _workload_from_url(url: str, bench_cfg: dict) -> str:
+    for workload in ("small", "medium", "large"):
+        if url and url == bench_cfg.get(f"{workload}_file_url"):
+            return workload
+    return "homepage"
 
 
 def _rewrite_listen_backlog_line(line: str, backlog: str) -> str:

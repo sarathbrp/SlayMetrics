@@ -469,8 +469,26 @@ def build(model) -> Agent:
         Each finding: {parameter, before_value, after_value, before_rps, after_rps, impact_pct}
         """
         tool_call("save", f"{len(findings)} findings")
+
+        def _coerce_optional_float(value: Any) -> float | None:
+            if value is None or value == "":
+                return None
+            if isinstance(value, bool):
+                return float(value)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value.strip())
+                except ValueError:
+                    return None
+            return None
+
         for f in findings:
             param = f.get("parameter", "unknown")
+            before_rps = _coerce_optional_float(f.get("before_rps", 0))
+            after_rps = _coerce_optional_float(f.get("after_rps", 0))
+            impact_pct = _coerce_optional_float(f.get("impact_pct", 0))
             ctx.deps.memory.save_fact(
                 session_id=ctx.deps.session_id,
                 type="fix",
@@ -478,11 +496,12 @@ def build(model) -> Agent:
                 reasoning=f.get("reasoning", "proven fix applied"),
                 before_value=f.get("before_value", ""),
                 after_value=f.get("after_value", ""),
-                before_rps=f.get("before_rps", 0),
-                after_rps=f.get("after_rps", 0),
-                impact_pct=f.get("impact_pct", 0),
+                before_rps=before_rps,
+                after_rps=after_rps,
+                impact_pct=impact_pct,
             )
-            tool_result("save", f"{param} ({f.get('impact_pct', 0):+.1f}%)")
+            impact_label = "n/a" if impact_pct is None else f"{impact_pct:+.1f}%"
+            tool_result("save", f"{param} ({impact_label})")
         ctx.deps.token_counter.tool_calls += 1
         return True
 

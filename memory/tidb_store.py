@@ -39,6 +39,21 @@ class ContextEntry:
     created_at: datetime
 
 
+def _coerce_optional_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 class TiDBStore:
     def __init__(self, cfg: dict, embedder: EmbeddingProvider):
         m = cfg["memory"]
@@ -131,9 +146,9 @@ class TiDBStore:
                     parameter,
                     before_value,
                     after_value,
-                    before_rps,
-                    after_rps,
-                    impact_pct,
+                    _coerce_optional_float(before_rps),
+                    _coerce_optional_float(after_rps),
+                    _coerce_optional_float(impact_pct),
                     reasoning,
                     status,
                     json.dumps(embedding),

@@ -122,3 +122,25 @@ def test_tidb_store_reconnects_when_connection_closed(monkeypatch):
     store._conn = conn
     cur = store._cursor()
     assert isinstance(cur, FakeCursor)
+
+
+def test_save_fact_coerces_non_numeric_float_fields(monkeypatch):
+    conn = FakeConn()
+    monkeypatch.setattr("pymysql.connect", lambda **kwargs: conn)
+    store = _store()
+    store.connect()
+
+    store.save_fact(
+        "s1",
+        "fix",
+        "reset_timedout_connection",
+        "reason",
+        before_rps="0",
+        after_rps="0.0",
+        impact_pct="N/A (reset)",
+    )
+
+    params = conn.executed[-1][1]
+    assert params[6] == 0.0
+    assert params[7] == 0.0
+    assert params[8] is None

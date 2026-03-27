@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from adapters.nginx import NginxAdapter, _rewrite_listen_backlog_line
 from tools.ssh import SSHResult
 
@@ -46,6 +50,23 @@ def _build_adapter(ssh: FakeSSH) -> NginxAdapter:
         },
         ssh,
     )
+
+
+class FakeBench:
+    def __init__(self, json_payload: str = ""):
+        self.json_payload = json_payload
+        self.commands: list[str] = []
+
+    def execute(self, command: str, timeout: int | None = None) -> SSHResult:
+        del timeout
+        self.commands.append(command)
+        if command.startswith("TARGET_HOST="):
+            return SSHResult("ok", "", 0)
+        if command.startswith("cat /root/hackathon-results/"):
+            return SSHResult(self.json_payload, "", 0)
+        if command.startswith("wrk2 "):
+            return SSHResult("", "wrk2: command not found", 127)
+        return SSHResult("", "", 0)
 
 
 def test_rewrite_listen_line_updates_existing_backlog_and_keeps_comment():
@@ -138,3 +159,56 @@ def test_apply_config_returns_false_when_target_context_block_is_missing():
     adapter = _build_adapter(ssh)
 
     assert adapter.apply_config("sendfile", "on") is False
+
+
+def test_benchmark_uses_hackathon_runner_when_configured(monkeypatch):
+    monkeypatch.setenv("DUT_HOST", "172.21.90.178")
+    payload = (
+        '{"results":{"requests":{"per_sec":431193.8},'
+        '"latency":{"percentiles":{"p50":"1.2ms","p99":"9.2ms"}},"duration":60}}'
+    )
+    bench = FakeBench(payload)
+    adapter = NginxAdapter(
+        {
+            "service": {
+                "config_path": "/etc/nginx/nginx.conf",
+                "benchmark": {
+                    "tool": "hackathon",
+                    "script": "/root/hackathon-tools/benchmark.sh",
+                    "contestant_name": "slaymetrics",
+                    "target_host_env": "DUT_HOST",
+                    "small_file_url": "http://172.21.90.178/1kb.html",
+                },
+            }
+        },
+        FakeSSH("http {}\n"),
+        bench=bench,
+    )
+
+    result = adapter.benchmark(url="http://172.21.90.178/1kb.html")
+
+    assert result.requests_per_sec == 431193.8
+    assert result.latency_p99_ms == 9.2
+    assert any("/root/hackathon-tools/benchmark.sh" in cmd for cmd in bench.commands)
+    assert any(cmd.endswith("_small.json 2>/dev/null") for cmd in bench.commands if cmd.startswith("cat "))
+
+
+def test_benchmark_raises_when_wrk2_command_fails():
+    adapter = NginxAdapter(
+        {
+            "service": {
+                "config_path": "/etc/nginx/nginx.conf",
+                "benchmark": {
+                    "threads": 4,
+                    "connections": 100,
+                    "rate": 1000,
+                    "small_file_url": "http://localhost/1kb.html",
+                },
+            }
+        },
+        FakeSSH("http {}\n"),
+        bench=FakeBench(),
+    )
+
+    with pytest.raises(RuntimeError, match="wrk2 benchmark failed"):
+        adapter.benchmark(url="http://localhost/1kb.html")

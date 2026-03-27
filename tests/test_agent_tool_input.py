@@ -11,8 +11,14 @@ from tools.ssh import SSHResult
 
 
 class FakeMemory:
+    def __init__(self):
+        self.saved_facts: list[dict] = []
+
     def save_context(self, *args, **kwargs) -> None:
         del args, kwargs
+
+    def save_fact(self, **kwargs) -> None:
+        self.saved_facts.append(kwargs)
 
 
 class FakeAdapter:
@@ -72,7 +78,6 @@ def test_apply_nginx_tuning_accepts_json_string_changes():
         tool(
             ctx,
             '{"sendfile":"on","keepalive_requests":1000}',
-            "test",
         )
     )
 
@@ -87,7 +92,7 @@ def test_apply_nginx_tuning_invalid_json_returns_structured_error():
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
-    result = asyncio.run(tool(ctx, '{"sendfile":"on"', "test"))
+    result = asyncio.run(tool(ctx, '{"sendfile":"on"'))
 
     assert result["reload"] == "FAILED"
     assert "invalid JSON" in result["error"]
@@ -100,7 +105,7 @@ def test_apply_system_tuning_invalid_json_returns_structured_error():
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     ctx = _ctx()
 
-    result = asyncio.run(tool(ctx, '{"net.core.somaxconn":65535', "test"))
+    result = asyncio.run(tool(ctx, '{"net.core.somaxconn":65535'))
 
     assert result["applied"] == {}
     assert "_input" in result["failed"]
@@ -112,7 +117,7 @@ def test_apply_nginx_tuning_rejects_unsupported_directives():
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
-    result = asyncio.run(tool(ctx, {"upstream_read_timeout": "5s", "sendfile": "on"}, "test"))
+    result = asyncio.run(tool(ctx, {"upstream_read_timeout": "5s", "sendfile": "on"}))
 
     assert result["reload"] == "OK"
     assert result["applied"] == ["sendfile"]
@@ -134,7 +139,6 @@ def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
                 "upstream_read_timeout": "5s",
                 "sendfile": "on",
             },
-            "test",
         )
     )
 
@@ -166,10 +170,37 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
     agent = build(TestModel())
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
 
-    result = asyncio.run(tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}, "test"))
+    result = asyncio.run(tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}))
 
     assert result["reload"] == "FAILED"
     assert result["applied"] == ["sendfile"]
     assert result["failed"] == ["keepalive_requests"]
     assert "failed to apply nginx directive" in result["error"]
     assert ctx.deps.ssh.files["/etc/nginx/nginx.conf"] == "good config\n"
+
+
+def test_save_findings_coerces_non_numeric_impact_pct():
+    agent = build(TestModel())
+    tool = agent._function_toolset.tools["save_findings"].function
+    ctx = _ctx()
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "parameter": "reset_timedout_connection",
+                    "before_value": "off",
+                    "after_value": "on",
+                    "before_rps": "0",
+                    "after_rps": "0.0",
+                    "impact_pct": "N/A (reset)",
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    assert ctx.deps.memory.saved_facts[0]["before_rps"] == 0.0
+    assert ctx.deps.memory.saved_facts[0]["after_rps"] == 0.0
+    assert ctx.deps.memory.saved_facts[0]["impact_pct"] is None
