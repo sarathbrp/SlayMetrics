@@ -1,6 +1,7 @@
 #!/bin/bash
-# SlayMetricsAgent — Setup Script
-# Run this on the target RHEL 9.x / CentOS Stream system before running the agent.
+# SlayMetricsAgent — Bench Node Setup
+# Run this on System 2 (benchmarking node) where the agent runs.
+# DUT (System 1) with nginx is provided separately.
 #
 # Usage:
 #   chmod +x setup.sh
@@ -19,8 +20,7 @@ NC='\033[0m'
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 TIDB_VERSION="v8.4.0"
 TIDB_TAG="perfagent"
-
-
+VENV_DIR="$INSTALL_DIR/venv"
 
 log()  { echo -e "${GREEN}[setup]${NC} $1"; }
 warn() { echo -e "${YELLOW}[warn]${NC}  $1"; }
@@ -43,12 +43,13 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: SCAN — Check what's present and what's missing
+# SCAN — Check what's present and what's missing
 # ══════════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo -e "${BOLD}SlayMetricsAgent — System Scan${NC}"
-echo -e "${DIM}Checking what's installed on this system...${NC}"
+echo -e "${BOLD}SlayMetricsAgent — Bench Node Setup${NC}"
+echo -e "${DIM}This sets up System 2 (benchmarking node) where the agent runs.${NC}"
+echo -e "${DIM}DUT (System 1 with nginx) is configured separately via .env${NC}"
 echo ""
 
 MISSING=()
@@ -64,9 +65,9 @@ fi
 ok "$(nproc) CPU cores, $(free -h | awk '/Mem:/{print $2}') RAM"
 echo ""
 
-# ── 1. Python 3 ─────────────────────────────────────────────────────────────
 echo -e "${CYAN}Required Components:${NC}"
 
+# ── 1. Python 3 ─────────────────────────────────────────────────────────────
 if command -v python3 &>/dev/null; then
     ok "Python 3         $(python3 --version 2>&1 | awk '{print $2}')"
     PRESENT+=("python3")
@@ -85,7 +86,6 @@ else
 fi
 
 # ── 3. Python venv + deps ────────────────────────────────────────────────────
-VENV_DIR="$INSTALL_DIR/venv"
 if [ -f "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -c "import pydantic_ai" &>/dev/null 2>&1; then
     ok "Python venv      $VENV_DIR (pydantic-ai installed)"
     PRESENT+=("pydeps")
@@ -94,32 +94,7 @@ else
     MISSING+=("pydeps")
 fi
 
-# ── 4. Nginx ────────────────────────────────────────────────────────────────
-if command -v nginx &>/dev/null; then
-    ok "Nginx            $(nginx -v 2>&1 | awk -F/ '{print $2}')"
-    PRESENT+=("nginx")
-    if systemctl is-active nginx &>/dev/null; then
-        ok "  service        running"
-    else
-        miss "  service        not running (will start)"
-        MISSING+=("nginx-start")
-    fi
-else
-    miss "Nginx            not installed"
-    MISSING+=("nginx")
-fi
-
-# ── 5. Test files ────────────────────────────────────────────────────────────
-WEBROOT="/usr/share/nginx/html"
-if [ -f "$WEBROOT/1kb.html" ] && [ -f "$WEBROOT/100kb.html" ] && [ -f "$WEBROOT/1mb.html" ]; then
-    ok "Test files        1kb, 100kb, 1mb present"
-    PRESENT+=("testfiles")
-else
-    miss "Test files        missing in $WEBROOT"
-    MISSING+=("testfiles")
-fi
-
-# ── 6. wrk2 ─────────────────────────────────────────────────────────────────
+# ── 4. wrk2 ─────────────────────────────────────────────────────────────────
 if command -v wrk2 &>/dev/null; then
     ok "wrk2             $(wrk2 --version 2>&1 | head -1)"
     PRESENT+=("wrk2")
@@ -128,7 +103,7 @@ else
     MISSING+=("wrk2")
 fi
 
-# ── 7. Build tools (for wrk2) ───────────────────────────────────────────────
+# ── 5. Build tools (for wrk2) ───────────────────────────────────────────────
 if command -v gcc &>/dev/null && command -v make &>/dev/null; then
     ok "Build tools      gcc + make"
     PRESENT+=("buildtools")
@@ -137,7 +112,7 @@ else
     MISSING+=("buildtools")
 fi
 
-# ── 8. TiDB ─────────────────────────────────────────────────────────────────
+# ── 6. TiDB ─────────────────────────────────────────────────────────────────
 if command -v tiup &>/dev/null || [ -f "$HOME/.tiup/bin/tiup" ]; then
     ok "TiDB (tiup)      installed"
     PRESENT+=("tiup")
@@ -153,7 +128,7 @@ else
     MISSING+=("tiup")
 fi
 
-# ── 9. MySQL client ─────────────────────────────────────────────────────────
+# ── 7. MySQL client ─────────────────────────────────────────────────────────
 if command -v mysql &>/dev/null; then
     ok "MySQL client     $(mysql --version 2>&1 | head -1 | awk '{print $3,$4,$5}')"
     PRESENT+=("mysql")
@@ -162,7 +137,7 @@ else
     MISSING+=("mysql")
 fi
 
-# ── 10. TiDB schema ─────────────────────────────────────────────────────────
+# ── 8. TiDB schema ─────────────────────────────────────────────────────────
 if mysql -h 127.0.0.1 -P 4000 -u root -e "USE perfagent; SELECT 1;" &>/dev/null 2>&1; then
     ok "TiDB schema      perfagent database exists"
     PRESENT+=("schema")
@@ -171,32 +146,19 @@ else
     MISSING+=("schema")
 fi
 
-# ── 11. System diagnostic tools ──────────────────────────────────────────────
-echo ""
-echo -e "${CYAN}Diagnostic Tools:${NC}"
-for tool in sar numactl ethtool; do
-    if command -v $tool &>/dev/null; then
-        ok "$tool"
-        PRESENT+=("$tool")
-    else
-        miss "$tool            not found"
-        MISSING+=("$tool")
-    fi
-done
-
-# ── 12. Localhost SSH ────────────────────────────────────────────────────────
+# ── 9. SSH key ───────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}Agent Connectivity:${NC}"
-if ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=3 root@127.0.0.1 "echo OK" &>/dev/null 2>&1; then
-    ok "Localhost SSH    working"
-    PRESENT+=("ssh")
+if [ -f "$HOME/.ssh/id_rsa" ]; then
+    ok "SSH key          $HOME/.ssh/id_rsa exists"
+    PRESENT+=("sshkey")
 else
-    miss "Localhost SSH    not configured"
-    MISSING+=("ssh")
+    miss "SSH key          not found (will generate)"
+    MISSING+=("sshkey")
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SUMMARY + INSTALL — Show what's missing and install it
+# SUMMARY + INSTALL
 # ══════════════════════════════════════════════════════════════════════════════
 
 echo ""
@@ -210,7 +172,8 @@ if [ ${#MISSING[@]} -eq 0 ]; then
     echo ""
     echo "  To run the agent:"
     echo "    cd $INSTALL_DIR"
-    echo "    python3 main.py"
+    echo "    cp .env.example .env  # set ANTHROPIC_API_KEY and DUT_HOST"
+    echo "    $VENV_DIR/bin/python3 main.py -v"
     echo ""
     exit 0
 fi
@@ -236,35 +199,10 @@ contains "python3"    "${MISSING[@]}" && SYS_PKGS+=(python3)
 contains "pip3"       "${MISSING[@]}" && SYS_PKGS+=(python3-pip)
 contains "buildtools" "${MISSING[@]}" && SYS_PKGS+=(git gcc make openssl-devel zlib-devel)
 contains "mysql"      "${MISSING[@]}" && SYS_PKGS+=(mariadb)
-contains "sar"        "${MISSING[@]}" && SYS_PKGS+=(sysstat)
-contains "numactl"    "${MISSING[@]}" && SYS_PKGS+=(numactl)
-contains "ethtool"    "${MISSING[@]}" && SYS_PKGS+=(ethtool)
 
 if [ ${#SYS_PKGS[@]} -gt 0 ]; then
     log "Installing system packages: ${SYS_PKGS[*]}"
     $PKG install -y "${SYS_PKGS[@]}" 2>&1 | tail -5
-fi
-
-# ── Nginx ────────────────────────────────────────────────────────────────────
-if contains "nginx" "${MISSING[@]}"; then
-    log "Installing nginx..."
-    $PKG install -y nginx 2>&1 | tail -3
-fi
-
-if contains "nginx" "${MISSING[@]}" || contains "nginx-start" "${MISSING[@]}"; then
-    log "Starting nginx..."
-    systemctl enable --now nginx
-    log "Nginx $(nginx -v 2>&1 | awk -F/ '{print $2}') running"
-fi
-
-# ── Test files ───────────────────────────────────────────────────────────────
-if contains "testfiles" "${MISSING[@]}"; then
-    log "Creating test files..."
-    mkdir -p "$WEBROOT"
-    dd if=/dev/urandom of="$WEBROOT/1kb.html" bs=1024 count=1 2>/dev/null
-    dd if=/dev/urandom of="$WEBROOT/100kb.html" bs=1024 count=100 2>/dev/null
-    dd if=/dev/urandom of="$WEBROOT/1mb.html" bs=1024 count=1024 2>/dev/null
-    log "Test files created in $WEBROOT"
 fi
 
 # ── wrk2 ─────────────────────────────────────────────────────────────────────
@@ -274,7 +212,6 @@ if contains "wrk2" "${MISSING[@]}"; then
     [ -d wrk2 ] && rm -rf wrk2
     git clone https://github.com/giltene/wrk2.git 2>/dev/null
     cd wrk2
-    # Fix stdint.h — check both possible locations (src/ or deps/)
     for hdr in src/hdr_histogram.c deps/hdr_histogram/hdr_histogram.c; do
         if [ -f "$hdr" ]; then
             grep -q "stdint.h" "$hdr" || sed -i '1i #include <stdint.h>' "$hdr"
@@ -333,48 +270,37 @@ if contains "schema" "${MISSING[@]}"; then
     log "Tables: $(mysql -h 127.0.0.1 -P 4000 -u root -e 'USE perfagent; SHOW TABLES;' -sN | tr '\n' ', ')"
 fi
 
-# ── Localhost SSH ────────────────────────────────────────────────────────────
-if contains "ssh" "${MISSING[@]}"; then
-    log "Setting up localhost SSH access..."
-    [ ! -f "$HOME/.ssh/id_rsa" ] && ssh-keygen -t rsa -N "" -f "$HOME/.ssh/id_rsa" -q
-    grep -q "$(cat $HOME/.ssh/id_rsa.pub)" "$HOME/.ssh/authorized_keys" 2>/dev/null || \
-        cat "$HOME/.ssh/id_rsa.pub" >> "$HOME/.ssh/authorized_keys"
-    chmod 600 "$HOME/.ssh/authorized_keys"
-    ssh-keyscan 127.0.0.1 >> "$HOME/.ssh/known_hosts" 2>/dev/null
-    ssh -o StrictHostKeyChecking=no -o BatchMode=yes root@127.0.0.1 "echo OK" &>/dev/null && \
-        log "Localhost SSH OK" || warn "Localhost SSH failed — agent may not work"
+# ── SSH key ──────────────────────────────────────────────────────────────────
+if contains "sshkey" "${MISSING[@]}"; then
+    log "Generating SSH key..."
+    ssh-keygen -t rsa -N "" -f "$HOME/.ssh/id_rsa" -q
+    log "SSH key generated: $HOME/.ssh/id_rsa.pub"
+    echo ""
+    warn "Add this public key to the DUT (System 1):"
+    echo ""
+    echo "  $(cat $HOME/.ssh/id_rsa.pub)"
+    echo ""
+    warn "Run on DUT: echo '<key>' >> ~/.ssh/authorized_keys"
 fi
 
-# ── Update config ────────────────────────────────────────────────────────────
-log "Updating config.yaml for this host..."
-cd "$INSTALL_DIR"
-sed -i "s|host: .*|host: 127.0.0.1|" config.yaml
-sed -i "s|ssh_key: .*|ssh_key: $HOME/.ssh/id_rsa|" config.yaml
-
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 5: VERIFY
+# VERIFY
 # ══════════════════════════════════════════════════════════════════════════════
 
 echo ""
 log "============================================"
-log "  SlayMetricsAgent setup complete"
+log "  SlayMetricsAgent bench node ready"
 log "============================================"
 echo ""
-echo "  Nginx:    $(curl -s -o /dev/null -w '%{http_code}' http://localhost/1kb.html) on :80"
 echo "  wrk2:     $(which wrk2 2>/dev/null || echo 'not found')"
 echo "  TiDB:     :4000"
 echo "  Python:   $($VENV_DIR/bin/python3 --version 2>&1)"
 echo "  Venv:     $VENV_DIR"
 echo "  Agent:    $INSTALL_DIR"
 echo ""
-echo "  To run the agent:"
-echo "    cd $INSTALL_DIR"
-echo "    cp .env.example .env  # add your API key"
-echo "    $VENV_DIR/bin/python3 main.py -v"
-echo ""
-echo "  To degrade the system for testing:"
-echo "    $VENV_DIR/bin/python3 tools/degrade.py --host 127.0.0.1"
-echo ""
-echo "  To reset the system:"
-echo "    $VENV_DIR/bin/python3 tools/reset.py --clear-db"
+echo "  Next steps:"
+echo "    1. Copy SSH key to DUT:  ssh-copy-id root@<DUT_IP>"
+echo "    2. Configure:            cp .env.example .env"
+echo "       Set ANTHROPIC_API_KEY and DUT_HOST in .env"
+echo "    3. Run:                  $VENV_DIR/bin/python3 main.py -v"
 echo ""
