@@ -3,11 +3,20 @@ repos:
     rev: v5.0.0
     hooks:
       - id: check-merge-conflict
+      - id: check-added-large-files
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-yaml
       - id: check-toml
       - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: repo-hygiene
+        name: Block secrets and raw IP API endpoints
+        entry: python3 tools/check_repo_hygiene.py
+        language: system
+        files: .*
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.11.10
