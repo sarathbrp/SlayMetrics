@@ -664,6 +664,13 @@ def build(model) -> DiagnosisWorkflow:
 
     def save_rca_impl(deps: AgentDeps, records: list[dict[str, Any]]) -> bool:
         tool_call("rca", f"{len(records)} records")
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "planner_rca_raw",
+            json.dumps(records, ensure_ascii=True),
+            f"raw rca payload ({len(records)} records)",
+        )
         normalized_records: list[dict[str, Any]] = []
         for idx, record in enumerate(records, start=1):
             symptom = str(record.get("symptom", "")).strip() or "unknown symptom"
@@ -699,10 +706,31 @@ def build(model) -> DiagnosisWorkflow:
 
     def save_recommendations_impl(deps: AgentDeps, recommendations: list[dict[str, Any]]) -> bool:
         tool_call("recommend", f"{len(recommendations)} recommendations")
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "planner_recommendations_raw",
+            json.dumps(recommendations, ensure_ascii=True),
+            f"raw recommendation payload ({len(recommendations)} items)",
+        )
         normalized_items: list[dict[str, Any]] = []
         for idx, item in enumerate(recommendations, start=1):
             scope = str(item.get("scope", "nginx")).strip().lower() or "nginx"
             if scope not in {"nginx", "system"}:
+                deps.memory.save_context(
+                    deps.session_id,
+                    "command_output",
+                    f"recommendation_rejected_{idx}",
+                    json.dumps(
+                        {
+                            "reason": "invalid scope",
+                            "scope": scope,
+                            "raw": item,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    f"recommendation_{idx} rejected: invalid scope {scope}",
+                )
                 tool_result("recommend", f"skipped recommendation_{idx}: invalid scope {scope}")
                 continue
             changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
@@ -713,6 +741,22 @@ def build(model) -> DiagnosisWorkflow:
                 key: value for key, value in (changes or {}).items() if key in allowed_params
             }
             if not filtered_changes:
+                deps.memory.save_context(
+                    deps.session_id,
+                    "command_output",
+                    f"recommendation_rejected_{idx}",
+                    json.dumps(
+                        {
+                            "reason": "no allowed performance changes",
+                            "scope": scope,
+                            "raw": item,
+                            "normalized_changes": changes or {},
+                            "allowed_params": sorted(allowed_params),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    f"recommendation_{idx} rejected: no allowed performance changes",
+                )
                 tool_result(
                     "recommend", f"skipped recommendation_{idx}: no allowed performance changes"
                 )

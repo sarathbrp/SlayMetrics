@@ -408,7 +408,10 @@ def test_save_recommendations_skips_non_nginx_performance_changes():
     )
 
     assert result is True
-    assert ctx.deps.memory.saved == []
+    assert any(entry[2] == "planner_recommendations_raw" for entry in ctx.deps.memory.saved)
+    rejected = [entry for entry in ctx.deps.memory.saved if entry[2] == "recommendation_rejected_1"]
+    assert rejected
+    assert "no allowed performance changes" in rejected[0][4]
 
 
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
