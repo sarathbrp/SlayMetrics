@@ -31,7 +31,8 @@ memory:
   password_env: TIDB_PASSWORD          # pragma: allowlist secret
 
 target:
-  host: 192.168.1.100              # DUT — nginx runs here, agent SSH tunes this
+  host_env: DUT_HOST                # reads IP from .env DUT_HOST variable
+  host: 127.0.0.1                   # fallback if DUT_HOST not set
   ssh_user: root
   ssh_key: ~/.ssh/id_rsa
   ssh_timeout: 30
@@ -54,9 +55,10 @@ service:
     threads: 4
     connections: 400
     rate: 150000
-    small_file_url: "http://localhost/1kb.html"
-    medium_file_url: "http://localhost/100kb.html"
-    large_file_url: "http://localhost/1mb.html"
+    # URLs use DUT_HOST from .env; fallback to localhost
+    small_file_url: "http://${DUT_HOST:-localhost}/1kb.html"
+    medium_file_url: "http://${DUT_HOST:-localhost}/100kb.html"
+    large_file_url: "http://${DUT_HOST:-localhost}/1mb.html"
   metrics:
     - requests_per_sec
     - latency_p50

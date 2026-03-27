@@ -39,7 +39,16 @@ def load_dotenv():
 
 def load_config(path: str) -> dict:
     with open(path) as f:
-        return yaml.safe_load(f)
+        raw = f.read()
+    # Resolve ${VAR:-default} patterns from environment
+    import re
+    def _resolve(m):
+        var = m.group(1)
+        default = m.group(2) if m.group(2) is not None else ""
+        return os.environ.get(var, default)
+    raw = re.sub(r"\$\{(\w+):-([^}]*)\}", _resolve, raw)
+    raw = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), raw)
+    return yaml.safe_load(raw)
 
 
 def get_model(cfg: dict):

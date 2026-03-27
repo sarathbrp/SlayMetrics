@@ -117,7 +117,11 @@ class SSHClient:
 
 def from_config(cfg: dict, section: str = "target") -> LocalClient | SSHClient:
     t = cfg[section]
+    # Resolve host from env var if host_env is set
     host = t.get("host", "localhost")
+    host_env = t.get("host_env")
+    if host_env:
+        host = os.environ.get(host_env, host)
     if host in ("localhost", "127.0.0.1", "::1"):
         return LocalClient()
     return SSHClient(
