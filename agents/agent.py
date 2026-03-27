@@ -184,8 +184,8 @@ def build(model) -> Agent:
     }
 
     @agent.tool
-    async def inspect_nginx_config(ctx: RunContext[AgentDeps]) -> dict:
-        """Inspect nginx config and return only what needs fixing vs proven targets."""
+    async def inspect_nginx_config(ctx: RunContext[AgentDeps]) -> str:
+        """Inspect nginx config and return only what needs fixing vs proven targets. Returns JSON string."""
         tool_call("inspect", "nginx config — comparing against proven fixes")
         ssh = ctx.deps.ssh
 
@@ -227,11 +227,11 @@ def build(model) -> Agent:
         tool_result(
             "inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
-        return result
+        return json.dumps(result)
 
     @agent.tool
-    async def inspect_system_tuning(ctx: RunContext[AgentDeps]) -> dict:
-        """Inspect system tuning and return only what needs fixing vs proven targets."""
+    async def inspect_system_tuning(ctx: RunContext[AgentDeps]) -> str:
+        """Inspect system tuning and return only what needs fixing vs proven targets. Returns JSON string."""
         tool_call("inspect", "system tuning — comparing against proven fixes")
         ssh = ctx.deps.ssh
 
@@ -293,12 +293,12 @@ def build(model) -> Agent:
         tool_result(
             "inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
-        return result
+        return json.dumps(result)
 
     @agent.tool
     async def apply_nginx_tuning(
         ctx: RunContext[AgentDeps], changes: dict[str, str] | str | None = None, **kwargs: Any
-    ) -> dict:
+    ) -> str:
         """Apply multiple nginx config changes in one batch, then reload.
         Example: {"sendfile": "on", "tcp_nopush": "on",
         "open_file_cache": "max=10000 inactive=60s"}
@@ -355,7 +355,7 @@ def build(model) -> Agent:
                     "nginx batch apply",
                 )
                 tool_result("apply_nginx", f"FAILED: {result['error']}")
-                return result
+                return json.dumps(result)
 
         # Test config before reload
         test = ctx.deps.ssh.execute("nginx -t 2>&1")
@@ -378,7 +378,7 @@ def build(model) -> Agent:
                 "nginx batch apply failed",
             )
             tool_result("apply_nginx", f"FAILED: {error_msg}")
-            return result
+            return json.dumps(result)
 
         # Config valid — reload
         reload_ok = ctx.deps.adapter.reload()
@@ -402,12 +402,12 @@ def build(model) -> Agent:
             "nginx batch apply",
         )
         tool_result("apply_nginx", summary)
-        return result
+        return json.dumps(result)
 
     @agent.tool
     async def apply_system_tuning(
         ctx: RunContext[AgentDeps], changes: dict[str, str] | str | None = None, **kwargs: Any
-    ) -> dict:
+    ) -> str:
         """Apply multiple sysctl/kernel changes in one batch.
         Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never",
         "selinux": "permissive"}
@@ -477,10 +477,10 @@ def build(model) -> Agent:
             "system batch apply",
         )
         tool_result("apply_system", summary)
-        return result
+        return json.dumps(result)
 
     @agent.tool
-    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30) -> dict:
+    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30) -> str:
         """Run wrk2 benchmark against the small file URL. Returns RPS and latency."""
         bench_cfg = ctx.deps.config["service"]["benchmark"]
         url = bench_cfg.get("small_file_url", "http://localhost/")
@@ -502,26 +502,26 @@ def build(model) -> Agent:
         )
         ctx.deps.token_counter.tool_calls += 1
         state["after_rps"] = float(result.requests_per_sec)
-        return result.__dict__
+        return json.dumps(result.__dict__)
 
     _memory_query_count = 0
     MAX_MEMORY_QUERIES = 3
 
     @agent.tool
-    async def query_memory(ctx: RunContext[AgentDeps], symptom: str) -> list[dict]:
-        """Search the knowledge base and past findings. Limited to 3 queries — use wisely."""
+    async def query_memory(ctx: RunContext[AgentDeps], symptom: str) -> str:
+        """Search the knowledge base and past findings. Limited to 3 queries. Returns JSON string."""
         nonlocal _memory_query_count
         _memory_query_count += 1
         if _memory_query_count > MAX_MEMORY_QUERIES:
             tool_call("memory", f"BLOCKED — limit reached ({MAX_MEMORY_QUERIES})")
             tool_result("memory", "limit reached; returning no additional memory results")
             ctx.deps.token_counter.tool_calls += 1
-            return []
+            return "[]"
         tool_call("memory", f"query {_memory_query_count}/{MAX_MEMORY_QUERIES}: {symptom}")
         results = ctx.deps.memory.semantic_search(symptom, ctx.deps.session_id, top_k=5)
         tool_result("memory", f"{len(results)} results found")
         ctx.deps.token_counter.tool_calls += 1
-        return results
+        return json.dumps(results, default=str)
 
     @agent.tool
     async def save_findings(
