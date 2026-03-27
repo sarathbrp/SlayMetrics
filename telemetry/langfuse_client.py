@@ -120,27 +120,12 @@ class LangfuseClient:
             return
 
         merged = {**self._metadata, **(metadata or {})}
-        generation_context = (
-            self._client.start_as_current_generation(
-                name=name,
-                model=model,
-                input=_jsonable(input),
-                metadata=_jsonable(merged),
-                model_parameters=_jsonable(model_parameters or {}),
-            )
-            if self._generation_api_supported
-            else self._client.start_as_current_observation(
-                name=name,
-                input=_jsonable(input),
-                metadata=_jsonable(
-                    {
-                        **merged,
-                        "model": model,
-                        "model_parameters": _jsonable(model_parameters or {}),
-                        "compat_mode": "observation_generation_fallback",
-                    }
-                ),
-            )
+        generation_context = self._make_generation_context(
+            name=name,
+            model=model,
+            input=input,
+            metadata=merged,
+            model_parameters=model_parameters or {},
         )
         with generation_context as generation:
             self._last_trace_url = self._safe_trace_url()
@@ -171,6 +156,45 @@ class LangfuseClient:
         self._client.update_current_span(
             output=_jsonable(output),
             metadata=_jsonable(merged),
+        )
+
+    def _make_generation_context(
+        self,
+        *,
+        name: str,
+        model: str,
+        input: Any = None,
+        metadata: dict[str, Any] | None = None,
+        model_parameters: dict[str, Any] | None = None,
+    ):
+        merged = metadata or {}
+        if self._generation_api_supported:
+            try:
+                return self._client.start_as_current_generation(
+                    name=name,
+                    model=model,
+                    input=_jsonable(input),
+                    metadata=_jsonable(merged),
+                    model_parameters=_jsonable(model_parameters or {}),
+                )
+            except AttributeError:
+                self._generation_api_supported = False
+                logger.log(
+                    "langfuse",
+                    "Generation API unavailable at runtime; falling back to observation spans",
+                    "warn",
+                )
+        return self._client.start_as_current_observation(
+            name=name,
+            input=_jsonable(input),
+            metadata=_jsonable(
+                {
+                    **merged,
+                    "model": model,
+                    "model_parameters": _jsonable(model_parameters or {}),
+                    "compat_mode": "observation_generation_fallback",
+                }
+            ),
         )
 
     def update_span(self, *, output: Any = None, metadata: dict[str, Any] | None = None) -> None:

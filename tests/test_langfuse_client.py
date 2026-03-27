@@ -74,6 +74,11 @@ class _OldFakeLangfuseImpl:
         self.calls.append(("shutdown", {}))
 
 
+class _BrokenGenerationLangfuseImpl(_FakeLangfuseImpl):
+    def start_as_current_generation(self, **kwargs):
+        raise AttributeError("start_as_current_generation")
+
+
 def test_langfuse_client_disabled_without_keys(monkeypatch):
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
@@ -147,6 +152,26 @@ def test_langfuse_client_falls_back_when_generation_api_missing(monkeypatch):
         fake.calls[0][1]["metadata"]["compat_mode"] == "observation_generation_fallback"
     )
     assert fake.calls[1][1]["metadata"]["usage_details"] == {"prompt_tokens": 1}
+
+
+def test_langfuse_client_falls_back_when_generation_call_raises(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse",
+        SimpleNamespace(Langfuse=_BrokenGenerationLangfuseImpl),
+    )
+
+    client = LangfuseClient.from_env({"session_id": "s1"})
+
+    with client.generation("nginx_expert", model="gpt-oss-120b", input={"messages": []}):
+        client.update_generation(output={"summary": "ok"})
+
+    fake = client._client
+    assert fake.calls[0][0] == "observation"
+    assert fake.calls[0][1]["metadata"]["compat_mode"] == "observation_generation_fallback"
+    assert fake.calls[1][0] == "update_span"
 
 
 def test_summarize_messages_limits_content():
