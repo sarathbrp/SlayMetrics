@@ -84,9 +84,10 @@ def reset_system(client) -> None:
 
     # 1. Restore default nginx.conf
     print("  [nginx] Restoring default nginx.conf...")
-    # Write default config
     client.execute(f"cat > /etc/nginx/nginx.conf << 'NGINX_EOF'\n{DEFAULT_NGINX_CONF}NGINX_EOF")
-    r = client.execute("nginx -t 2>&1")
+    # Find nginx binary (may not be in PATH over SSH)
+    nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
+    r = client.execute(f"{nginx_bin} -t 2>&1")
     if "syntax is ok" in r.stdout or "test is successful" in r.stdout:
         client.execute("systemctl restart nginx")
         print("  [nginx] Config restored and service restarted")
@@ -109,15 +110,17 @@ def reset_system(client) -> None:
 
     # 5. Reset tuned profile
     print("  [tuned] Resetting to default profile...")
-    client.execute("tuned-adm profile virtual-guest 2>/dev/null || true")
+    client.execute("tuned-adm profile throughput-performance 2>/dev/null || "
+                   "tuned-adm profile virtual-guest 2>/dev/null || true")
 
     # 6. Verify
     print("\n  Verifying...")
-    r = client.execute("curl -s -o /dev/null -w '%{http_code}' http://localhost/1kb.html")
+    r = client.execute("curl -s -o /dev/null -w '%{http_code}' http://localhost/")
     print(f"  [nginx] HTTP status: {r.stdout.strip()}")
+    nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
     r = client.execute(
-        "nginx -T 2>&1 | "
-        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log|worker_connections'"
+        f"{nginx_bin} -T 2>&1 | "
+        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log|worker_connections|open_file_cache|gzip|aio'"
     )
     for line in r.stdout.strip().splitlines():
         print(f"  [nginx] {line.strip()}")
