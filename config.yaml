@@ -1,5 +1,5 @@
 llm:
-  active_profile: claude-haiku          # change this one line to switch LLM
+  active_profile: ollama-local          # change this one line to switch LLM
 
   profiles:
     granite-local:                     # default: fully local, air-gapped
@@ -19,7 +19,7 @@ llm:
 
     ollama-local:                      # lightweight alternative, zero infra
       backend: ollama
-      model: llama3.2
+      model: granite4:7b-a1b-h
       base_url: http://localhost:11434/v1
 
 memory:

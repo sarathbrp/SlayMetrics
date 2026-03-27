@@ -33,7 +33,7 @@ Steps 6-8: Direct (wrk2 + template) → zero LLM tokens
 
 - RHEL 9.x / CentOS Stream 9+ system
 - Root access
-- An LLM backend (Claude API key, or local Granite via vLLM, or Ollama)
+- An LLM backend (local Granite via Ollama or vLLM; Claude remains optional)
 
 ### Automated Setup
 
@@ -49,16 +49,13 @@ The setup script scans the system, shows what's present/missing, asks for confir
 ### Configure
 
 ```bash
-# Set API key (if using Claude)
-echo 'ANTHROPIC_API_KEY=sk-ant-your-key' > .env  # pragma: allowlist secret
-
 # Edit target and LLM profile
 vi config.yaml
 ```
 
 ```yaml
 llm:
-  active_profile: claude-haiku     # or: claude-remote, granite-local, ollama-local
+  active_profile: ollama-local     # or: granite-local, claude-haiku, claude-remote
 
 target:
   host: 127.0.0.1                  # localhost = subprocess, remote = SSH
@@ -69,6 +66,8 @@ target:
 ### Run
 
 ```bash
+ollama pull granite4:7b-a1b-h
+ollama serve
 python3 main.py           # normal
 python3 main.py -v        # verbose (show all tool calls)
 python3 main.py --session <id>   # resume previous session
@@ -96,10 +95,10 @@ Change one line in `config.yaml`:
 
 ```yaml
 llm:
-  active_profile: claude-haiku      # fast + cheap, good for testing
-  active_profile: claude-remote     # Claude Opus — best reasoning
+  active_profile: ollama-local      # local Granite 4 7B A1B via Ollama — default
   active_profile: granite-local     # Granite 3.1 8B via vLLM — air-gapped
-  active_profile: ollama-local      # any Ollama model — zero infra
+  active_profile: claude-haiku      # Claude Haiku — optional remote fallback
+  active_profile: claude-remote     # Claude Opus — optional remote fallback
 ```
 
 ## Knowledge Base

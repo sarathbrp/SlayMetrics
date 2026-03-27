@@ -11,7 +11,7 @@ import main
 from agents import TokenCounter
 from core import log as logger
 from core.reporter import _clean, generate
-from memory.embeddings import ClaudeEmbeddings
+from memory.embeddings import RemoteEmbeddings
 
 
 class FakeConsole:
@@ -243,8 +243,8 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: fake_memory)
     monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
     fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
-    monkeypatch.setattr(main, "ssh_from_config", lambda cfg: fake_ssh)
-    monkeypatch.setattr(main, "load_adapter", lambda cfg, ssh: "adapter")
+    monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)
+    monkeypatch.setattr(main, "load_adapter", lambda cfg, ssh, bench=None: "adapter")
     monkeypatch.setattr(main, "get_model", lambda cfg: "model")
     monkeypatch.setattr(main.logger, "status", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
@@ -274,7 +274,7 @@ def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):
     assert any("unchanged, skipping load" in args[1] for args in calls if len(args) > 1)
 
 
-def test_claude_embeddings(monkeypatch):
+def test_remote_embeddings(monkeypatch):
     class FakeEmbeddingsAPI:
         def create(self, model, input):
             return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0, 2.0])])
@@ -284,5 +284,5 @@ def test_claude_embeddings(monkeypatch):
             self.embeddings = FakeEmbeddingsAPI()
 
     monkeypatch.setitem(main.sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
-    emb = ClaudeEmbeddings("voyage-3")
+    emb = RemoteEmbeddings("voyage-3")
     assert emb.embed("hello") == [1.0, 2.0]
