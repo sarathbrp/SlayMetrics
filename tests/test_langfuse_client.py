@@ -50,6 +50,30 @@ class _FakeLangfuseImpl:
         self.calls.append(("shutdown", {}))
 
 
+class _OldFakeLangfuseImpl:
+    def __init__(self, **kwargs):
+        self.init_kwargs = kwargs
+        self.calls: list[tuple] = []
+
+    def start_as_current_observation(self, **kwargs):
+        return _FakeContext(self, "observation", kwargs)
+
+    def update_current_span(self, **kwargs):
+        self.calls.append(("update_span", kwargs))
+
+    def create_event(self, **kwargs):
+        self.calls.append(("event", kwargs))
+
+    def get_trace_url(self):
+        return "http://langfuse/project/p/traces/t"
+
+    def flush(self):
+        self.calls.append(("flush", {}))
+
+    def shutdown(self):
+        self.calls.append(("shutdown", {}))
+
+
 def test_langfuse_client_disabled_without_keys(monkeypatch):
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
@@ -104,6 +128,25 @@ def test_langfuse_client_auth_check(monkeypatch):
     client = LangfuseClient.from_env({"session_id": "s1"})
     client._client.auth_check = lambda: True
     assert client.auth_check() is True
+
+
+def test_langfuse_client_falls_back_when_generation_api_missing(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setitem(sys.modules, "langfuse", SimpleNamespace(Langfuse=_OldFakeLangfuseImpl))
+
+    client = LangfuseClient.from_env({"session_id": "s1"})
+
+    with client.generation("nginx_expert", model="gpt-oss-120b", input={"messages": []}):
+        client.update_generation(output={"summary": "ok"}, usage_details={"prompt_tokens": 1})
+
+    fake = client._client
+    assert fake.calls[0][0] == "observation"
+    assert fake.calls[1][0] == "update_span"
+    assert (
+        fake.calls[0][1]["metadata"]["compat_mode"] == "observation_generation_fallback"
+    )
+    assert fake.calls[1][1]["metadata"]["usage_details"] == {"prompt_tokens": 1}
 
 
 def test_summarize_messages_limits_content():

@@ -23,6 +23,11 @@ class LangfuseClient:
         self._client = client
         self._metadata = metadata or {}
         self._last_trace_url: str | None = None
+        self._generation_api_supported = bool(
+            client
+            and hasattr(client, "start_as_current_generation")
+            and hasattr(client, "update_current_generation")
+        )
 
     @property
     def enabled(self) -> bool:
@@ -115,13 +120,29 @@ class LangfuseClient:
             return
 
         merged = {**self._metadata, **(metadata or {})}
-        with self._client.start_as_current_generation(
-            name=name,
-            model=model,
-            input=_jsonable(input),
-            metadata=_jsonable(merged),
-            model_parameters=_jsonable(model_parameters or {}),
-        ) as generation:
+        generation_context = (
+            self._client.start_as_current_generation(
+                name=name,
+                model=model,
+                input=_jsonable(input),
+                metadata=_jsonable(merged),
+                model_parameters=_jsonable(model_parameters or {}),
+            )
+            if self._generation_api_supported
+            else self._client.start_as_current_observation(
+                name=name,
+                input=_jsonable(input),
+                metadata=_jsonable(
+                    {
+                        **merged,
+                        "model": model,
+                        "model_parameters": _jsonable(model_parameters or {}),
+                        "compat_mode": "observation_generation_fallback",
+                    }
+                ),
+            )
+        )
+        with generation_context as generation:
             self._last_trace_url = self._safe_trace_url()
             try:
                 yield generation
@@ -137,10 +158,19 @@ class LangfuseClient:
     ) -> None:
         if not self._client:
             return
-        self._client.update_current_generation(
+        if self._generation_api_supported:
+            self._client.update_current_generation(
+                output=_jsonable(output),
+                metadata=_jsonable({**self._metadata, **(metadata or {})}),
+                usage_details=usage_details or None,
+            )
+            return
+        merged = {**self._metadata, **(metadata or {})}
+        if usage_details:
+            merged["usage_details"] = usage_details
+        self._client.update_current_span(
             output=_jsonable(output),
-            metadata=_jsonable({**self._metadata, **(metadata or {})}),
-            usage_details=usage_details or None,
+            metadata=_jsonable(merged),
         )
 
     def update_span(self, *, output: Any = None, metadata: dict[str, Any] | None = None) -> None:
