@@ -595,6 +595,66 @@ def test_coerce_recommendations_drops_empty_changes():
     assert recommendations[0]["title"] == "good"
 
 
+def test_coerce_recommendations_accepts_nginx_directive_value_shape():
+    recommendations = diagnosis_agent._coerce_recommendations(
+        [
+            {
+                "directive": "worker_connections",
+                "value": "65536",
+                "justification": "Raise concurrency ceiling",
+            }
+        ]
+    )
+
+    assert recommendations == [
+        {
+            "title": "Set worker_connections",
+            "recommendation": "Set worker_connections to 65536",
+            "rationale": "Raise concurrency ceiling",
+            "expected_benefit": "no expected benefit",
+            "risk_level": "medium",
+            "validation": "manual verification required",
+            "scope": "nginx",
+            "changes": {"worker_connections": "65536"},
+        }
+    ]
+
+
+def test_coerce_recommendations_extracts_system_changes_from_commands():
+    recommendations = diagnosis_agent._coerce_recommendations(
+        [
+            {
+                "action": "Increase socket backlog limits",
+                "commands": [
+                    "sysctl -w net.core.somaxconn=65535",
+                    "sysctl -w net.ipv4.tcp_max_syn_backlog=65535",
+                    "echo never > /sys/kernel/mm/transparent_hugepage/enabled",
+                    "setenforce 0",
+                ],
+                "justification": "Reduce queue overflow",
+            }
+        ]
+    )
+
+    assert recommendations == [
+        {
+            "title": "Increase socket backlog limits",
+            "recommendation": "Increase socket backlog limits",
+            "rationale": "Reduce queue overflow",
+            "expected_benefit": "no expected benefit",
+            "risk_level": "medium",
+            "validation": "manual verification required",
+            "scope": "system",
+            "changes": {
+                "net.core.somaxconn": "65535",
+                "net.ipv4.tcp_max_syn_backlog": "65535",
+                "transparent_hugepage": "never",
+                "selinux": "permissive",
+            },
+        }
+    ]
+
+
 def test_run_applies_saved_recommendations(monkeypatch):
     deps = _ctx().deps
 

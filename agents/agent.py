@@ -1528,7 +1528,8 @@ def _coerce_recommendations(value: Any, deps: AgentDeps | None = None) -> list[d
                     f"synthesized recommendation_{idx} dropped: non-dict item {item!r}",
                 )
             continue
-        changes = item.get("changes", {})
+        normalized_item = _normalize_synthesized_recommendation(item)
+        changes = normalized_item.get("changes", {})
         if not isinstance(changes, dict) or not changes:
             if deps and _planner_debug_enabled(deps):
                 tool_result(
@@ -1541,20 +1542,85 @@ def _coerce_recommendations(value: Any, deps: AgentDeps | None = None) -> list[d
             continue
         recommendations.append(
             {
-                "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
-                "recommendation": str(item.get("recommendation", "")).strip()
+                "title": str(normalized_item.get("title", "")).strip() or f"recommendation_{idx}",
+                "recommendation": str(normalized_item.get("recommendation", "")).strip()
                 or "no recommendation",
-                "rationale": str(item.get("rationale", "")).strip() or "no rationale",
-                "expected_benefit": str(item.get("expected_benefit", "")).strip()
+                "rationale": str(normalized_item.get("rationale", "")).strip() or "no rationale",
+                "expected_benefit": str(normalized_item.get("expected_benefit", "")).strip()
                 or "no expected benefit",
-                "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
-                "validation": str(item.get("validation", "")).strip()
+                "risk_level": str(normalized_item.get("risk_level", "medium")).strip().lower()
+                or "medium",
+                "validation": str(normalized_item.get("validation", "")).strip()
                 or "manual verification required",
-                "scope": str(item.get("scope", "nginx")).strip().lower() or "nginx",
+                "scope": str(normalized_item.get("scope", "nginx")).strip().lower() or "nginx",
                 "changes": changes,
             }
         )
     return recommendations
+
+
+def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    changes = item.get("changes")
+    if isinstance(changes, dict) and changes:
+        return normalized
+
+    directive = str(item.get("directive", "")).strip()
+    value = item.get("value")
+    if directive and value not in (None, ""):
+        normalized["scope"] = "nginx"
+        normalized["changes"] = {directive: str(value)}
+        normalized["title"] = normalized.get("title") or f"Set {directive}"
+        normalized["recommendation"] = normalized.get("recommendation") or f"Set {directive} to {value}"
+        normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+        return normalized
+
+    commands = item.get("commands")
+    if isinstance(commands, list) and commands:
+        extracted = _extract_changes_from_commands(commands)
+        if extracted:
+            normalized["scope"] = normalized.get("scope") or "system"
+            normalized["changes"] = extracted
+            normalized["title"] = normalized.get("title") or str(item.get("action", "")).strip() or "system tuning"
+            normalized["recommendation"] = (
+                normalized.get("recommendation")
+                or str(item.get("action", "")).strip()
+                or "apply system tuning"
+            )
+            normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+            return normalized
+
+    return normalized
+
+
+def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:
+    extracted: dict[str, str] = {}
+    for raw_command in commands:
+        command = str(raw_command).strip()
+        if not command:
+            continue
+
+        sysctl_match = re.search(r"sysctl\s+-w\s+([A-Za-z0-9_.]+)=(.+)$", command)
+        if sysctl_match:
+            key = sysctl_match.group(1).strip()
+            value = sysctl_match.group(2).strip().strip('"').strip("'")
+            extracted[key] = value
+            continue
+
+        if "transparent_hugepage/enabled" in command and "echo never" in command:
+            extracted["transparent_hugepage"] = "never"
+            continue
+
+        if command.startswith("setenforce "):
+            mode = command.split(None, 1)[1].strip()
+            extracted["selinux"] = "permissive" if mode in {"0", "permissive"} else "enforcing"
+            continue
+
+        if "tcp_tw_reuse" in command and "sysctl -w" in command:
+            tw_match = re.search(r"tcp_tw_reuse=(.+)$", command)
+            if tw_match:
+                extracted["net.ipv4.tcp_tw_reuse"] = tw_match.group(1).strip().strip('"').strip("'")
+    return extracted
 
 
 def _save_planner_artifact(deps: AgentDeps, source: str, payload: dict[str, Any]) -> None:
