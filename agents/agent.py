@@ -1196,6 +1196,15 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
 
     nginx_analysis, nginx_usage = _invoke_json_planner(model, "nginx_expert", nginx_prompt)
     rhel_analysis, rhel_usage = _invoke_json_planner(model, "rhel_expert", rhel_prompt)
+    if _planner_debug_enabled(deps):
+        tool_result(
+            "debug",
+            f"nginx_expert raw: {json.dumps(nginx_analysis, ensure_ascii=True)[:1200]}",
+        )
+        tool_result(
+            "debug",
+            f"rhel_expert raw: {json.dumps(rhel_analysis, ensure_ascii=True)[:1200]}",
+        )
 
     synth_prompt = (
         "You are the synthesis arbiter between an NGINX expert "
@@ -1208,13 +1217,15 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
     synthesis, synth_usage = _invoke_json_planner(model, "synthesizer", synth_prompt)
+    if _planner_debug_enabled(deps):
+        tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=True)[:1500]}")
 
     _save_planner_artifact(deps, "nginx_expert", nginx_analysis)
     _save_planner_artifact(deps, "rhel_expert", rhel_analysis)
     _save_planner_artifact(deps, "synthesizer", synthesis)
 
-    rca_records = _coerce_records(synthesis.get("rca_records"))
-    recommendations = _coerce_recommendations(synthesis.get("recommendations"))
+    rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
+    recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)
     if rca_records:
         await save_rca(ctx, rca_records)
     if recommendations:
@@ -1276,36 +1287,71 @@ def _extract_json_dict(text: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _coerce_records(value: Any) -> list[dict[str, Any]]:
+def _planner_debug_enabled(deps: AgentDeps) -> bool:
+    cfg = getattr(deps, "config", {}) or {}
+    return bool((cfg.get("agent") or {}).get("debug_planner_payloads", False))
+
+
+def _coerce_records(value: Any, deps: AgentDeps | None = None) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     records: list[dict[str, Any]] = []
-    for item in value:
+    for idx, item in enumerate(value, start=1):
         if not isinstance(item, dict):
+            if deps and _planner_debug_enabled(deps):
+                tool_result("debug", f"synthesized rca_{idx} dropped: non-dict item {item!r}")
+            continue
+        symptom = str(item.get("symptom", "")).strip()
+        root_cause = str(item.get("root_cause", "")).strip()
+        recommendation = str(item.get("recommendation", "")).strip()
+        if not symptom or not root_cause:
+            if deps and _planner_debug_enabled(deps):
+                tool_result(
+                    "debug",
+                    (
+                        f"synthesized rca_{idx} dropped: missing required fields "
+                        f"raw={json.dumps(item, ensure_ascii=True)[:500]}"
+                    ),
+                )
             continue
         records.append(
             {
-                "symptom": str(item.get("symptom", "")).strip() or "unknown symptom",
-                "root_cause": str(item.get("root_cause", "")).strip() or "unknown root cause",
+                "symptom": symptom,
+                "root_cause": root_cause,
                 "confidence": _coerce_float(item.get("confidence", 0.0)),
-                "recommendation": str(item.get("recommendation", "")).strip()
-                or "no recommendation",
+                "recommendation": recommendation or "no recommendation",
                 "evidence": item.get("evidence", []),
             }
         )
     return records
 
 
-def _coerce_recommendations(value: Any) -> list[dict[str, Any]]:
+def _coerce_recommendations(value: Any, deps: AgentDeps | None = None) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     recommendations: list[dict[str, Any]] = []
-    for item in value:
+    for idx, item in enumerate(value, start=1):
         if not isinstance(item, dict):
+            if deps and _planner_debug_enabled(deps):
+                tool_result(
+                    "debug",
+                    f"synthesized recommendation_{idx} dropped: non-dict item {item!r}",
+                )
+            continue
+        changes = item.get("changes", {})
+        if not isinstance(changes, dict) or not changes:
+            if deps and _planner_debug_enabled(deps):
+                tool_result(
+                    "debug",
+                    (
+                        f"synthesized recommendation_{idx} dropped: empty/invalid changes "
+                        f"raw={json.dumps(item, ensure_ascii=True)[:500]}"
+                    ),
+                )
             continue
         recommendations.append(
             {
-                "title": str(item.get("title", "")).strip() or "untitled recommendation",
+                "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
                 "recommendation": str(item.get("recommendation", "")).strip()
                 or "no recommendation",
                 "rationale": str(item.get("rationale", "")).strip() or "no rationale",
@@ -1315,7 +1361,7 @@ def _coerce_recommendations(value: Any) -> list[dict[str, Any]]:
                 "validation": str(item.get("validation", "")).strip()
                 or "manual verification required",
                 "scope": str(item.get("scope", "nginx")).strip().lower() or "nginx",
-                "changes": item.get("changes", {}),
+                "changes": changes,
             }
         )
     return recommendations

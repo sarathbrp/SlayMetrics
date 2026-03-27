@@ -565,6 +565,36 @@ def test_run_uses_debate_planner_mode(monkeypatch):
     assert deps.token_counter.output_tokens == 3
 
 
+def test_coerce_records_drops_malformed_synthesized_items():
+    deps = SimpleNamespace(config={"agent": {"debug_planner_payloads": False}})
+
+    records = diagnosis_agent._coerce_records(
+        [
+            {"symptom": "", "root_cause": "missing symptom"},
+            {"symptom": "High p99", "root_cause": "backlog too low", "confidence": 0.8},
+        ],
+        deps=deps,
+    )
+
+    assert len(records) == 1
+    assert records[0]["symptom"] == "High p99"
+
+
+def test_coerce_recommendations_drops_empty_changes():
+    deps = SimpleNamespace(config={"agent": {"debug_planner_payloads": False}})
+
+    recommendations = diagnosis_agent._coerce_recommendations(
+        [
+            {"title": "bad", "scope": "nginx", "changes": {}},
+            {"title": "good", "scope": "nginx", "changes": {"worker_connections": "65536"}},
+        ],
+        deps=deps,
+    )
+
+    assert len(recommendations) == 1
+    assert recommendations[0]["title"] == "good"
+
+
 def test_run_applies_saved_recommendations(monkeypatch):
     deps = _ctx().deps
 
