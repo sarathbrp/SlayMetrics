@@ -285,12 +285,20 @@ class LangfuseClient:
         input: Any = None,
         metadata: dict[str, Any] | None = None,
     ):
-        return self._client.start_as_current_observation(
-            name=name,
-            input=_jsonable(input),
-            metadata=_jsonable(self._with_identity_metadata(metadata or {})),
-            **self._safe_identity_kwargs(),
-        )
+        try:
+            return self._client.start_as_current_observation(
+                name=name,
+                input=_jsonable(input),
+                metadata=_jsonable(self._with_identity_metadata(metadata or {})),
+                **self._safe_identity_kwargs(),
+            )
+        except TypeError:
+            self._identity_kwargs_supported = False
+            return self._client.start_as_current_observation(
+                name=name,
+                input=_jsonable(input),
+                metadata=_jsonable(self._with_identity_metadata(metadata or {})),
+            )
 
     def _identity_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}
