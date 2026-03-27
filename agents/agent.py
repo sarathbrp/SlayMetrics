@@ -31,23 +31,26 @@ class DiagnosisOutput:
     improvement_pct: float = 0.0
     notes: str = ""
     rca_records: list[dict[str, Any]] | None = None
+    recommendations: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.after_rps = _coerce_float(self.after_rps)
         self.improvement_pct = _coerce_float(self.improvement_pct)
         self.notes = _coerce_notes(self.notes)
         self.rca_records = list(self.rca_records or [])
+        self.recommendations = list(self.recommendations or [])
 
 
 SYSTEM_PROMPT = """\
 You are SlayMetricsAgent. Steps:
 1. Inspect nginx and system tuning
 2. Save structured RCA via save_rca before remediation
-3. Apply missing nginx fixes via apply_nginx_tuning
-4. Apply missing system fixes via apply_system_tuning
-5. Benchmark AFTER (baselines are provided — do NOT benchmark before)
-6. Call save_findings with both results in one call
-7. Return one short plain-text summary sentence
+3. Save transparent human-readable recommendations via save_recommendations before remediation
+4. Apply missing nginx fixes via apply_nginx_tuning
+5. Apply missing system fixes via apply_system_tuning
+6. Benchmark AFTER (baselines are provided — do NOT benchmark before)
+7. Call save_findings with both results in one call
+8. Return one short plain-text summary sentence
 
 For apply_nginx_tuning and apply_system_tuning:
 - Pass a structured object under the changes field
@@ -63,6 +66,12 @@ For save_rca:
 - Each RCA record must include symptom, root_cause, confidence, recommendation
 - evidence may be a list of short strings
 - Example: {"records":[{"symptom":"High p99 on small payloads","root_cause":"listen backlog and worker limits are below target","confidence":0.9,"recommendation":"Raise worker_connections and somaxconn","evidence":["small p99 above 1000ms","somaxconn below proven target"]}]}
+
+For save_recommendations:
+- Pass a structured list under the recommendations field
+- Each recommendation must include title, recommendation, rationale, expected_benefit, risk_level, validation
+- risk_level should be low, medium, or high
+- Example: {"recommendations":[{"title":"Raise connection limits","recommendation":"Increase worker_connections and somaxconn","rationale":"Current limits are below proven target values","expected_benefit":"Higher small-file RPS and lower tail latency","risk_level":"low","validation":"Re-run small workload and compare RPS/p99"}]}
 
 Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
 - worker_connections=65536
@@ -155,6 +164,7 @@ def build(model) -> DiagnosisWorkflow:
         "after_rps": 0.0,
         "findings": [],
         "rca_records": [],
+        "recommendations": [],
     }
     memory_query_count = 0
     max_memory_queries = 3
@@ -604,6 +614,31 @@ def build(model) -> DiagnosisWorkflow:
         state["rca_records"] = normalized_records
         return True
 
+    def save_recommendations_impl(deps: AgentDeps, recommendations: list[dict[str, Any]]) -> bool:
+        tool_call("recommend", f"{len(recommendations)} recommendations")
+        normalized_items: list[dict[str, Any]] = []
+        for idx, item in enumerate(recommendations, start=1):
+            normalized = {
+                "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
+                "recommendation": str(item.get("recommendation", "")).strip() or "no recommendation",
+                "rationale": str(item.get("rationale", "")).strip() or "no rationale",
+                "expected_benefit": str(item.get("expected_benefit", "")).strip() or "no expected benefit",
+                "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
+                "validation": str(item.get("validation", "")).strip() or "manual verification required",
+            }
+            deps.memory.save_context(
+                deps.session_id,
+                "recommendation",
+                f"recommendation_{idx}",
+                json.dumps(normalized),
+                f"{normalized['title']} [{normalized['risk_level']}]",
+            )
+            normalized_items.append(normalized)
+            tool_result("recommend", f"{normalized['title']} [{normalized['risk_level']}]")
+        deps.token_counter.tool_calls += 1
+        state["recommendations"] = normalized_items
+        return True
+
     async def inspect_nginx_config(ctx) -> dict:
         return inspect_nginx_impl(ctx.deps)
 
@@ -627,6 +662,9 @@ def build(model) -> DiagnosisWorkflow:
 
     async def save_rca(ctx, records: list[dict[str, Any]]) -> bool:
         return save_rca_impl(ctx.deps, records)
+
+    async def save_recommendations(ctx, recommendations: list[dict[str, Any]]) -> bool:
+        return save_recommendations_impl(ctx.deps, recommendations)
 
     def tool_factory(deps: AgentDeps):
         from langchain_core.tools import tool
@@ -671,10 +709,16 @@ def build(model) -> DiagnosisWorkflow:
             """Save structured root-cause analysis records before remediation."""
             return save_rca_impl(deps, records)
 
+        @tool
+        def save_recommendations(recommendations: list[dict[str, Any]]) -> bool:
+            """Save transparent human-readable recommendations before remediation."""
+            return save_recommendations_impl(deps, recommendations)
+
         return [
             inspect_nginx_config,
             inspect_system_tuning,
             save_rca,
+            save_recommendations,
             apply_nginx_tuning,
             apply_system_tuning,
             run_benchmark,
@@ -686,6 +730,7 @@ def build(model) -> DiagnosisWorkflow:
         "inspect_nginx_config": inspect_nginx_config,
         "inspect_system_tuning": inspect_system_tuning,
         "save_rca": save_rca,
+        "save_recommendations": save_recommendations,
         "apply_nginx_tuning": apply_nginx_tuning,
         "apply_system_tuning": apply_system_tuning,
         "run_benchmark": run_benchmark,
@@ -740,6 +785,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
         improvement_pct=improvement_pct,
         notes=notes,
         rca_records=list(state.get("rca_records") or []),
+        recommendations=list(state.get("recommendations") or []),
     )
 
 

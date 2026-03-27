@@ -24,6 +24,7 @@ def generate(
     profile = memory.get_profile(session_id) or {}
     facts = memory.get_facts(session_id)
     rca_entries = memory.get_contexts(session_id, type="rca")
+    recommendation_entries = memory.get_contexts(session_id, type="recommendation")
     queue = memory.get_queue(session_id)
 
     fixes = [f for f in facts if f.get("type") == "fix"]
@@ -51,6 +52,7 @@ def generate(
         throughput=throughput,
         token_history=token_history,
         rca_entries=rca_entries,
+        recommendation_entries=recommendation_entries,
     )
 
     # ── JSON report ──────────────────────────────────────────────────────────
@@ -69,6 +71,7 @@ def generate(
         "findings": [_clean(f) for f in findings],
         "negatives": [_clean(f) for f in negatives],
         "rca": [_clean(_clean_rca_entry(entry)) for entry in rca_entries],
+        "recommendations": [_clean(_clean_rca_entry(entry)) for entry in recommendation_entries],
         "hypothesis_queue": [_clean(q) for q in queue],
         "tokens": {
             "input": token_counter.input_tokens,
@@ -115,6 +118,7 @@ def _md_report(
     throughput=None,
     token_history=None,
     rca_entries=None,
+    recommendation_entries=None,
 ) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     service = profile.get("service", "unknown")
@@ -298,6 +302,21 @@ def _md_report(
                 f"- Confidence: {float(data.get('confidence', 0.0)):.2f}",
                 f"- Recommendation: {data.get('recommendation', 'No recommendation')}",
                 f"- Evidence: {evidence_text}",
+                "",
+            ]
+        lines += ["---", ""]
+
+    if recommendation_entries:
+        lines += ["## Recommendations", ""]
+        for entry in recommendation_entries:
+            data = _clean_rca_entry(entry)
+            lines += [
+                f"### {data.get('title', 'Recommendation')}",
+                f"- Action: {data.get('recommendation', 'No recommendation')}",
+                f"- Rationale: {data.get('rationale', 'No rationale')}",
+                f"- Expected benefit: {data.get('expected_benefit', 'No expected benefit')}",
+                f"- Risk level: {data.get('risk_level', 'unknown')}",
+                f"- Validation: {data.get('validation', 'No validation method')}",
                 "",
             ]
         lines += ["---", ""]

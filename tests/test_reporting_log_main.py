@@ -45,7 +45,22 @@ class FakeMemory:
         ]
 
     def get_contexts(self, session_id, type=None, source_prefix=None, limit=None):
-        del session_id, type, source_prefix, limit
+        del session_id, source_prefix, limit
+        if type == "recommendation":
+            return [
+                {
+                    "content": json.dumps(
+                        {
+                            "title": "Raise connection limits",
+                            "recommendation": "Increase worker_connections and somaxconn",
+                            "rationale": "Current limits are below target",
+                            "expected_benefit": "Higher throughput",
+                            "risk_level": "low",
+                            "validation": "Rerun small workload",
+                        }
+                    )
+                }
+            ]
         return []
 
     def get_queue(self, session_id):
@@ -90,8 +105,10 @@ def test_reporter_generate_and_clean(tmp_path):
     assert Path(path).exists()
     md = Path(path).read_text()
     assert "Token Attribution by Tool" in md
+    assert "## Recommendations" in md
     report_json = json.loads((tmp_path / "report.json").read_text())
     assert report_json["tokens"]["by_tool"][0]["tool"] == "inspect"
+    assert report_json["recommendations"][0]["title"] == "Raise connection limits"
     assert _clean({"a": 1, "embedding": [1]}) == {"a": 1}
 
     class EmptyMemory(FakeMemory):

@@ -312,6 +312,33 @@ def test_save_rca_persists_structured_records():
     assert "Backlog and worker limits" in saved[4]
 
 
+def test_save_recommendations_persists_human_readable_items():
+    agent = build("model")
+    tool = agent._function_toolset.tools["save_recommendations"].function
+    ctx = _ctx()
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "title": "Raise connection limits",
+                    "recommendation": "Increase worker_connections and somaxconn",
+                    "rationale": "Current values are below proven targets",
+                    "expected_benefit": "Higher small-file throughput",
+                    "risk_level": "low",
+                    "validation": "Re-run small workload and compare p99/RPS",
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    saved = ctx.deps.memory.saved[-1]
+    assert saved[1] == "recommendation"
+    assert "Raise connection limits" in saved[4]
+
+
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
     deps = SimpleNamespace(
         memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
