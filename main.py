@@ -247,6 +247,7 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
         adapter=adapter,
         memory=memory,
         ssh=ssh,
+        bench=bench,
         session_id=session_id,
         config=cfg,
         token_counter=token_counter,

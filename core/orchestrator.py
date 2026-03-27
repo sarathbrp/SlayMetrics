@@ -142,12 +142,17 @@ async def run(model, deps: AgentDeps) -> str:
 
     diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
 
-    logger.log("agent", f"Summary: {diagnosis.notes}", "result")
+    notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
+    logger.log("agent", f"Summary: {notes}", "result")
 
     # Update best RPS from agent's result
     best_rps = baseline_rps
-    if diagnosis.after_rps > best_rps:
-        best_rps = diagnosis.after_rps
+    diagnosis_after_rps = getattr(diagnosis, "after_rps", None)
+    if diagnosis_after_rps is None:
+        fixes_applied = getattr(diagnosis, "fixes_applied", []) or []
+        diagnosis_after_rps = max((fix.get("after_rps", 0) for fix in fixes_applied), default=0)
+    if diagnosis_after_rps > best_rps:
+        best_rps = diagnosis_after_rps
     memory.update_profile(session_id, best_rps=best_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -279,12 +284,14 @@ async def run(model, deps: AgentDeps) -> str:
     )
 
     total_improvement = ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
+    nginx_applied = getattr(diagnosis, "nginx_applied", "unknown")
+    system_applied = getattr(diagnosis, "system_applied", "unknown")
     logger.panel(
         "SlayMetricsAgent Complete",
         f"Baseline (small): {baseline_rps:.1f} req/sec\n"
         f"Best (small):     {best_rps:.1f} req/sec\n"
         f"Improvement: {total_improvement:+.1f}%\n"
-        f"Nginx applied: {diagnosis.nginx_applied}, System applied: {diagnosis.system_applied}\n"
+        f"Nginx applied: {nginx_applied}, System applied: {system_applied}\n"
         f"Tokens used: {deps.token_counter.summary()}\n"
         f"Report: {report_path}\n"
         f"Log: report/log_*_{session_id}.md",

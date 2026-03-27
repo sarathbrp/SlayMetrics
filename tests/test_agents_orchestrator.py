@@ -241,8 +241,6 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         16,
         ["- x"],
         {"small": {"rps": 1.0, "p50": 1.0, "p99": 2.0, "cpu_pct": 3.0, "error_rate": 0.0}},
-        "cfg",
-        ["k"],
         [{"parameter": "p", "value": "v", "impact": 1.0}],
     )
-    assert "Already Applied" in prompt
+    assert "Already applied (skip)" in prompt
