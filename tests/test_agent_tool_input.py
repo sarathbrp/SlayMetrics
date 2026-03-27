@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import agents.agent as diagnosis_agent
 from adapters.base import BenchmarkResult
 from agents import TokenCounter
-from agents.agent import DiagnosisOutput, _coerce_recommendations, _coerce_records, build
+from agents.agent import (
+    DiagnosisOutput,
+    _coerce_recommendations,
+    _coerce_records,
+    _save_planner_artifact,
+    build,
+)
 from tools.ssh import SSHResult
 
 
@@ -101,7 +108,7 @@ def _ctx():
         session_id="s1",
         token_counter=TokenCounter(),
         config={
-            "agent": {"debug_planner_payloads": False},
+            "agent": {"debug_planner_payloads": False, "persist_hypotheses": False},
             "service": {"benchmark": {}, "config_path": "/etc/nginx/nginx.conf"},
         },
     )
@@ -499,6 +506,57 @@ def test_coerce_recommendations_accepts_single_command_shape_for_system():
 
     assert recommendations[0]["scope"] == "system"
     assert recommendations[0]["changes"] == {"selinux": "permissive"}
+
+
+def test_save_planner_artifact_writes_hypothesis_markdown(tmp_path, monkeypatch):
+    ctx = _ctx()
+    ctx.deps.config["agent"]["persist_hypotheses"] = True
+    monkeypatch.setattr(
+        diagnosis_agent,
+        "_hypothesis_dir",
+        lambda deps: Path(tmp_path) / deps.session_id,
+    )
+
+    _save_planner_artifact(
+        ctx.deps,
+        "nginx_expert",
+        {"summary": "summary text", "recommendations": [{"x": 1}]},
+    )
+
+    saved = (tmp_path / "s1" / "01_nginx_expert.md").read_text()
+    assert "# Nginx Expert" in saved
+    assert "summary text" in saved
+    assert '"recommendations"' in saved
+
+
+def test_rejected_recommendations_are_written_to_hypothesis_markdown(tmp_path, monkeypatch):
+    agent = build("model")
+    tool = agent._function_toolset.tools["save_recommendations"].function
+    ctx = _ctx()
+    ctx.deps.config["agent"]["persist_hypotheses"] = True
+    monkeypatch.setattr(
+        diagnosis_agent,
+        "_hypothesis_dir",
+        lambda deps: Path(tmp_path) / deps.session_id,
+    )
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "title": "Bad shape",
+                    "scope": "nginx",
+                    "changes": {"not_supported": "1"},
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    saved = (tmp_path / "s1" / "06_rejections.md").read_text()
+    assert "# Rejected Recommendations" in saved
+    assert "no allowed performance changes" in saved
 
 
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):

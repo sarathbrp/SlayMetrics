@@ -5,6 +5,7 @@ import re
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 
@@ -232,6 +233,15 @@ def build(model) -> DiagnosisWorkflow:
             else str(payload)
         )
         tool_result("debug", f"{label}: {text}")
+        _persist_hypothesis_markdown(
+            deps,
+            filename=f"debug_{label}.md",
+            title=f"Debug {label}",
+            sections=[
+                ("Summary", f"Planner debug artifact for `{label}`."),
+                ("Payload", _markdown_json(payload)),
+            ],
+        )
 
     def _langfuse_event(
         deps: AgentDeps,
@@ -860,6 +870,15 @@ def build(model) -> DiagnosisWorkflow:
             tool_result("rca", f"{symptom} -> {root_cause} ({confidence:.2f})")
         deps.token_counter.tool_calls += 1
         state["rca_records"] = normalized_records
+        _persist_hypothesis_markdown(
+            deps,
+            filename="04_rca.md",
+            title="RCA",
+            sections=[
+                ("Summary", f"Accepted RCA records: {len(normalized_records)}"),
+                ("Records", _markdown_json(normalized_records)),
+            ],
+        )
         _langfuse_event(
             deps,
             "tool.save_rca",
@@ -904,6 +923,25 @@ def build(model) -> DiagnosisWorkflow:
                     ),
                     f"recommendation_{idx} rejected: invalid scope {scope}",
                 )
+                _persist_hypothesis_markdown(
+                    deps,
+                    filename="06_rejections.md",
+                    title="Rejected Recommendations",
+                    sections=[
+                        (
+                            "Rejection",
+                            _markdown_json(
+                                {
+                                    "index": idx,
+                                    "reason": "invalid scope",
+                                    "scope": scope,
+                                    "raw": item,
+                                }
+                            ),
+                        )
+                    ],
+                    append=True,
+                )
                 tool_result("recommend", f"skipped recommendation_{idx}: invalid scope {scope}")
                 continue
             changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
@@ -942,6 +980,27 @@ def build(model) -> DiagnosisWorkflow:
                     ),
                     f"recommendation_{idx} rejected: no allowed performance changes",
                 )
+                _persist_hypothesis_markdown(
+                    deps,
+                    filename="06_rejections.md",
+                    title="Rejected Recommendations",
+                    sections=[
+                        (
+                            "Rejection",
+                            _markdown_json(
+                                {
+                                    "index": idx,
+                                    "reason": "no allowed performance changes",
+                                    "scope": scope,
+                                    "raw": item,
+                                    "normalized_changes": changes or {},
+                                    "allowed_params": sorted(allowed_params),
+                                }
+                            ),
+                        )
+                    ],
+                    append=True,
+                )
                 tool_result(
                     "recommend", f"skipped recommendation_{idx}: no allowed performance changes"
                 )
@@ -970,6 +1029,15 @@ def build(model) -> DiagnosisWorkflow:
             tool_result("recommend", f"{normalized['title']} [{normalized['risk_level']}]")
         deps.token_counter.tool_calls += 1
         state["recommendations"] = normalized_items
+        _persist_hypothesis_markdown(
+            deps,
+            filename="05_recommendations.md",
+            title="Recommendations",
+            sections=[
+                ("Summary", f"Accepted recommendations: {len(normalized_items)}"),
+                ("Recommendations", _markdown_json(normalized_items)),
+            ],
+        )
         _langfuse_event(
             deps,
             "tool.save_recommendations",
@@ -1746,6 +1814,64 @@ def _save_planner_artifact(deps: AgentDeps, source: str, payload: dict[str, Any]
         json.dumps(payload, ensure_ascii=True),
         f"{source} planner output",
     )
+    file_map = {
+        "nginx_expert": "01_nginx_expert.md",
+        "rhel_expert": "02_rhel_expert.md",
+        "synthesizer": "03_synthesizer.md",
+    }
+    _persist_hypothesis_markdown(
+        deps,
+        filename=file_map.get(source, f"{source}.md"),
+        title=source.replace("_", " ").title(),
+        sections=[
+            ("Summary", str(payload.get("summary", "")).strip() or "No summary returned."),
+            ("Payload", _markdown_json(payload)),
+        ],
+    )
+
+
+def _hypothesis_enabled(deps: AgentDeps) -> bool:
+    cfg = getattr(deps, "config", {}) or {}
+    agent_cfg = cfg.get("agent") or {}
+    if "persist_hypotheses" in agent_cfg:
+        return bool(agent_cfg.get("persist_hypotheses"))
+    return bool(agent_cfg.get("debug_planner_payloads", False))
+
+
+def _hypothesis_dir(deps: AgentDeps) -> Path:
+    root = Path(__file__).resolve().parent.parent
+    return root / "hypothesis" / str(getattr(deps, "session_id", "unknown"))
+
+
+def _markdown_json(payload: Any) -> str:
+    return f"```json\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n```"
+
+
+def _persist_hypothesis_markdown(
+    deps: AgentDeps,
+    *,
+    filename: str,
+    title: str,
+    sections: list[tuple[str, str]],
+    append: bool = False,
+) -> None:
+    if not _hypothesis_enabled(deps):
+        return
+    path = _hypothesis_dir(deps)
+    path.mkdir(parents=True, exist_ok=True)
+    target = path / filename
+    chunks: list[str] = []
+    if not append or not target.exists():
+        chunks.append(f"# {title}")
+    for heading, body in sections:
+        chunks.append(f"## {heading}")
+        chunks.append(body)
+    text = "\n\n".join(chunks).strip() + "\n"
+    if append and target.exists():
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write("\n" + text)
+    else:
+        target.write_text(text, encoding="utf-8")
 
 
 def _extract_final_text(messages: list[Any]) -> str:

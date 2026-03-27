@@ -81,6 +81,7 @@ agent:
   max_phase: 4
   baseline_mode: fresh
   debug_planner_payloads: false
+  persist_hypotheses: false
   benchmark_after_every_fix: true
   stability:
     enabled: false
