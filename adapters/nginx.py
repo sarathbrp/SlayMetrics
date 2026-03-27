@@ -21,6 +21,9 @@ HTTP_DIRECTIVES = {
     "reset_timedout_connection",
     "lingering_close",
     "lingering_timeout",
+    "aio",
+    "client_body_buffer_size",
+    "client_max_body_size",
 }
 
 

@@ -31,9 +31,35 @@ You are SlayMetricsAgent. Steps:
 5. Call save_findings with both results in one call
 6. Return DiagnosisOutput
 
-Proven nginx fixes: worker_connections=8192, open_file_cache=max=10000 inactive=60s, open_file_cache_valid=30s, open_file_cache_min_uses=2, worker_rlimit_nofile=65536, access_log=off, tcp_nodelay=on, keepalive_requests=1000, gzip=on, gzip_comp_level=1, listen_backlog=65535
+Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
+- worker_connections=65536
+- worker_rlimit_nofile=200000
+- worker_cpu_affinity=auto
+- open_file_cache=max=200000 inactive=60s
+- open_file_cache_valid=30s
+- open_file_cache_min_uses=2
+- access_log=off
+- tcp_nodelay=on
+- keepalive_requests=10000
+- keepalive_timeout=30
+- reset_timedout_connection=on
+- listen_backlog=65535
+- aio=threads
 
-Proven system fixes: net.core.somaxconn=65535, net.ipv4.tcp_max_syn_backlog=65535, net.core.netdev_max_backlog=65535, transparent_hugepage=never, selinux=permissive, net.ipv4.tcp_tw_reuse=1, net.core.rmem_max=16777216, net.core.wmem_max=16777216
+Proven system fixes:
+- net.core.somaxconn=65535
+- net.ipv4.tcp_max_syn_backlog=65535
+- net.core.netdev_max_backlog=65535
+- net.core.rmem_max=16777216
+- net.core.wmem_max=16777216
+- net.ipv4.tcp_tw_reuse=1
+- net.ipv4.tcp_max_tw_buckets=2000000
+- net.ipv4.ip_local_port_range=1024 65535
+- transparent_hugepage=never
+- selinux=permissive
+- cpu_governor=performance
+
+Do NOT apply gzip — test files are random binary data, compression wastes CPU.
 
 Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
 """
@@ -72,28 +98,33 @@ def build(model) -> Agent:
 
     # Proven optimal values — inspect compares against these
     NGINX_TARGETS = {
-        "worker_connections": "8192",
-        "open_file_cache": "max=10000 inactive=60s",
+        "worker_connections": "65536",
+        "worker_rlimit_nofile": "200000",
+        "worker_cpu_affinity": "auto",
+        "open_file_cache": "max=200000 inactive=60s",
         "open_file_cache_valid": "30s",
         "open_file_cache_min_uses": "2",
-        "worker_rlimit_nofile": "65536",
         "access_log": "off",
         "tcp_nodelay": "on",
-        "keepalive_requests": "1000",
-        "gzip": "on",
-        "gzip_comp_level": "1",
+        "keepalive_requests": "10000",
+        "keepalive_timeout": "30",
+        "reset_timedout_connection": "on",
         "listen_backlog": "65535",
+        "aio": "threads",
     }
 
     SYSTEM_TARGETS = {
         "net.core.somaxconn": "65535",
         "net.ipv4.tcp_max_syn_backlog": "65535",
         "net.core.netdev_max_backlog": "65535",
-        "transparent_hugepage": "never",
-        "selinux": "permissive",
-        "net.ipv4.tcp_tw_reuse": "1",
         "net.core.rmem_max": "16777216",
         "net.core.wmem_max": "16777216",
+        "net.ipv4.tcp_tw_reuse": "1",
+        "net.ipv4.tcp_max_tw_buckets": "2000000",
+        "net.ipv4.ip_local_port_range": "1024 65535",
+        "transparent_hugepage": "never",
+        "selinux": "permissive",
+        "cpu_governor": "performance",
     }
 
     @agent.tool
@@ -156,6 +187,8 @@ def build(model) -> Agent:
             "net.ipv4.tcp_max_syn_backlog",
             "net.core.netdev_max_backlog",
             "net.ipv4.tcp_tw_reuse",
+            "net.ipv4.tcp_max_tw_buckets",
+            "net.ipv4.ip_local_port_range",
             "net.core.rmem_max",
             "net.core.wmem_max",
         ]:
@@ -171,6 +204,12 @@ def build(model) -> Agent:
         current["selinux"] = (
             ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip().lower()
         )
+
+        # CPU governor
+        r = ssh.execute(
+            "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
+        )
+        current["cpu_governor"] = r.stdout.strip() or "not available"
 
         # Compare against targets
         needs_fixing = {}
@@ -344,6 +383,21 @@ def build(model) -> Agent:
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
                 r = ssh.execute(f"setenforce {mode} 2>&1")
                 applied[param] = value
+            elif param == "cpu_governor":
+                r = ssh.execute(
+                    f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>&1"
+                )
+                if r.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = r.stderr.strip()
+            elif param == "net.ipv4.ip_local_port_range":
+                # ip_local_port_range needs quotes around the value
+                r = ssh.execute(f'sysctl -w net.ipv4.ip_local_port_range="{value}" 2>&1')
+                if r.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = r.stderr.strip()
             else:
                 r = ssh.execute(f"sysctl -w {param}={value} 2>&1")
                 if r.ok:
