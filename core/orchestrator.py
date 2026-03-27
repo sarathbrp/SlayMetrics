@@ -88,6 +88,21 @@ async def run(model, deps: AgentDeps) -> str:
     )
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 2.5: Aggregate benchmark evidence from bench + DUT telemetry
+    # ══════════════════════════════════════════════════════════════════════════
+    logger.step("Step 2.5: Aggregating benchmark evidence...")
+    telemetry_entries = memory.get_contexts(session_id, "telemetry", limit=8)
+    benchmark_evidence = _build_benchmark_evidence(baselines, telemetry_entries)
+    memory.save_context(
+        session_id,
+        "command_output",
+        "benchmark_evidence",
+        json.dumps(benchmark_evidence),
+        benchmark_evidence["summary"],
+    )
+    logger.status("evidence", benchmark_evidence["summary"])
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 3: Collect service config (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 3: Collecting service configuration...")
@@ -130,13 +145,18 @@ async def run(model, deps: AgentDeps) -> str:
     else:
         logger.status("context", "No prior fixes found — fresh diagnosis")
 
-    # Step 4b removed — RAG knowledge is in system prompt (proven fixes list).
-    # Knowledge base stays in TiDB for query_memory tool if agent needs it.
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 4b: Assemble diagnosis evidence bundle
+    # ══════════════════════════════════════════════════════════════════════════
+    logger.step("Step 4b: Assembling diagnosis evidence...")
+    telemetry_summary = _build_telemetry_summary(telemetry_entries)
+    benchmark_evidence_text = _build_benchmark_evidence_text(benchmark_evidence)
+    logger.status("evidence", "Benchmark and telemetry evidence assembled for RCA")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5: LLM diagnosis + remediation (ONE agent, ONE context)
+    # STEP 5: RCA + recommendations
     # ══════════════════════════════════════════════════════════════════════════
-    logger.step("Step 5: Running AI diagnosis and remediation...")
+    logger.step("Step 5: Running RCA and recommendation planning...")
 
     context_prompt = _build_context_prompt(
         rhel_ver=rhel_ver,
@@ -144,9 +164,9 @@ async def run(model, deps: AgentDeps) -> str:
         cpu_cores=cpu_cores,
         ram_gb=ram_gb,
         checks_summary=checks_summary,
-        baselines=baselines,
+        benchmark_evidence_text=benchmark_evidence_text,
         prior_fixes=prior_fixes,
-        telemetry_summary=_build_telemetry_summary(memory.get_contexts(session_id, "telemetry", limit=4)),
+        telemetry_summary=telemetry_summary,
     )
 
     logger.log("orchestrator", f"Context prompt: {len(context_prompt)} chars", "info")
@@ -349,15 +369,11 @@ def _build_context_prompt(
     cpu_cores,
     ram_gb,
     checks_summary,
-    baselines,
+    benchmark_evidence_text,
     prior_fixes=None,
     telemetry_summary: str = "",
 ) -> str:
     checks_text = "\n".join(checks_summary)
-
-    baselines_text = ""
-    for size, data in baselines.items():
-        baselines_text += f"  {size}: {data['rps']:.1f} RPS, p99={data.get('p99', 0):.1f}ms\n"
 
     prior_text = ""
     if prior_fixes:
@@ -369,8 +385,8 @@ def _build_context_prompt(
 
     return f"""{rhel_ver} | {kernel_ver} | {cpu_cores} CPU | {ram_gb}GB
 Checks: {checks_text}
-Baselines:
-{baselines_text}
+Benchmark Evidence:
+{benchmark_evidence_text}
 {prior_text}
 {telemetry_text}
 Inspect, apply proven fixes, benchmark after, save_findings.
@@ -407,6 +423,78 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
             f"estab={summary.get('tcp_established', 'unknown')}"
         )
     return "\n".join(lines)
+
+
+def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, object]:
+    baseline_small = baselines.get("small", {})
+    baseline_homepage = baselines.get("homepage", {})
+    pre = _find_telemetry_entry(telemetry_entries, "baseline:pre")
+    post = _find_telemetry_entry(telemetry_entries, "baseline:post")
+    pre_summary = pre.get("summary", {}) if pre else {}
+    post_summary = post.get("summary", {}) if post else {}
+    rx_pre = _safe_int(pre_summary.get("rx_drop_total"))
+    rx_post = _safe_int(post_summary.get("rx_drop_total"))
+    tx_pre = _safe_int(pre_summary.get("tx_drop_total"))
+    tx_post = _safe_int(post_summary.get("tx_drop_total"))
+    evidence = {
+        "baseline_small_rps": baseline_small.get("rps", 0.0),
+        "baseline_small_p99_ms": baseline_small.get("p99", 0.0),
+        "baseline_homepage_rps": baseline_homepage.get("rps", 0.0),
+        "baseline_homepage_p99_ms": baseline_homepage.get("p99", 0.0),
+        "baseline_pre_workers": pre_summary.get("nginx_worker_count", 0),
+        "baseline_post_workers": post_summary.get("nginx_worker_count", 0),
+        "somaxconn": post_summary.get("somaxconn", pre_summary.get("somaxconn", "unknown")),
+        "tcp_max_syn_backlog": post_summary.get(
+            "tcp_max_syn_backlog", pre_summary.get("tcp_max_syn_backlog", "unknown")
+        ),
+        "rx_drop_delta": max(rx_post - rx_pre, 0),
+        "tx_drop_delta": max(tx_post - tx_pre, 0),
+        "tcp_established_post": post_summary.get("tcp_established", "unknown"),
+    }
+    evidence["summary"] = (
+        f"Bench baseline small={evidence['baseline_small_rps']:.1f} RPS "
+        f"p99={evidence['baseline_small_p99_ms']:.1f}ms; "
+        f"homepage={evidence['baseline_homepage_rps']:.1f} RPS; "
+        f"workers={evidence['baseline_post_workers']}; "
+        f"somaxconn={evidence['somaxconn']}; "
+        f"rx_drop_delta={evidence['rx_drop_delta']}"
+    )
+    return evidence
+
+
+def _build_benchmark_evidence_text(evidence: dict[str, object]) -> str:
+    return (
+        f"- baseline small: {float(evidence.get('baseline_small_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_small_p99_ms', 0.0)):.1f}ms\n"
+        f"- baseline homepage: {float(evidence.get('baseline_homepage_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_homepage_p99_ms', 0.0)):.1f}ms\n"
+        f"- benchmark telemetry delta: workers={evidence.get('baseline_post_workers', 0)}, "
+        f"somaxconn={evidence.get('somaxconn', 'unknown')}, "
+        f"syn_backlog={evidence.get('tcp_max_syn_backlog', 'unknown')}, "
+        f"rx_drop_delta={evidence.get('rx_drop_delta', 0)}, "
+        f"tx_drop_delta={evidence.get('tx_drop_delta', 0)}, "
+        f"established={evidence.get('tcp_established_post', 'unknown')}"
+    )
+
+
+def _find_telemetry_entry(entries: list[dict], source: str) -> dict:
+    for entry in entries:
+        if entry.get("source") != source:
+            continue
+        try:
+            payload = json.loads(entry.get("content", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return 0
 
 
 HACKATHON_WORKLOADS = ["homepage", "small", "medium", "large", "mixed"]
