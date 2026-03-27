@@ -7,9 +7,15 @@ import statistics
 import agents.agent as diagnosis_agent
 import core.reporter as reporter
 import rhel.system_checks as system_checks
-from telemetry import collect_snapshot, persist_snapshot
 from agents import AgentDeps
 from core import log as logger
+from telemetry import (
+    collect_snapshot,
+    persist_sampler_result,
+    persist_snapshot,
+    start_sampler,
+    stop_sampler,
+)
 
 PAYLOAD_SIZES = ["small", "medium", "large"]
 
@@ -70,17 +76,22 @@ async def run(model, deps: AgentDeps) -> str:
 
     if bench_tool == "hackathon":
         logger.step("Step 2: Running hackathon baseline benchmark...")
-        _capture_telemetry(deps, scope="baseline", source="pre")
-        baselines = _run_hackathon_benchmark(deps, cfg, "baseline", session_id)
-        _capture_telemetry(deps, scope="baseline", source="post")
+        baselines = _run_benchmark_window_with_telemetry(
+            deps,
+            scope="baseline",
+            runner=lambda: _run_hackathon_benchmark(deps, cfg, "baseline", session_id),
+        )
     else:
         logger.step("Step 2: Running baseline benchmarks (small/medium/large)...")
-        _capture_telemetry(deps, scope="baseline", source="pre")
-        baselines = _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id)
-        _capture_telemetry(deps, scope="baseline", source="post")
+        baselines = _run_benchmark_window_with_telemetry(
+            deps,
+            scope="baseline",
+            runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id),
+        )
 
-    baseline_rps = baselines.get("small", {}).get("rps",
-                   baselines.get("homepage", {}).get("rps", 0))
+    baseline_rps = baselines.get("small", {}).get(
+        "rps", baselines.get("homepage", {}).get("rps", 0)
+    )
     memory.update_profile(
         session_id,
         baseline_rps=baseline_rps,
@@ -217,18 +228,21 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     if bench_tool == "hackathon":
         logger.step("Step 6: Running hackathon final benchmark...")
-        _capture_telemetry(deps, scope="final", source="pre")
-        finals = _run_hackathon_benchmark(deps, cfg, "tuned", session_id)
-        _capture_telemetry(deps, scope="final", source="post")
+        finals = _run_benchmark_window_with_telemetry(
+            deps,
+            scope="final",
+            runner=lambda: _run_hackathon_benchmark(deps, cfg, "tuned", session_id),
+        )
     else:
         logger.step("Step 6: Running final benchmarks (small/medium/large)...")
-        _capture_telemetry(deps, scope="final", source="pre")
-        finals = _run_wrk2_benchmarks(deps, cfg, "Final", session_id)
-        _capture_telemetry(deps, scope="final", source="post")
+        finals = _run_benchmark_window_with_telemetry(
+            deps,
+            scope="final",
+            runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Final", session_id),
+        )
 
     # Update best_rps from actual final benchmarks
-    final_small_rps = finals.get("small", {}).get("rps",
-                      finals.get("homepage", {}).get("rps", 0))
+    final_small_rps = finals.get("small", {}).get("rps", finals.get("homepage", {}).get("rps", 0))
     if final_small_rps > best_rps:
         best_rps = final_small_rps
     memory.update_profile(session_id, best_rps=best_rps)
@@ -403,6 +417,30 @@ def _capture_telemetry(deps: AgentDeps, *, scope: str, source: str) -> None:
     persist_snapshot(deps.memory, deps.session_id, snapshot)
 
 
+def _run_benchmark_window_with_telemetry(deps: AgentDeps, *, scope: str, runner):
+    _capture_telemetry(deps, scope=scope, source="pre")
+    start_sampler(deps.ssh, scope=scope, host=deps.config["target"]["host"])
+    try:
+        return runner()
+    finally:
+        sampler_result = stop_sampler(deps.ssh, scope=scope, host=deps.config["target"]["host"])
+        persist_sampler_result(deps.memory, deps.session_id, sampler_result)
+        summary = sampler_result.get("summary", {})
+        last_sample = summary.get("last_sample", {})
+        if last_sample:
+            persist_snapshot(
+                deps.memory,
+                deps.session_id,
+                {
+                    "scope": scope,
+                    "source": "post",
+                    "host": deps.config["target"]["host"],
+                    "summary": last_sample,
+                    "sections": {},
+                },
+            )
+
+
 def _build_telemetry_summary(entries: list[dict]) -> str:
     lines: list[str] = []
     for entry in entries[:4]:
@@ -412,6 +450,16 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
         except (TypeError, json.JSONDecodeError):
             continue
         summary = payload.get("summary", {})
+        if source.endswith(":series"):
+            lines.append(
+                f"- {source}: samples={summary.get('sample_count', 0)}, "
+                f"duration={summary.get('duration_sec', 0)}s, "
+                f"runq_avg={summary.get('run_queue_avg', 0)}, "
+                f"runq_max={summary.get('run_queue_max', 0)}, "
+                f"rx_drop_delta={summary.get('rx_drop_delta', 0)}, "
+                f"rx_drop_rate={summary.get('rx_drop_rate_per_sec', 0)}"
+            )
+            continue
         lines.append(
             f"- {source}: workers={summary.get('nginx_worker_count', 0)}, "
             f"cores={summary.get('nginx_worker_cores', [])}, "
@@ -428,10 +476,20 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
 def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, object]:
     baseline_small = baselines.get("small", {})
     baseline_homepage = baselines.get("homepage", {})
+    series = _find_telemetry_entry(telemetry_entries, "baseline:series")
     pre = _find_telemetry_entry(telemetry_entries, "baseline:pre")
     post = _find_telemetry_entry(telemetry_entries, "baseline:post")
-    pre_summary = pre.get("summary", {}) if pre else {}
-    post_summary = post.get("summary", {}) if post else {}
+    series_summary = series.get("summary", {}) if series else {}
+    pre_summary = (
+        series.get("first_sample", {})
+        if series.get("first_sample")
+        else (pre.get("summary", {}) if pre else {})
+    )
+    post_summary = (
+        series.get("last_sample", {})
+        if series.get("last_sample")
+        else (post.get("summary", {}) if post else {})
+    )
     rx_pre = _safe_int(pre_summary.get("rx_drop_total"))
     rx_post = _safe_int(post_summary.get("rx_drop_total"))
     tx_pre = _safe_int(pre_summary.get("tx_drop_total"))
@@ -450,6 +508,12 @@ def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) ->
         "rx_drop_delta": max(rx_post - rx_pre, 0),
         "tx_drop_delta": max(tx_post - tx_pre, 0),
         "tcp_established_post": post_summary.get("tcp_established", "unknown"),
+        "telemetry_sample_count": series_summary.get("sample_count", 0),
+        "telemetry_duration_sec": series_summary.get("duration_sec", 0),
+        "run_queue_avg": series_summary.get("run_queue_avg", 0),
+        "run_queue_max": series_summary.get("run_queue_max", 0),
+        "worker_core_spread_max": series_summary.get("worker_core_spread_max", 0),
+        "rx_drop_rate_per_sec": series_summary.get("rx_drop_rate_per_sec", 0),
     }
     evidence["summary"] = (
         f"Bench baseline small={evidence['baseline_small_rps']:.1f} RPS "
@@ -457,6 +521,7 @@ def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) ->
         f"homepage={evidence['baseline_homepage_rps']:.1f} RPS; "
         f"workers={evidence['baseline_post_workers']}; "
         f"somaxconn={evidence['somaxconn']}; "
+        f"samples={evidence['telemetry_sample_count']}; "
         f"rx_drop_delta={evidence['rx_drop_delta']}"
     )
     return evidence
@@ -468,10 +533,15 @@ def _build_benchmark_evidence_text(evidence: dict[str, object]) -> str:
         f"p99={float(evidence.get('baseline_small_p99_ms', 0.0)):.1f}ms\n"
         f"- baseline homepage: {float(evidence.get('baseline_homepage_rps', 0.0)):.1f} RPS, "
         f"p99={float(evidence.get('baseline_homepage_p99_ms', 0.0)):.1f}ms\n"
-        f"- benchmark telemetry delta: workers={evidence.get('baseline_post_workers', 0)}, "
+        f"- benchmark telemetry window: samples={evidence.get('telemetry_sample_count', 0)}, "
+        f"duration={evidence.get('telemetry_duration_sec', 0)}s, "
+        f"workers={evidence.get('baseline_post_workers', 0)}, "
         f"somaxconn={evidence.get('somaxconn', 'unknown')}, "
         f"syn_backlog={evidence.get('tcp_max_syn_backlog', 'unknown')}, "
+        f"runq_avg={evidence.get('run_queue_avg', 0)}, "
+        f"runq_max={evidence.get('run_queue_max', 0)}, "
         f"rx_drop_delta={evidence.get('rx_drop_delta', 0)}, "
+        f"rx_drop_rate={evidence.get('rx_drop_rate_per_sec', 0)}, "
         f"tx_drop_delta={evidence.get('tx_drop_delta', 0)}, "
         f"established={evidence.get('tcp_established_post', 'unknown')}"
     )
@@ -564,7 +634,9 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
     # Save to context
     for workload, data in results.items():
         deps.memory.save_context(
-            session_id, "benchmark", f"{label}_{workload}",
+            session_id,
+            "benchmark",
+            f"{label}_{workload}",
             json.dumps(data),
             f"{label} {workload}: {data['rps']:.1f} RPS",
         )
@@ -582,7 +654,8 @@ def _run_wrk2_benchmarks(deps, cfg, label, session_id):
         if not url:
             continue
         result = deps.adapter.benchmark(
-            duration=bench_cfg.get("duration", 30), url=url,
+            duration=bench_cfg.get("duration", 30),
+            url=url,
         )
         results[size] = {
             "rps": result.requests_per_sec,
@@ -594,11 +667,16 @@ def _run_wrk2_benchmarks(deps, cfg, label, session_id):
             "url": url,
         }
         logger.benchmark(
-            f"{label} ({size})", result.requests_per_sec,
-            result.latency_p99_ms, result.cpu_pct, result.mem_mb,
+            f"{label} ({size})",
+            result.requests_per_sec,
+            result.latency_p99_ms,
+            result.cpu_pct,
+            result.mem_mb,
         )
         deps.memory.save_context(
-            session_id, "benchmark", f"{label.lower()}_{size}",
+            session_id,
+            "benchmark",
+            f"{label.lower()}_{size}",
             json.dumps(results[size]),
             f"{label} {size}: {result.requests_per_sec:.1f} RPS",
         )
