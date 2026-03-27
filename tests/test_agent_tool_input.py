@@ -19,6 +19,10 @@ class FakeMemory:
     def save_fact(self, **kwargs) -> None:
         self.saved_facts.append(kwargs)
 
+    def get_profile(self, session_id):
+        del session_id
+        return {"baseline_rps": 100.0}
+
 
 class FakeAdapter:
     def __init__(self):
@@ -238,6 +242,31 @@ def test_save_findings_coerces_non_numeric_impact_pct():
     assert ctx.deps.memory.saved_facts[0]["impact_pct"] is None
 
 
+def test_save_findings_derives_run_level_delta_when_model_omits_it():
+    agent = build("model")
+    tool = agent._function_toolset.tools["save_findings"].function
+    ctx = _ctx()
+    agent._slaymetrics_state["after_rps"] = 150.0
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "parameter": "worker_connections",
+                    "before_value": "1024",
+                    "after_value": "65536",
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    assert ctx.deps.memory.saved_facts[0]["before_rps"] == 100.0
+    assert ctx.deps.memory.saved_facts[0]["after_rps"] == 150.0
+    assert ctx.deps.memory.saved_facts[0]["impact_pct"] == 50.0
+
+
 def test_diagnosis_output_coerces_granite_friendly_shapes():
     output = DiagnosisOutput(
         nginx_applied=True,
@@ -293,3 +322,41 @@ def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
     assert output.after_rps == 150.0
     assert output.improvement_pct == 50.0
     assert output.notes == "Applied tuning successfully."
+
+
+def test_run_does_not_double_count_usage(monkeypatch):
+    deps = SimpleNamespace(
+        memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
+        session_id="s1",
+        token_counter=TokenCounter(),
+    )
+
+    class FakeRunResult:
+        output = "Applied tuning successfully."
+
+        def usage(self):
+            return SimpleNamespace(input_tokens=11, output_tokens=7)
+
+        def all_messages(self):
+            return []
+
+    class FakeAgent:
+        _slaymetrics_state = {
+            "nginx_applied": True,
+            "system_applied": True,
+            "after_rps": 150.0,
+            "findings": [],
+        }
+
+        async def run(self, prompt, deps):
+            return FakeRunResult()
+
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
+
+    asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
+
+    assert deps.token_counter.input_tokens == 11
+    assert deps.token_counter.output_tokens == 7

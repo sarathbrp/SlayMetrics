@@ -516,11 +516,32 @@ def build(model) -> DiagnosisWorkflow:
                     return None
             return None
 
+        try:
+            profile = deps.memory.get_profile(deps.session_id) or {}
+        except Exception:
+            profile = {}
+
+        baseline_rps = _coerce_optional_float(profile.get("baseline_rps")) or 0.0
+        run_after_rps = _coerce_optional_float(state.get("after_rps")) or 0.0
+        derived_impact = (
+            ((run_after_rps - baseline_rps) / baseline_rps * 100) if baseline_rps and run_after_rps else 0.0
+        )
+
         for finding in findings:
             param = finding.get("parameter", "unknown")
-            before_rps = _coerce_optional_float(finding.get("before_rps", 0))
-            after_rps = _coerce_optional_float(finding.get("after_rps", 0))
-            impact_pct = _coerce_optional_float(finding.get("impact_pct", 0))
+            before_rps = _coerce_optional_float(finding.get("before_rps"))
+            after_rps = _coerce_optional_float(finding.get("after_rps"))
+            impact_pct = _coerce_optional_float(finding.get("impact_pct"))
+
+            if before_rps is None and baseline_rps:
+                before_rps = baseline_rps
+            if after_rps is None and run_after_rps:
+                after_rps = run_after_rps
+            if impact_pct is None and before_rps and after_rps:
+                impact_pct = ((after_rps - before_rps) / before_rps * 100)
+            elif impact_pct is None and derived_impact:
+                impact_pct = derived_impact
+
             deps.memory.save_fact(
                 session_id=deps.session_id,
                 type="fix",
@@ -625,8 +646,10 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     agent = build(model)
     state = getattr(agent, "_slaymetrics_state", {})
     result = await agent.run(context_prompt, deps=deps)
-    _attribute_tool_tokens(result, deps.token_counter)
-    inp, out = deps.token_counter.add(result.usage())
+    inp, out = result.usage().input_tokens or 0, result.usage().output_tokens or 0
+    deps.token_counter.input_tokens += int(inp)
+    deps.token_counter.output_tokens += int(out)
+    deps.token_counter.tool_calls += 1
     llm_call("agent", f"LLM finished — {inp:,} in / {out:,} out tokens")
     tokens("agent", inp, out, deps.token_counter.summary())
 
@@ -701,33 +724,6 @@ def _coerce_notes(value: Any) -> str:
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=True)
     return str(value)
-
-
-def _attribute_tool_tokens(run_result: Any, token_counter: TokenCounter) -> None:
-    try:
-        messages = run_result.all_messages()
-    except Exception:
-        return
-
-    for message in messages:
-        usage = getattr(message, "usage_metadata", None) or {}
-        if not usage:
-            continue
-        input_tokens = (
-            usage.get("input_tokens")
-            or usage.get("prompt_tokens")
-            or usage.get("input_token_count")
-            or 0
-        )
-        output_tokens = (
-            usage.get("output_tokens")
-            or usage.get("completion_tokens")
-            or usage.get("output_token_count")
-            or 0
-        )
-        if input_tokens or output_tokens:
-            token_counter.input_tokens += int(input_tokens)
-            token_counter.output_tokens += int(output_tokens)
 
 
 def _aggregate_usage(messages: list[Any]) -> dict[str, int]:
