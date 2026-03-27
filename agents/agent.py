@@ -9,7 +9,12 @@ from typing import Annotated, Any, TypedDict
 from adapters.base import BenchmarkResult
 from agents import AgentDeps, TokenCounter
 from core.log import llm_call, log, tokens, tool_call, tool_result
-from langgraph.graph.message import add_messages
+
+try:
+    from langgraph.graph.message import add_messages
+except ModuleNotFoundError:
+    def add_messages(left: list[Any], right: list[Any]) -> list[Any]:
+        return [*left, *right]
 
 
 class GraphState(TypedDict):
@@ -42,12 +47,13 @@ You are SlayMetricsAgent. Steps:
 6. Return one short plain-text summary sentence
 
 For apply_nginx_tuning and apply_system_tuning:
-- Pass a single string argument named payload
-- payload must be a JSON object string, for example: {"access_log":"off","listen_backlog":"65535"}
+- Pass a structured object under the changes field
+- Example: {"changes":{"access_log":"off","listen_backlog":"65535"}}
+- If needed, you may also pass directive names directly as tool arguments instead of nesting them
 
 For save_findings:
-- Pass a single string argument named findings_json
-- findings_json must be a JSON array string
+- Pass a structured list under the findings field
+- Example: {"findings":[{"parameter":"nginx.access_log","before_value":"on","after_value":"off"}]}
 
 Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
 - worker_connections=65536
@@ -186,9 +192,6 @@ def build(model) -> DiagnosisWorkflow:
             else:
                 merged[key_str] = str(value)
         return merged, None
-
-    def _parse_payload_arg(payload: str | None, tool_name: str) -> tuple[dict[str, str] | None, str | None]:
-        return _normalize_changes(payload, tool_name)
 
     nginx_targets = {
         "worker_connections": "65536",
@@ -570,25 +573,13 @@ def build(model) -> DiagnosisWorkflow:
             return inspect_system_impl(deps)
 
         @tool
-        def apply_nginx_tuning(payload: str = "{}") -> dict:
-            """Apply multiple nginx config changes from a JSON object string payload."""
-            changes, parse_error = _parse_payload_arg(payload, "apply_nginx")
-            if parse_error:
-                tool_call("apply_nginx", "invalid input payload")
-                tool_result("apply_nginx", f"FAILED: {parse_error}")
-                deps.token_counter.tool_calls += 1
-                return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
+        def apply_nginx_tuning(changes: dict[str, Any] | str | None = None) -> dict:
+            """Apply multiple nginx config changes from a structured changes object."""
             return apply_nginx_impl(deps, changes)
 
         @tool
-        def apply_system_tuning(payload: str = "{}") -> dict:
-            """Apply multiple system changes from a JSON object string payload."""
-            changes, parse_error = _parse_payload_arg(payload, "apply_system")
-            if parse_error:
-                tool_call("apply_system", "invalid input payload")
-                tool_result("apply_system", f"FAILED: {parse_error}")
-                deps.token_counter.tool_calls += 1
-                return {"applied": {}, "failed": {"_input": parse_error}}
+        def apply_system_tuning(changes: dict[str, Any] | str | None = None) -> dict:
+            """Apply multiple system tuning changes from a structured changes object."""
             return apply_system_impl(deps, changes)
 
         @tool
@@ -602,20 +593,8 @@ def build(model) -> DiagnosisWorkflow:
             return query_memory_impl(deps, symptom)
 
         @tool
-        def save_findings(findings_json: str = "[]") -> bool:
-            """Save all findings from a JSON array string."""
-            try:
-                findings = json.loads(findings_json)
-            except json.JSONDecodeError as e:
-                tool_call("save", "invalid findings_json payload")
-                tool_result("save", f"FAILED: invalid findings_json ({e.msg})")
-                deps.token_counter.tool_calls += 1
-                return False
-            if not isinstance(findings, list):
-                tool_call("save", "invalid findings_json payload")
-                tool_result("save", "FAILED: findings_json must decode to a list")
-                deps.token_counter.tool_calls += 1
-                return False
+        def save_findings(findings: list[dict[str, Any]]) -> bool:
+            """Save all findings from a structured findings list."""
             return save_findings_impl(deps, findings)
 
         return [
