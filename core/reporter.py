@@ -54,7 +54,7 @@ def generate(
     # ── JSON report ──────────────────────────────────────────────────────────
     report_data = {
         "session_id": session_id,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(datetime.UTC).isoformat(),
         "profile": {k: v for k, v in profile.items() if k != "id"},
         "baseline_rps": baseline_rps,
         "best_rps": best_rps,
@@ -76,7 +76,7 @@ def generate(
         },
     }
 
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     md_path = os.path.join(output_dir, f"report_{ts}_{session_id}.md")
     json_path = os.path.join(output_dir, f"report_{ts}_{session_id}.json")
 
@@ -112,7 +112,7 @@ def _md_report(
     throughput=None,
     token_history=None,
 ) -> str:
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     service = profile.get("service", "unknown")
     host = profile.get("host", "unknown")
     rhel = profile.get("rhel_version", "unknown")
