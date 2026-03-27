@@ -74,8 +74,10 @@ def build(model) -> Agent:
     )
 
     def _normalize_changes(
-        raw_changes: dict[str, str] | str, tool_name: str
+        raw_changes: dict[str, str] | str | None, tool_name: str
     ) -> tuple[dict[str, str] | None, str | None]:
+        if raw_changes is None:
+            return {}, None
         changes_obj = raw_changes
         if isinstance(changes_obj, str):
             try:
@@ -95,6 +97,25 @@ def build(model) -> Agent:
             else:
                 normalized[key] = str(value)
         return normalized, None
+
+    def _coerce_tool_changes(
+        raw_changes: dict[str, str] | str | None,
+        extra_changes: dict[str, Any],
+        tool_name: str,
+    ) -> tuple[dict[str, str] | None, str | None]:
+        normalized_changes, parse_error = _normalize_changes(raw_changes, tool_name)
+        if parse_error:
+            return None, parse_error
+
+        merged = dict(normalized_changes or {})
+        for key, value in extra_changes.items():
+            if key == "changes":
+                continue
+            if isinstance(value, (dict, list)):
+                merged[str(key)] = json.dumps(value, separators=(",", ":"))
+            else:
+                merged[str(key)] = str(value)
+        return merged, None
 
     # Proven optimal values — inspect compares against these
     NGINX_TARGETS = {
@@ -240,12 +261,14 @@ def build(model) -> Agent:
         return result
 
     @agent.tool
-    async def apply_nginx_tuning(ctx: RunContext[AgentDeps], changes: dict[str, str] | str) -> dict:
+    async def apply_nginx_tuning(
+        ctx: RunContext[AgentDeps], changes: dict[str, str] | str | None = None, **kwargs: Any
+    ) -> dict:
         """Apply multiple nginx config changes in one batch, then reload.
         Example: {"sendfile": "on", "tcp_nopush": "on",
         "open_file_cache": "max=10000 inactive=60s"}
         """
-        normalized_changes, parse_error = _normalize_changes(changes, "apply_nginx")
+        normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_nginx")
         if parse_error:
             tool_call("apply_nginx", "invalid input payload")
             tool_result("apply_nginx", f"FAILED: {parse_error}")
@@ -347,13 +370,13 @@ def build(model) -> Agent:
 
     @agent.tool
     async def apply_system_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str
+        ctx: RunContext[AgentDeps], changes: dict[str, str] | str | None = None, **kwargs: Any
     ) -> dict:
         """Apply multiple sysctl/kernel changes in one batch.
         Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never",
         "selinux": "permissive"}
         """
-        normalized_changes, parse_error = _normalize_changes(changes, "apply_system")
+        normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_system")
         if parse_error:
             tool_call("apply_system", "invalid input payload")
             tool_result("apply_system", f"FAILED: {parse_error}")

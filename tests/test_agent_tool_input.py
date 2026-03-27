@@ -126,6 +126,28 @@ def test_apply_nginx_tuning_rejects_unsupported_directives():
     assert ctx.deps.adapter.applied == [("sendfile", "on")]
 
 
+def test_apply_nginx_tuning_accepts_top_level_kwargs_shape():
+    agent = build(TestModel())
+    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    ctx = _ctx()
+
+    result = asyncio.run(tool(ctx, access_log="off", sendfile="on"))
+
+    assert result["reload"] == "OK"
+    assert "sendfile" in result["applied"]
+    assert "access_log" in result["failed"] or "access_log" in result["applied"]
+
+
+def test_apply_system_tuning_accepts_top_level_kwargs_shape():
+    agent = build(TestModel())
+    tool = agent._function_toolset.tools["apply_system_tuning"].function
+    ctx = _ctx()
+
+    result = asyncio.run(tool(ctx, transparent_hugepage="never"))
+
+    assert result["applied"].get("transparent_hugepage") == "never"
+
+
 def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
     agent = build(TestModel())
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
