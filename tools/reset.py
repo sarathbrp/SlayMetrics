@@ -189,7 +189,29 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    # Load .env so DUT_HOST resolves in config
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(env_path):
+        for line in open(env_path):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+    # Resolve ${VAR:-default} in config
+    import re
+    raw = open(args.config).read()
+    raw = re.sub(r"\$\{(\w+):-([^}]*)\}", lambda m: os.environ.get(m.group(1), m.group(2)), raw)
+    raw = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), raw)
+    cfg = yaml.safe_load(raw)
+
+    # Resolve host_env for target
+    t = cfg["target"]
+    host_env = t.get("host_env")
+    if host_env:
+        t["host"] = os.environ.get(host_env, t.get("host", "127.0.0.1"))
+
+    print(f"  Target: {t['host']}")
     client = from_config(cfg)
     client.connect()
 
