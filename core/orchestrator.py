@@ -80,7 +80,17 @@ async def run(model, deps: AgentDeps) -> str:
 
     baseline_rps = baselines.get("small", {}).get("rps",
                    baselines.get("homepage", {}).get("rps", 0))
-    memory.update_profile(session_id, baseline_rps=baseline_rps, best_rps=baseline_rps)
+    baseline_p99 = baselines.get("small", {}).get("p99",
+                   baselines.get("homepage", {}).get("p99", 0))
+    baseline_error_rate = baselines.get("small", {}).get("error_rate",
+                          baselines.get("homepage", {}).get("error_rate", 0))
+    memory.update_profile(
+        session_id,
+        baseline_rps=baseline_rps,
+        baseline_p99=baseline_p99,
+        baseline_error_rate=baseline_error_rate,
+        best_rps=baseline_rps,
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 3: Collect service config (direct — no LLM)

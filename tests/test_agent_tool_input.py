@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+from adapters.base import BenchmarkResult
 from agents import TokenCounter
 import agents.agent as diagnosis_agent
 from agents.agent import DiagnosisOutput, build
@@ -23,7 +24,7 @@ class FakeMemory:
 
     def get_profile(self, session_id):
         del session_id
-        return {"baseline_rps": 100.0}
+        return {"baseline_rps": 100.0, "baseline_p99": 2.0, "baseline_error_rate": 0.0}
 
 
 class FakeAdapter:
@@ -43,6 +44,9 @@ class FakeAdapter:
 
     def reload(self) -> bool:
         return True
+
+    def benchmark(self, duration: int = 30, url: str = "") -> BenchmarkResult:
+        return BenchmarkResult(150.0, 1.0, 1.5, 0.0, duration, url=url, cpu_pct=10.0, mem_mb=20.0)
 
 
 class FakeSSH:
@@ -329,7 +333,7 @@ def test_save_recommendations_persists_human_readable_items():
                     "risk_level": "low",
                     "validation": "Re-run small workload and compare p99/RPS",
                     "scope": "nginx",
-                    "changes": {"sendfile": "on"},
+                    "changes": {"worker_connections": "65536"},
                 }
             ],
         )
@@ -339,6 +343,33 @@ def test_save_recommendations_persists_human_readable_items():
     saved = ctx.deps.memory.saved[-1]
     assert saved[1] == "recommendation"
     assert "Raise connection limits" in saved[4]
+
+
+def test_save_recommendations_skips_non_nginx_performance_changes():
+    agent = build("model")
+    tool = agent._function_toolset.tools["save_recommendations"].function
+    ctx = _ctx()
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "title": "Change unrelated setting",
+                    "recommendation": "Touch upstream timeout",
+                    "rationale": "not relevant",
+                    "expected_benefit": "none",
+                    "risk_level": "low",
+                    "validation": "n/a",
+                    "scope": "nginx",
+                    "changes": {"upstream_read_timeout": "5s"},
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    assert ctx.deps.memory.saved == []
 
 
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
@@ -463,3 +494,27 @@ def test_run_applies_saved_recommendations(monkeypatch):
     assert output.system_applied is True
     assert output.after_rps == 160.0
     assert output.recommendations[0]["title"] == "Raise connection limits"
+
+
+def test_recommendation_guardrail_records_negative_on_regression():
+    ctx = _ctx()
+    ctx.deps.adapter.benchmark = lambda duration=30, url="": BenchmarkResult(
+        90.0, 1.0, 3.0, 0.0, duration, url=url, cpu_pct=10.0, mem_mb=20.0
+    )
+    agent = build("model")
+    agent._slaymetrics_state["recommendations"] = [
+        {
+            "title": "Enable sendfile",
+            "recommendation": "Enable sendfile",
+            "rationale": "recommended",
+            "scope": "nginx",
+            "changes": {"sendfile": "on"},
+        }
+    ]
+    agent._slaymetrics_state["nginx_inspection"] = {"current": {"sendfile": "off"}}
+
+    agent._apply_from_recommendations(ctx.deps)
+
+    assert any(fact["type"] == "negative" for fact in ctx.deps.memory.saved_facts)
+    assert not any(fact["type"] == "fix" for fact in ctx.deps.memory.saved_facts)
+    assert "RPS regressed" in agent._slaymetrics_state["guardrail_failure"]

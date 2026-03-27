@@ -160,9 +160,12 @@ def build(model) -> DiagnosisWorkflow:
         "nginx_applied": False,
         "system_applied": False,
         "after_rps": 0.0,
+        "after_p99_ms": 0.0,
+        "after_error_rate": 0.0,
         "findings": [],
         "rca_records": [],
         "recommendations": [],
+        "guardrail_failure": "",
     }
     memory_query_count = 0
     max_memory_queries = 3
@@ -503,6 +506,8 @@ def build(model) -> DiagnosisWorkflow:
         )
         deps.token_counter.tool_calls += 1
         state["after_rps"] = float(result.requests_per_sec)
+        state["after_p99_ms"] = float(result.latency_p99_ms)
+        state["after_error_rate"] = float(result.error_rate)
         return result.__dict__
 
     def query_memory_impl(deps: AgentDeps, symptom: str) -> list[dict]:
@@ -618,9 +623,20 @@ def build(model) -> DiagnosisWorkflow:
         tool_call("recommend", f"{len(recommendations)} recommendations")
         normalized_items: list[dict[str, Any]] = []
         for idx, item in enumerate(recommendations, start=1):
+            scope = str(item.get("scope", "nginx")).strip().lower() or "nginx"
+            if scope not in {"nginx", "system"}:
+                tool_result("recommend", f"skipped recommendation_{idx}: invalid scope {scope}")
+                continue
             changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
             if parse_error:
                 changes = {}
+            allowed_params = set(nginx_targets) if scope == "nginx" else set(system_targets)
+            filtered_changes = {
+                key: value for key, value in (changes or {}).items() if key in allowed_params
+            }
+            if not filtered_changes:
+                tool_result("recommend", f"skipped recommendation_{idx}: no allowed performance changes")
+                continue
             normalized = {
                 "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
                 "recommendation": str(item.get("recommendation", "")).strip() or "no recommendation",
@@ -628,8 +644,8 @@ def build(model) -> DiagnosisWorkflow:
                 "expected_benefit": str(item.get("expected_benefit", "")).strip() or "no expected benefit",
                 "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
                 "validation": str(item.get("validation", "")).strip() or "manual verification required",
-                "scope": str(item.get("scope", "nginx")).strip().lower() or "nginx",
-                "changes": changes or {},
+                "scope": scope,
+                "changes": filtered_changes,
             }
             deps.memory.save_context(
                 deps.session_id,
@@ -643,6 +659,38 @@ def build(model) -> DiagnosisWorkflow:
         deps.token_counter.tool_calls += 1
         state["recommendations"] = normalized_items
         return True
+
+    def _evaluate_nginx_guardrails(deps: AgentDeps, benchmark_result: dict[str, Any]) -> dict[str, Any]:
+        try:
+            profile = deps.memory.get_profile(deps.session_id) or {}
+        except Exception:
+            profile = {}
+
+        baseline_rps = _coerce_float(profile.get("baseline_rps"))
+        baseline_p99 = _coerce_float(profile.get("baseline_p99"))
+        baseline_error_rate = _coerce_float(profile.get("baseline_error_rate"))
+        after_rps = _coerce_float(benchmark_result.get("requests_per_sec"))
+        after_p99 = _coerce_float(benchmark_result.get("latency_p99_ms"))
+        after_error_rate = _coerce_float(benchmark_result.get("error_rate"))
+        reasons: list[str] = []
+
+        if baseline_rps and after_rps < baseline_rps:
+            reasons.append(f"RPS regressed ({after_rps:.1f} < {baseline_rps:.1f})")
+        if baseline_p99 and after_p99 > baseline_p99 * 1.10:
+            reasons.append(f"p99 regressed ({after_p99:.1f}ms > {baseline_p99:.1f}ms)")
+        if after_error_rate > baseline_error_rate:
+            reasons.append(
+                f"error rate regressed ({after_error_rate:.3f} > {baseline_error_rate:.3f})"
+            )
+
+        impact_pct = ((after_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
+        return {
+            "ok": not reasons,
+            "summary": "validated for nginx performance" if not reasons else "; ".join(reasons),
+            "baseline_rps": baseline_rps,
+            "after_rps": after_rps,
+            "impact_pct": impact_pct,
+        }
 
     def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
         recommendations = list(state.get("recommendations") or [])
@@ -697,8 +745,40 @@ def build(model) -> DiagnosisWorkflow:
                 }
             )
 
-        if findings:
+        guardrail = _evaluate_nginx_guardrails(deps, benchmark_result)
+        deps.memory.save_context(
+            deps.session_id,
+            "metric",
+            "guardrail_validation",
+            json.dumps(guardrail),
+            guardrail["summary"],
+        )
+
+        if findings and guardrail["ok"]:
+            state["guardrail_failure"] = ""
             save_findings_impl(deps, findings)
+        elif findings:
+            state["guardrail_failure"] = guardrail["summary"]
+            state["nginx_applied"] = False
+            state["system_applied"] = False
+            state["findings"] = []
+            for finding in findings:
+                deps.memory.save_fact(
+                    session_id=deps.session_id,
+                    type="negative",
+                    parameter=finding.get("parameter", "unknown"),
+                    reasoning=guardrail["summary"],
+                    before_value=finding.get("before_value", ""),
+                    after_value=finding.get("after_value", ""),
+                    before_rps=guardrail["baseline_rps"],
+                    after_rps=guardrail["after_rps"],
+                    impact_pct=guardrail["impact_pct"],
+                    status="regressed",
+                )
+                tool_result(
+                    "guardrail",
+                    f"blocked {finding.get('parameter', 'unknown')}: {guardrail['summary']}",
+                )
 
         return {
             "nginx": nginx_result,
@@ -846,6 +926,9 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
             notes = f"Applied findings: {params}."
         else:
             notes = "Diagnosis completed."
+    guardrail_failure = str(state.get("guardrail_failure") or "").strip()
+    if guardrail_failure:
+        notes = f"{notes} Guardrail: {guardrail_failure}"
 
     return DiagnosisOutput(
         nginx_applied=bool(state.get("nginx_applied", False)),
