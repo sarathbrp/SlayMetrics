@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -223,6 +224,8 @@ async def main(
         )
 
     token_counter = TokenCounter()
+    tracing_cfg = cfg.get("telemetry", {}).get("langfuse", {}) or {}
+    langfuse_enabled = bool(tracing_cfg.get("enabled", False))
     langfuse = LangfuseClient.from_env(
         {
             "session_id": session_id,
@@ -232,10 +235,15 @@ async def main(
             "llm_profile": profile_name,
             "dut_host": host,
             "bench_host": bench_host,
-        }
+        },
+        enabled=langfuse_enabled,
     )
     if langfuse.enabled:
-        logger.status("langfuse", "Tracing enabled")
+        if langfuse.auth_check():
+            logger.status("langfuse", "Tracing enabled (auth OK)")
+        else:
+            logger.log("langfuse", "Tracing disabled: auth check failed", "warn")
+            langfuse = LangfuseClient.from_env(enabled=False)
     deps = AgentDeps(
         adapter=adapter,
         memory=memory,

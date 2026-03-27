@@ -86,3 +86,7 @@ agent:
     duration_sec: 1800
     sample_interval_sec: 60
     url_key: small_file_url
+
+telemetry:
+  langfuse:
+    enabled: true

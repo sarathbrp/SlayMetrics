@@ -33,7 +33,14 @@ class LangfuseClient:
         return self._last_trace_url
 
     @classmethod
-    def from_env(cls, metadata: dict[str, Any] | None = None) -> "LangfuseClient":
+    def from_env(
+        cls,
+        metadata: dict[str, Any] | None = None,
+        *,
+        enabled: bool = True,
+    ) -> "LangfuseClient":
+        if not enabled:
+            return cls(None, metadata=metadata)
         public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip()
         secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "").strip()
         base_url = (
@@ -59,6 +66,16 @@ class LangfuseClient:
             base_url=base_url or None,
         )
         return cls(client, metadata=metadata)
+
+    def auth_check(self) -> bool:
+        if not self._client:
+            return False
+        try:
+            result = self._client.auth_check()
+        except Exception as exc:
+            logger.log("langfuse", f"Auth check failed: {exc}", "warn")
+            return False
+        return bool(result)
 
     @contextmanager
     def trace(self, name: str, *, input: Any = None, metadata: dict[str, Any] | None = None):

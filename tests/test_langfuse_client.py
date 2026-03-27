@@ -61,6 +61,15 @@ def test_langfuse_client_disabled_without_keys(monkeypatch):
         pass
 
 
+def test_langfuse_client_disabled_by_flag(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+
+    client = LangfuseClient.from_env({"session_id": "s1"}, enabled=False)
+
+    assert client.enabled is False
+
+
 def test_langfuse_client_traces_events_and_generations(monkeypatch):
     monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
     monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
@@ -85,6 +94,16 @@ def test_langfuse_client_traces_events_and_generations(monkeypatch):
     assert any(call[0] == "event" for call in fake.calls)
     assert any(call[0] == "update_generation" for call in fake.calls)
     assert client.last_trace_url == "http://langfuse/project/p/traces/t"
+
+
+def test_langfuse_client_auth_check(monkeypatch):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setitem(sys.modules, "langfuse", SimpleNamespace(Langfuse=_FakeLangfuseImpl))
+
+    client = LangfuseClient.from_env({"session_id": "s1"})
+    client._client.auth_check = lambda: True
+    assert client.auth_check() is True
 
 
 def test_summarize_messages_limits_content():

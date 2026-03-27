@@ -295,6 +295,7 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
         "agent": {},
+        "telemetry": {"langfuse": {"enabled": True}},
     }
     monkeypatch.setattr(main, "load_config", lambda p: cfg_main)
     monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
@@ -316,6 +317,10 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         enabled = True
         last_trace_url = "http://langfuse/project/x/traces/y"
 
+        def auth_check(self):
+            langfuse_calls.append(("auth_check",))
+            return True
+
         def trace(self, *args, **kwargs):
             langfuse_calls.append(("trace", args, kwargs))
 
@@ -334,7 +339,11 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         def shutdown(self):
             langfuse_calls.append(("shutdown",))
 
-    monkeypatch.setattr(main.LangfuseClient, "from_env", lambda metadata=None: FakeLangfuse())
+    monkeypatch.setattr(
+        main.LangfuseClient,
+        "from_env",
+        lambda metadata=None, enabled=True: FakeLangfuse() if enabled else SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
+    )
     monkeypatch.setitem(
         main.sys.modules,
         "core.orchestrator",
@@ -344,7 +353,8 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     assert fake_memory.created is True
     assert cfg_main["agent"]["max_phase"] == 3
     assert cfg_main["agent"]["planner_mode"] == "debate"
-    assert langfuse_calls[0][0] == "trace"
+    assert ("auth_check",) in langfuse_calls
+    assert any(call[0] == "trace" for call in langfuse_calls)
     assert ("flush",) in langfuse_calls
     assert ("shutdown",) in langfuse_calls
 
