@@ -241,7 +241,8 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
                     "profiles": {
                         "g": {
                             "backend": "openai",
-                            "model": "gpt-oss-120b",
+                            "model": "/models/gpt-oss-120b",
+                            "model_env": "GPT_OSS_MODEL",
                             "base_url": "http://example-gpt-oss-host:8002/v1",
                             "api_key_env": "GPT_OSS_API_KEY",
                         }
@@ -251,6 +252,24 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         )[0]
         == "openai"
     )
+    monkeypatch.setenv("GPT_OSS_MODEL", "/models/custom-gpt-oss")
+    resolved = main.get_model(
+        {
+            "llm": {
+                "active_profile": "g",
+                "profiles": {
+                    "g": {
+                        "backend": "openai",
+                        "model": "/models/gpt-oss-120b",
+                        "model_env": "GPT_OSS_MODEL",
+                        "base_url": "http://example-gpt-oss-host:8002/v1",
+                        "api_key_env": "GPT_OSS_API_KEY",
+                    }
+                },
+            }
+        }
+    )
+    assert resolved[1]["model"] == "/models/custom-gpt-oss"
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     try:

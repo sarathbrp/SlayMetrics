@@ -9,7 +9,8 @@ llm:
 
     gpt-oss-api:                       # GPT-OSS via OpenAI-compatible endpoint
       backend: openai
-      model: gpt-oss-120b
+      model: /models/gpt-oss-120b
+      model_env: GPT_OSS_MODEL
       base_url: ${GPT_OSS_BASE_URL}
       api_key_env: GPT_OSS_API_KEY
 

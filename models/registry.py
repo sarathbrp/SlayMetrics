@@ -10,7 +10,7 @@ def create_model(cfg: dict):
     profile_name = cfg["llm"]["active_profile"]
     profile = cfg["llm"]["profiles"][profile_name]
     backend = profile["backend"]
-    model_name = profile["model"]
+    model_name = os.environ.get(profile.get("model_env", ""), "").strip() or profile["model"]
     logger.status("main", f"LLM profile: {profile_name} ({backend} / {model_name})")
 
     if backend == "claude":
