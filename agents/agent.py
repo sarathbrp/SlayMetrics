@@ -4,11 +4,16 @@ import json
 import re
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any, TypedDict
 
 from adapters.base import BenchmarkResult
 from agents import AgentDeps, TokenCounter
 from core.log import llm_call, log, tokens, tool_call, tool_result
+from langgraph.graph.message import add_messages
+
+
+class GraphState(TypedDict):
+    messages: Annotated[list, add_messages]
 
 
 @dataclass
@@ -90,13 +95,7 @@ class DiagnosisWorkflow:
     async def run(self, context_prompt: str, deps: AgentDeps):
         from langchain_core.messages import HumanMessage, SystemMessage
         from langgraph.graph import END, StateGraph
-        from langgraph.graph.message import add_messages
         from langgraph.prebuilt import ToolNode
-
-        from typing import Annotated, TypedDict
-
-        class GraphState(TypedDict):
-            messages: Annotated[list, add_messages]
 
         tools = self._tool_factory(deps)
         llm = self.model.bind_tools(tools)
