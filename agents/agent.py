@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -225,7 +226,7 @@ def build(model) -> DiagnosisWorkflow:
     def _debug_planner(deps: AgentDeps, label: str, payload: Any) -> None:
         if not _debug_enabled(deps):
             return
-        text = (
+        text = _sanitize_debug_text(
             json.dumps(payload, ensure_ascii=False)
             if isinstance(payload, (dict, list))
             else str(payload)
@@ -1364,9 +1365,7 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
-    synthesis, synth_usage = _invoke_json_planner(
-        model, "planner.synthesizer", synth_prompt, deps
-    )
+    synthesis, synth_usage = _invoke_json_planner(model, "planner.synthesizer", synth_prompt, deps)
     if _planner_debug_enabled(deps):
         tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=False)}")
 
@@ -1482,6 +1481,16 @@ def _planner_debug_enabled(deps: AgentDeps) -> bool:
     return bool((cfg.get("agent") or {}).get("debug_planner_payloads", False))
 
 
+def _sanitize_debug_text(value: str, limit: int = 4000) -> str:
+    text = unicodedata.normalize("NFKC", value)
+    text = text.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+    text = text.replace("\u202f", " ").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = f"{text[: limit - 3]}..."
+    return text
+
+
 def _coerce_records(value: Any, deps: AgentDeps | None = None) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -1493,14 +1502,15 @@ def _coerce_records(value: Any, deps: AgentDeps | None = None) -> list[dict[str,
             continue
         issue = str(item.get("issue", "")).strip()
         cause = str(item.get("cause", "")).strip()
+        description = str(item.get("description", "")).strip()
         impact = str(item.get("impact", "")).strip()
-        symptom = str(item.get("symptom", "")).strip() or issue or cause
+        symptom = str(item.get("symptom", "")).strip() or issue or cause or description
         root_cause = str(item.get("root_cause", "")).strip()
         if not root_cause:
             if impact:
                 root_cause = impact
             else:
-                root_cause = cause
+                root_cause = cause or description
         recommendation = str(item.get("recommendation", "")).strip()
         if not recommendation:
             recommendation = impact or "no recommendation"
@@ -1583,28 +1593,32 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
     value = item.get("value")
     if isinstance(setting, list) and isinstance(value, list) and len(setting) == len(value):
         normalized["changes"] = {str(k): str(v) for k, v in zip(setting, value)}
-        normalized["title"] = normalized.get("title") or str(item.get("description", "")).strip() or "batch setting"
+        normalized["title"] = (
+            normalized.get("title") or str(item.get("description", "")).strip() or "batch setting"
+        )
         normalized["recommendation"] = (
             normalized.get("recommendation")
             or str(item.get("description", "")).strip()
             or "apply configuration changes"
         )
-        normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+        normalized["rationale"] = (
+            normalized.get("rationale") or normalized.get("justification") or ""
+        )
         return normalized
 
     if setting and value not in (None, ""):
         normalized["changes"] = {str(setting): str(value)}
         normalized["title"] = (
-            normalized.get("title")
-            or str(item.get("description", "")).strip()
-            or f"Set {setting}"
+            normalized.get("title") or str(item.get("description", "")).strip() or f"Set {setting}"
         )
         normalized["recommendation"] = (
             normalized.get("recommendation")
             or str(item.get("description", "")).strip()
             or f"Set {setting} to {value}"
         )
-        normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+        normalized["rationale"] = (
+            normalized.get("rationale") or normalized.get("justification") or ""
+        )
         return normalized
 
     directive = str(item.get("directive", "")).strip()
@@ -1613,9 +1627,38 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
         normalized["scope"] = "nginx"
         normalized["changes"] = {directive: str(value)}
         normalized["title"] = normalized.get("title") or f"Set {directive}"
-        normalized["recommendation"] = normalized.get("recommendation") or f"Set {directive} to {value}"
-        normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+        normalized["recommendation"] = (
+            normalized.get("recommendation") or f"Set {directive} to {value}"
+        )
+        normalized["rationale"] = (
+            normalized.get("rationale") or normalized.get("justification") or ""
+        )
         return normalized
+
+    action = str(item.get("action", "")).strip().rstrip(";")
+    if action:
+        action_changes = _extract_changes_from_action(action, normalized.get("scope", ""))
+        if action_changes:
+            normalized["changes"] = action_changes
+            normalized["title"] = normalized.get("title") or action or "apply tuning"
+            normalized["recommendation"] = normalized.get("recommendation") or action
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
+
+    command = item.get("command")
+    if isinstance(command, str) and command.strip():
+        extracted = _extract_changes_from_commands([command])
+        if extracted:
+            normalized["scope"] = normalized.get("scope") or "system"
+            normalized["changes"] = extracted
+            normalized["title"] = normalized.get("title") or action or "system tuning"
+            normalized["recommendation"] = normalized.get("recommendation") or action or command
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
 
     commands = item.get("commands")
     if isinstance(commands, list) and commands:
@@ -1623,16 +1666,46 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
         if extracted:
             normalized["scope"] = normalized.get("scope") or "system"
             normalized["changes"] = extracted
-            normalized["title"] = normalized.get("title") or str(item.get("action", "")).strip() or "system tuning"
+            normalized["title"] = (
+                normalized.get("title") or str(item.get("action", "")).strip() or "system tuning"
+            )
             normalized["recommendation"] = (
                 normalized.get("recommendation")
                 or str(item.get("action", "")).strip()
                 or "apply system tuning"
             )
-            normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
             return normalized
 
     return normalized
+
+
+def _extract_changes_from_action(action: str, scope: str) -> dict[str, str]:
+    extracted: dict[str, str] = {}
+    nginx_match = re.match(
+        r"(?i)(?:set|enable|disable|configure|reduce)\s+([A-Za-z0-9_]+)\s*(.*)$", action
+    )
+    if scope == "nginx" and nginx_match:
+        key = nginx_match.group(1).strip()
+        remainder = nginx_match.group(2).strip().strip(";")
+        lowered = action.lower()
+        if key and remainder:
+            value = remainder
+            if key == "aio" and value.lower() == "threads":
+                extracted[key] = "threads"
+            else:
+                extracted[key] = value
+        elif key and "disable" in lowered:
+            extracted[key] = "off"
+        elif key and "enable" in lowered:
+            extracted[key] = "on"
+        elif key == "worker_cpu_affinity" and "auto" in lowered:
+            extracted[key] = "auto"
+        return extracted
+
+    return extracted
 
 
 def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:

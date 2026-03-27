@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import agents.agent as diagnosis_agent
 from adapters.base import BenchmarkResult
 from agents import TokenCounter
-from agents.agent import DiagnosisOutput, build
+from agents.agent import DiagnosisOutput, _coerce_recommendations, _coerce_records, build
 from tools.ssh import SSHResult
 
 
@@ -440,6 +440,65 @@ def test_save_recommendations_debug_mode_keeps_same_filtering(monkeypatch):
 
     assert result is True
     assert any(tool_name == "debug" for tool_name, _ in debug_lines)
+
+
+def test_coerce_records_accepts_description_impact_shape():
+    records = _coerce_records(
+        [
+            {
+                "id": "RCA-01",
+                "description": "worker_connections limited to 1024",
+                "impact": "Restricts simultaneous client connections and raises latency.",
+            }
+        ]
+    )
+
+    assert records == [
+        {
+            "symptom": "worker_connections limited to 1024",
+            "root_cause": "Restricts simultaneous client connections and raises latency.",
+            "confidence": 0.0,
+            "recommendation": "Restricts simultaneous client connections and raises latency.",
+            "evidence": [],
+        }
+    ]
+
+
+def test_coerce_recommendations_accepts_action_shape_for_nginx():
+    recommendations = _coerce_recommendations(
+        [
+            {
+                "type": "nginx",
+                "action": "Set worker_connections 65536;",
+                "justification": "Raise concurrent connection capacity.",
+            },
+            {
+                "type": "nginx",
+                "action": "Enable aio threads;",
+                "justification": "Use async file I/O.",
+            },
+        ]
+    )
+
+    assert recommendations[0]["scope"] == "nginx"
+    assert recommendations[0]["changes"] == {"worker_connections": "65536"}
+    assert recommendations[1]["changes"] == {"aio": "threads"}
+
+
+def test_coerce_recommendations_accepts_single_command_shape_for_system():
+    recommendations = _coerce_recommendations(
+        [
+            {
+                "type": "system",
+                "action": "Temporarily set SELinux to permissive for benchmarking.",
+                "command": "setenforce 0",
+                "justification": "Isolate SELinux impact.",
+            }
+        ]
+    )
+
+    assert recommendations[0]["scope"] == "system"
+    assert recommendations[0]["changes"] == {"selinux": "permissive"}
 
 
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
