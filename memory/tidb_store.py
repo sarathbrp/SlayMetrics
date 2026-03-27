@@ -55,6 +55,17 @@ def _coerce_optional_float(value) -> float | None:
 
 
 class TiDBStore:
+    CONTEXT_TYPE_MAP = {
+        "metric": "metric",
+        "log": "log",
+        "command_output": "command_output",
+        "benchmark": "benchmark",
+        "system_check": "system_check",
+        "telemetry": "metric",
+        "rca": "command_output",
+        "recommendation": "command_output",
+    }
+
     def __init__(self, cfg: dict, embedder: EmbeddingProvider):
         m = cfg["memory"]
         self._conn_kwargs = dict(
@@ -193,7 +204,11 @@ class TiDBStore:
         self, session_id: str, type: str, source: str, content: str, summary: str = ""
     ) -> str:
         cid = str(uuid.uuid4())
+        logical_type = type
+        storage_type = self.CONTEXT_TYPE_MAP.get(type, "command_output")
         source = source[:250]  # VARCHAR(256) safety
+        if logical_type not in {"metric", "log", "command_output", "benchmark", "system_check"}:
+            source = f"{logical_type}:{source}"[:250]
         text = f"{source} {summary or content[:500]}"
         embedding = self._embedder.embed(text)
         with self._cursor() as cur:
@@ -206,7 +221,7 @@ class TiDBStore:
                 (
                     cid,
                     session_id,
-                    type,
+                    storage_type,
                     source,
                     content,
                     summary or content[:500],
@@ -222,11 +237,13 @@ class TiDBStore:
         source_prefix: str | None = None,
         limit: int | None = None,
     ) -> list[dict]:
+        logical_type = type
+        storage_type = self.CONTEXT_TYPE_MAP.get(type, type) if type else None
         query = "SELECT * FROM context WHERE session_id = %s"
         params: list[object] = [session_id]
-        if type:
+        if storage_type:
             query += " AND type = %s"
-            params.append(type)
+            params.append(storage_type)
         if source_prefix:
             query += " AND source LIKE %s"
             params.append(f"{source_prefix}%")
@@ -236,7 +253,14 @@ class TiDBStore:
             params.append(int(limit))
         with self._cursor() as cur:
             cur.execute(query, tuple(params))
-            return cur.fetchall()
+            rows = cur.fetchall()
+        if logical_type in {"telemetry", "rca", "recommendation"}:
+            prefix = f"{logical_type}:"
+            rows = [row for row in rows if str(row.get("source", "")).startswith(prefix)]
+            for row in rows:
+                row["type"] = logical_type
+                row["source"] = str(row.get("source", ""))[len(prefix):]
+        return rows
 
     # ── Vector search ────────────────────────────────────────────────────────
 

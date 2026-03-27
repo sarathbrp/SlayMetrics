@@ -164,7 +164,7 @@ async def run(model, deps: AgentDeps) -> str:
 
     if max_phase <= 3:
         logger.status("main", "Stopping after Phase 3 planning (RCA + recommendations)")
-        memory.update_profile(session_id, status="analysis_complete")
+        memory.update_profile(session_id, status="completed")
         _save_token_usage(memory, session_id, deps.token_counter)
         token_history = memory.get_token_history()
         report_path = reporter.generate(

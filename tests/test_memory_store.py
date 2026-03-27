@@ -80,7 +80,14 @@ def test_tidb_store_methods(monkeypatch):
 
     cid = store.save_context("s1", "metric", "src", "content", "summary")
     assert isinstance(cid, str)
-    conn.fetchall_queue.append([{"type": "telemetry"}])
+    telemetry_params = conn.executed[-1][1]
+    assert telemetry_params[2] == "metric"
+    assert telemetry_params[3].startswith("metric:") is False
+    store.save_context("s1", "telemetry", "baseline:pre", "content", "summary")
+    telemetry_params = conn.executed[-1][1]
+    assert telemetry_params[2] == "metric"
+    assert telemetry_params[3].startswith("telemetry:")
+    conn.fetchall_queue.append([{"type": "metric", "source": "telemetry:baseline:pre"}])
     assert store.get_contexts("s1", "telemetry", "baseline:", 1)[0]["type"] == "telemetry"
     conn.fetchall_queue.append([{"parameter": "p", "reasoning": "r"}])
     assert store.semantic_search("query", "s1", 3)[0]["parameter"] == "p"
