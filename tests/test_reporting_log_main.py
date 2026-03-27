@@ -310,6 +310,31 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(main.logger, "status", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "close", lambda: None)
+    langfuse_calls = []
+
+    class FakeLangfuse:
+        enabled = True
+        last_trace_url = "http://langfuse/project/x/traces/y"
+
+        def trace(self, *args, **kwargs):
+            langfuse_calls.append(("trace", args, kwargs))
+
+            class Ctx:
+                def __enter__(self_inner):
+                    return None
+
+                def __exit__(self_inner, *exc):
+                    return False
+
+            return Ctx()
+
+        def flush(self):
+            langfuse_calls.append(("flush",))
+
+        def shutdown(self):
+            langfuse_calls.append(("shutdown",))
+
+    monkeypatch.setattr(main.LangfuseClient, "from_env", lambda metadata=None: FakeLangfuse())
     monkeypatch.setitem(
         main.sys.modules,
         "core.orchestrator",
@@ -319,6 +344,9 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     assert fake_memory.created is True
     assert cfg_main["agent"]["max_phase"] == 3
     assert cfg_main["agent"]["planner_mode"] == "debate"
+    assert langfuse_calls[0][0] == "trace"
+    assert ("flush",) in langfuse_calls
+    assert ("shutdown",) in langfuse_calls
 
 
 def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):

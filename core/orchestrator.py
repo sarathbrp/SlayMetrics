@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
+from contextlib import nullcontext
 
 import agents.agent as diagnosis_agent
 import core.reporter as reporter
@@ -25,12 +26,23 @@ async def run(model, deps: AgentDeps) -> str:
     cfg = deps.config
     session_id = deps.session_id
     memory = deps.memory
+    langfuse = getattr(deps, "langfuse", None)
     max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
 
     logger.panel(
         "SlayMetricsAgent",
         f"Session: {session_id}\nService: {cfg['service']['name']} on {cfg['target']['host']}",
     )
+    if langfuse:
+        langfuse.event(
+            "run_started",
+            metadata={
+                "session_id": session_id,
+                "service": cfg["service"]["name"],
+                "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "single"),
+                "max_phase": max_phase,
+            },
+        )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1: RHEL system checks (direct — no LLM)
@@ -76,18 +88,36 @@ async def run(model, deps: AgentDeps) -> str:
 
     if bench_tool == "hackathon":
         logger.step("Step 2: Running hackathon baseline benchmark...")
-        baselines = _run_benchmark_window_with_telemetry(
-            deps,
-            scope="baseline",
-            runner=lambda: _run_hackathon_benchmark(deps, cfg, "baseline", session_id),
-        )
+        with (
+            langfuse.span(
+                "baseline_benchmark",
+                input={"scope": "baseline", "tool": bench_tool},
+                metadata={"session_id": session_id},
+            )
+            if langfuse
+            else nullcontext()
+        ):
+            baselines = _run_benchmark_window_with_telemetry(
+                deps,
+                scope="baseline",
+                runner=lambda: _run_hackathon_benchmark(deps, cfg, "baseline", session_id),
+            )
     else:
         logger.step("Step 2: Running baseline benchmarks (small/medium/large)...")
-        baselines = _run_benchmark_window_with_telemetry(
-            deps,
-            scope="baseline",
-            runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id),
-        )
+        with (
+            langfuse.span(
+                "baseline_benchmark",
+                input={"scope": "baseline", "tool": bench_tool},
+                metadata={"session_id": session_id},
+            )
+            if langfuse
+            else nullcontext()
+        ):
+            baselines = _run_benchmark_window_with_telemetry(
+                deps,
+                scope="baseline",
+                runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id),
+            )
 
     baseline_rps = baselines.get("small", {}).get(
         "rps", baselines.get("homepage", {}).get("rps", 0)
@@ -104,6 +134,13 @@ async def run(model, deps: AgentDeps) -> str:
     logger.step("Step 2.5: Aggregating benchmark evidence...")
     telemetry_entries = memory.get_contexts(session_id, "telemetry", limit=8)
     benchmark_evidence = _build_benchmark_evidence(baselines, telemetry_entries)
+    if langfuse:
+        langfuse.event(
+            "benchmark_evidence",
+            input={"baselines": baselines},
+            output=benchmark_evidence,
+            metadata={"session_id": session_id},
+        )
     memory.save_context(
         session_id,
         "command_output",
@@ -182,10 +219,34 @@ async def run(model, deps: AgentDeps) -> str:
 
     logger.log("orchestrator", f"Context prompt: {len(context_prompt)} chars", "info")
 
-    diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
+    with (
+        langfuse.span(
+            "diagnosis_planning",
+            input={
+                "context_prompt_length": len(context_prompt),
+                "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "single"),
+            },
+            metadata={"session_id": session_id},
+        )
+        if langfuse
+        else nullcontext()
+    ):
+        diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
 
     notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
     logger.log("agent", f"Summary: {notes}", "result")
+    if langfuse:
+        langfuse.event(
+            "diagnosis_completed",
+            output={
+                "notes": notes,
+                "nginx_applied": getattr(diagnosis, "nginx_applied", False),
+                "system_applied": getattr(diagnosis, "system_applied", False),
+                "recommendation_count": len(getattr(diagnosis, "recommendations", []) or []),
+                "rca_count": len(getattr(diagnosis, "rca_records", []) or []),
+            },
+            metadata={"session_id": session_id},
+        )
 
     if max_phase <= 3:
         logger.status("main", "Stopping after Phase 3 planning (RCA + recommendations)")
@@ -228,18 +289,36 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     if bench_tool == "hackathon":
         logger.step("Step 6: Running hackathon final benchmark...")
-        finals = _run_benchmark_window_with_telemetry(
-            deps,
-            scope="final",
-            runner=lambda: _run_hackathon_benchmark(deps, cfg, "tuned", session_id),
-        )
+        with (
+            langfuse.span(
+                "final_benchmark",
+                input={"scope": "final", "tool": bench_tool},
+                metadata={"session_id": session_id},
+            )
+            if langfuse
+            else nullcontext()
+        ):
+            finals = _run_benchmark_window_with_telemetry(
+                deps,
+                scope="final",
+                runner=lambda: _run_hackathon_benchmark(deps, cfg, "tuned", session_id),
+            )
     else:
         logger.step("Step 6: Running final benchmarks (small/medium/large)...")
-        finals = _run_benchmark_window_with_telemetry(
-            deps,
-            scope="final",
-            runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Final", session_id),
-        )
+        with (
+            langfuse.span(
+                "final_benchmark",
+                input={"scope": "final", "tool": bench_tool},
+                metadata={"session_id": session_id},
+            )
+            if langfuse
+            else nullcontext()
+        ):
+            finals = _run_benchmark_window_with_telemetry(
+                deps,
+                scope="final",
+                runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Final", session_id),
+            )
 
     # Update best_rps from actual final benchmarks
     final_small_rps = finals.get("small", {}).get("rps", finals.get("homepage", {}).get("rps", 0))
@@ -354,6 +433,17 @@ async def run(model, deps: AgentDeps) -> str:
         f"Report: {report_path}\n"
         f"Log: report/log_*_{session_id}.md",
     )
+    if langfuse:
+        langfuse.event(
+            "run_completed",
+            output={
+                "report_path": report_path,
+                "baseline_rps": baseline_rps,
+                "best_rps": best_rps,
+                "improvement_pct": total_improvement,
+            },
+            metadata={"session_id": session_id},
+        )
     return report_path
 
 

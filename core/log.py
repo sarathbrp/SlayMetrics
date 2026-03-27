@@ -21,6 +21,14 @@ def _clean(message: str) -> str:
     return " ".join(text.split())
 
 
+def _write(line: str) -> None:
+    global _log_file
+    if not _log_file or getattr(_log_file, "closed", False):
+        return
+    _log_file.write(line)
+    _log_file.flush()
+
+
 def init(session_id: str, verbose: bool = False, log_dir: str = "report") -> str:
     global _log_file, _verbose
     _verbose = verbose
@@ -41,9 +49,7 @@ def log(agent: str, message: str, level: str = "info") -> None:
     tag = f"[{agent}]"
     msg = _clean(message)
 
-    if _log_file:
-        _log_file.write(f"{ts} {tag:16s} {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} {tag:16s} {msg}\n")
 
     color = {
         "info": "dim",
@@ -64,9 +70,7 @@ def llm_call(agent: str, message: str) -> None:
     """Log an LLM API call — always visible."""
     ts = datetime.now().strftime("%H:%M:%S")
     msg = _clean(message)
-    if _log_file:
-        _log_file.write(f"{ts} [LLM]            {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} [LLM]            {msg}\n")
     _console.print(f"       [bold magenta][LLM][/bold magenta] {msg}")
 
 
@@ -74,9 +78,7 @@ def tool_call(tool_name: str, message: str) -> None:
     """Log a tool execution — always visible."""
     ts = datetime.now().strftime("%H:%M:%S")
     msg = _clean(message)
-    if _log_file:
-        _log_file.write(f"{ts} [TOOL:{tool_name:12s}] {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} [TOOL:{tool_name:12s}] {msg}\n")
     _console.print(f"       [cyan][TOOL:{tool_name}][/cyan] {msg}")
 
 
@@ -84,9 +86,7 @@ def tool_result(tool_name: str, message: str) -> None:
     """Log a tool result — verbose only on console, always in file."""
     ts = datetime.now().strftime("%H:%M:%S")
     msg = _clean(message)
-    if _log_file:
-        _log_file.write(f"{ts} [TOOL:{tool_name:12s}] -> {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} [TOOL:{tool_name:12s}] -> {msg}\n")
     if _verbose:
         _console.print(f"       [dim][TOOL:{tool_name}][/dim] -> {msg}")
 
@@ -94,9 +94,7 @@ def tool_result(tool_name: str, message: str) -> None:
 def step(message: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     msg = _clean(message)
-    if _log_file:
-        _log_file.write(f"\n## {ts} {msg}\n\n")
-        _log_file.flush()
+    _write(f"\n## {ts} {msg}\n\n")
     _console.print()
     _console.print(Rule(f"[bold]{msg}[/bold]", style="bright_black"))
 
@@ -104,9 +102,7 @@ def step(message: str) -> None:
 def status(agent: str, message: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     msg = _clean(message)
-    if _log_file:
-        _log_file.write(f"{ts} [{agent}]         {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} [{agent}]         {msg}\n")
     _console.print(f"  [dim]{agent:>10}[/dim]  {msg}")
 
 
@@ -121,10 +117,11 @@ def check(name: str, value: str, check_status: str, recommendation: str = "") ->
         break_long_words=False,
     )
     _console.print(f"  [{color}]●[/{color}] {name}: {wrapped}")
-    if _log_file:
-        rec = f" -> {_clean(recommendation)}" if recommendation else ""
-        _log_file.write(f"{ts} [check]          {name}: {safe_value} [{check_status}]{rec}\n")
-        _log_file.flush()
+    if recommendation:
+        rec = f" -> {_clean(recommendation)}"
+    else:
+        rec = ""
+    _write(f"{ts} [check]          {name}: {safe_value} [{check_status}]{rec}\n")
 
 
 def benchmark(label: str, rps: float, p99: float, cpu: float = 0, mem: float = 0) -> None:
@@ -137,30 +134,26 @@ def benchmark(label: str, rps: float, p99: float, cpu: float = 0, mem: float = 0
         f"CPU [dim]{cpu:>5.1f}%[/dim]   "
         f"MEM [dim]{mem:>6.0f} MB[/dim]"
     )
-    if _log_file:
-        _log_file.write(f"{ts} [benchmark]      {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} [benchmark]      {msg}\n")
 
 
 def panel(title: str, body: str) -> None:
     cleaned_body = "\n".join(_clean(line) for line in str(body).splitlines())
     _console.print(Panel(cleaned_body, title=title, border_style="bright_black"))
-    if _log_file:
-        ts = datetime.now().strftime("%H:%M:%S")
-        _log_file.write(f"\n### {ts} {title}\n{cleaned_body}\n\n")
-        _log_file.flush()
+    ts = datetime.now().strftime("%H:%M:%S")
+    _write(f"\n### {ts} {title}\n{cleaned_body}\n\n")
 
 
 def tokens(agent: str, inp: int, out: int, cumulative: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     msg = f"Tokens: in={inp:,} out={out:,} | {_clean(cumulative)}"
-    if _log_file:
-        _log_file.write(f"{ts} [TOKENS]         {msg}\n")
-        _log_file.flush()
+    _write(f"{ts} [TOKENS]         {msg}\n")
     _console.print(f"       [bold blue][TOKENS][/bold blue] {msg}")
 
 
 def close() -> None:
-    if _log_file:
+    global _log_file
+    if _log_file and not getattr(_log_file, "closed", False):
         _log_file.write(f"\nEnded: {datetime.now().isoformat()}\n")
         _log_file.close()
+    _log_file = None

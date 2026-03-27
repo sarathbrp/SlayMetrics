@@ -6,6 +6,7 @@ from telemetry.collector import (
     stop_sampler,
     summarize_csv,
 )
+from telemetry.langfuse_client import LangfuseClient, summarize_messages
 
 __all__ = [
     "collect_snapshot",
@@ -14,4 +15,6 @@ __all__ = [
     "start_sampler",
     "stop_sampler",
     "summarize_csv",
+    "LangfuseClient",
+    "summarize_messages",
 ]

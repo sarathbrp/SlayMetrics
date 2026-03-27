@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
@@ -9,6 +10,7 @@ from typing import Annotated, Any, TypedDict
 from adapters.base import BenchmarkResult
 from agents import AgentDeps
 from core.log import llm_call, log, tokens, tool_call, tool_result
+from telemetry import summarize_messages
 
 try:
     from langgraph.graph.message import add_messages
@@ -116,7 +118,37 @@ class DiagnosisWorkflow:
 
         def call_model(state: GraphState):
             messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
-            response = llm.invoke(messages)
+            with (
+                getattr(deps, "langfuse", None).generation(
+                    "single_planner_turn",
+                    model=_resolve_model_name(self.model),
+                    input={"messages": summarize_messages(messages)},
+                    metadata={
+                        "planner_mode": "single",
+                        "session_id": deps.session_id,
+                    },
+                    model_parameters={"temperature": 0},
+                )
+                if getattr(deps, "langfuse", None)
+                else _null_generation() as _
+            ):
+                response = llm.invoke(messages)
+                usage = getattr(response, "usage_metadata", None) or {}
+                if getattr(deps, "langfuse", None):
+                    deps.langfuse.update_generation(
+                        output={
+                            "content": _extract_final_text([response])[:2000],
+                            "tool_calls": getattr(response, "tool_calls", None),
+                        },
+                        usage_details={
+                            "prompt_tokens": int(
+                                usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+                            ),
+                            "completion_tokens": int(
+                                usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                            ),
+                        },
+                    )
             return {"messages": [response]}
 
         def route(state: GraphState):
@@ -199,6 +231,25 @@ def build(model) -> DiagnosisWorkflow:
             else str(payload)
         )
         tool_result("debug", f"{label}: {text[:800]}")
+
+    def _langfuse_event(
+        deps: AgentDeps,
+        name: str,
+        *,
+        input: Any = None,
+        output: Any = None,
+        metadata: dict[str, Any] | None = None,
+        level: str | None = None,
+    ) -> None:
+        client = getattr(deps, "langfuse", None)
+        if client:
+            client.event(
+                name,
+                input=input,
+                output=output,
+                metadata=metadata,
+                level=level,
+            )
 
     def _coerce_tool_changes(
         raw_changes: dict[str, str] | str | None,
@@ -305,6 +356,12 @@ def build(model) -> DiagnosisWorkflow:
             "needs_investigation": needs_investigation,
             "current": current,
         }
+        _langfuse_event(
+            deps,
+            "tool.inspect_irq_distribution",
+            input={"telemetry_rows": len(telemetry_rows)},
+            output=result,
+        )
         deps.token_counter.tool_calls += 1
         deps.memory.save_context(
             deps.session_id,
@@ -348,6 +405,12 @@ def build(model) -> DiagnosisWorkflow:
                 already_ok.append(parameter)
 
         result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
+        _langfuse_event(
+            deps,
+            "tool.inspect_nginx_config",
+            input={"directive_count": len(nginx_targets)},
+            output=result,
+        )
         deps.token_counter.tool_calls += 1
         deps.memory.save_context(
             deps.session_id,
@@ -400,6 +463,12 @@ def build(model) -> DiagnosisWorkflow:
                 already_ok.append(parameter)
 
         result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
+        _langfuse_event(
+            deps,
+            "tool.inspect_system_tuning",
+            input={"parameter_count": len(system_targets)},
+            output=result,
+        )
         deps.token_counter.tool_calls += 1
         deps.memory.save_context(
             deps.session_id,
@@ -421,6 +490,13 @@ def build(model) -> DiagnosisWorkflow:
         if parse_error:
             tool_call("apply_nginx", "invalid input payload")
             tool_result("apply_nginx", f"FAILED: {parse_error}")
+            _langfuse_event(
+                deps,
+                "tool.apply_nginx_tuning",
+                input={"changes": changes, "kwargs": kwargs},
+                output={"error": parse_error},
+                level="ERROR",
+            )
             deps.token_counter.tool_calls += 1
             return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
 
@@ -434,6 +510,13 @@ def build(model) -> DiagnosisWorkflow:
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
                 tool_call("apply_nginx", "unsupported directives")
                 tool_result("apply_nginx", f"FAILED: {error}")
+                _langfuse_event(
+                    deps,
+                    "tool.apply_nginx_tuning",
+                    input={"changes": changes_dict, "unsupported": unsupported},
+                    output={"error": error},
+                    level="ERROR",
+                )
                 deps.token_counter.tool_calls += 1
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
@@ -467,6 +550,13 @@ def build(model) -> DiagnosisWorkflow:
                     "nginx batch apply",
                 )
                 tool_result("apply_nginx", f"FAILED: {result['error']}")
+                _langfuse_event(
+                    deps,
+                    "tool.apply_nginx_tuning",
+                    input={"changes": changes_dict},
+                    output=result,
+                    level="ERROR",
+                )
                 return result
 
         test = deps.ssh.execute("nginx -t 2>&1")
@@ -488,6 +578,13 @@ def build(model) -> DiagnosisWorkflow:
                 "nginx batch apply failed",
             )
             tool_result("apply_nginx", f"FAILED: {error_msg}")
+            _langfuse_event(
+                deps,
+                "tool.apply_nginx_tuning",
+                input={"changes": changes_dict},
+                output=result,
+                level="ERROR",
+            )
             return result
 
         reload_ok = deps.adapter.reload()
@@ -505,6 +602,12 @@ def build(model) -> DiagnosisWorkflow:
             summary,
             "nginx batch apply",
         )
+        _langfuse_event(
+            deps,
+            "tool.apply_nginx_tuning",
+            input={"changes": changes_dict},
+            output=result,
+        )
         tool_result("apply_nginx", summary)
         return result
 
@@ -515,6 +618,13 @@ def build(model) -> DiagnosisWorkflow:
         if parse_error:
             tool_call("apply_system", "invalid input payload")
             tool_result("apply_system", f"FAILED: {parse_error}")
+            _langfuse_event(
+                deps,
+                "tool.apply_system_tuning",
+                input={"changes": changes, "kwargs": kwargs},
+                output={"error": parse_error},
+                level="ERROR",
+            )
             deps.token_counter.tool_calls += 1
             return {"applied": {}, "failed": {"_input": parse_error}}
 
@@ -568,6 +678,12 @@ def build(model) -> DiagnosisWorkflow:
             summary,
             "system batch apply",
         )
+        _langfuse_event(
+            deps,
+            "tool.apply_system_tuning",
+            input={"changes": changes_dict},
+            output={"applied": applied, "failed": failed},
+        )
         tool_result("apply_system", summary)
         return {"applied": applied, "failed": failed}
 
@@ -598,6 +714,12 @@ def build(model) -> DiagnosisWorkflow:
         state["after_rps"] = float(result.requests_per_sec)
         state["after_p99_ms"] = float(result.latency_p99_ms)
         state["after_error_rate"] = float(result.error_rate)
+        _langfuse_event(
+            deps,
+            "tool.run_benchmark",
+            input={"duration": duration, "url": url, "backend": bench_tool},
+            output=result.__dict__,
+        )
         return result.__dict__
 
     def query_memory_impl(deps: AgentDeps, symptom: str) -> list[dict]:
@@ -611,6 +733,12 @@ def build(model) -> DiagnosisWorkflow:
         tool_call("memory", f"query {memory_query_count}/{max_memory_queries}: {symptom}")
         results = deps.memory.semantic_search(symptom, deps.session_id, top_k=5)
         tool_result("memory", f"{len(results)} results found")
+        _langfuse_event(
+            deps,
+            "tool.query_memory",
+            input={"symptom": symptom, "query_index": memory_query_count},
+            output={"result_count": len(results), "top_results": results[:3]},
+        )
         deps.token_counter.tool_calls += 1
         return results
 
@@ -674,6 +802,12 @@ def build(model) -> DiagnosisWorkflow:
             tool_result("save", f"{param} ({impact_label})")
         deps.token_counter.tool_calls += 1
         state["findings"] = findings
+        _langfuse_event(
+            deps,
+            "tool.save_findings",
+            input={"count": len(findings)},
+            output={"saved": findings[:10]},
+        )
         return True
 
     def save_rca_impl(deps: AgentDeps, records: list[dict[str, Any]]) -> bool:
@@ -727,6 +861,12 @@ def build(model) -> DiagnosisWorkflow:
             tool_result("rca", f"{symptom} -> {root_cause} ({confidence:.2f})")
         deps.token_counter.tool_calls += 1
         state["rca_records"] = normalized_records
+        _langfuse_event(
+            deps,
+            "tool.save_rca",
+            input={"count": len(records)},
+            output={"normalized_records": normalized_records[:10]},
+        )
         return True
 
     def save_recommendations_impl(deps: AgentDeps, recommendations: list[dict[str, Any]]) -> bool:
@@ -831,6 +971,12 @@ def build(model) -> DiagnosisWorkflow:
             tool_result("recommend", f"{normalized['title']} [{normalized['risk_level']}]")
         deps.token_counter.tool_calls += 1
         state["recommendations"] = normalized_items
+        _langfuse_event(
+            deps,
+            "tool.save_recommendations",
+            input={"count": len(recommendations)},
+            output={"accepted": normalized_items[:10]},
+        )
         return True
 
     def _evaluate_nginx_guardrails(
@@ -1194,8 +1340,8 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"IRQ Inspection:\n{json.dumps(irq_inspection, ensure_ascii=True)}"
     )
 
-    nginx_analysis, nginx_usage = _invoke_json_planner(model, "nginx_expert", nginx_prompt)
-    rhel_analysis, rhel_usage = _invoke_json_planner(model, "rhel_expert", rhel_prompt)
+    nginx_analysis, nginx_usage = _invoke_json_planner(model, "nginx_expert", nginx_prompt, deps)
+    rhel_analysis, rhel_usage = _invoke_json_planner(model, "rhel_expert", rhel_prompt, deps)
     if _planner_debug_enabled(deps):
         tool_result(
             "debug",
@@ -1216,7 +1362,7 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
-    synthesis, synth_usage = _invoke_json_planner(model, "synthesizer", synth_prompt)
+    synthesis, synth_usage = _invoke_json_planner(model, "synthesizer", synth_prompt, deps)
     if _planner_debug_enabled(deps):
         tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=True)[:1500]}")
 
@@ -1244,23 +1390,63 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
     )
 
 
-def _invoke_json_planner(model, name: str, prompt: str) -> tuple[dict[str, Any], dict[str, int]]:
+@contextmanager
+def _null_generation():
+    yield None
+
+
+def _resolve_model_name(model: Any) -> str:
+    for attr in ("model_name", "model", "_model", "model_id"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return model.__class__.__name__
+
+
+def _invoke_json_planner(
+    model, name: str, prompt: str, deps: AgentDeps | None = None
+) -> tuple[dict[str, Any], dict[str, int]]:
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    response = model.invoke(
-        [
-            SystemMessage(
-                content=(
-                    f"You are {name}. Return JSON only. No markdown fences. "
-                    "If unsure, return empty arrays instead of prose."
-                )
-            ),
-            HumanMessage(content=prompt),
-        ]
-    )
+    messages = [
+        SystemMessage(
+            content=(
+                f"You are {name}. Return JSON only. No markdown fences. "
+                "If unsure, return empty arrays instead of prose."
+            )
+        ),
+        HumanMessage(content=prompt),
+    ]
+    langfuse = getattr(deps, "langfuse", None) if deps else None
+    with (
+        langfuse.generation(
+            name,
+            model=_resolve_model_name(model),
+            input={"messages": summarize_messages(messages)},
+            metadata={
+                "planner_name": name,
+                "session_id": getattr(deps, "session_id", ""),
+                "planner_mode": "debate",
+            },
+            model_parameters={"temperature": 0},
+        )
+        if langfuse
+        else _null_generation()
+    ):
+        response = model.invoke(messages)
     text = _extract_final_text([response])
     payload = _extract_json_dict(text)
     usage = getattr(response, "usage_metadata", None) or {}
+    if langfuse:
+        langfuse.update_generation(
+            output={"text": text[:4000], "payload": payload},
+            usage_details={
+                "prompt_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(
+                    usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                ),
+            },
+        )
     return payload, {
         "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),

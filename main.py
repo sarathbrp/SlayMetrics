@@ -16,6 +16,7 @@ from core import log as logger
 from memory.embeddings import from_config as embedder_from_config
 from memory.tidb_store import from_config as tidb_from_config
 from models import create_model
+from telemetry import LangfuseClient
 from tools.ssh import from_config as ssh_from_config
 
 
@@ -222,6 +223,19 @@ async def main(
         )
 
     token_counter = TokenCounter()
+    langfuse = LangfuseClient.from_env(
+        {
+            "session_id": session_id,
+            "service": cfg["service"]["name"],
+            "planner_mode": planner_mode,
+            "max_phase": max_phase,
+            "llm_profile": profile_name,
+            "dut_host": host,
+            "bench_host": bench_host,
+        }
+    )
+    if langfuse.enabled:
+        logger.status("langfuse", "Tracing enabled")
     deps = AgentDeps(
         adapter=adapter,
         memory=memory,
@@ -230,13 +244,26 @@ async def main(
         session_id=session_id,
         config=cfg,
         token_counter=token_counter,
+        langfuse=langfuse,
     )
 
     try:
         from core.orchestrator import run
 
-        report_path = await run(model, deps)
+        with langfuse.trace(
+            "slaymetrics_run",
+            input={"config_path": config_path},
+            metadata={
+                "session_id": session_id,
+                "planner_mode": planner_mode,
+                "max_phase": max_phase,
+                "llm_profile": profile_name,
+            },
+        ):
+            report_path = await run(model, deps)
         logger.status("main", f"Report: {report_path}")
+        if langfuse.last_trace_url:
+            logger.status("langfuse", f"Trace: {langfuse.last_trace_url}")
     except KeyboardInterrupt:
         logger.log("main", "Interrupted by user (Ctrl+C)", "warn")
         logger.log(
@@ -250,6 +277,8 @@ async def main(
         raise
     finally:
         # Silent cleanup
+        langfuse.flush()
+        langfuse.shutdown()
         logger.close()
         ssh.disconnect()
         if bench is not ssh:
