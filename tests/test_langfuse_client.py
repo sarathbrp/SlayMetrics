@@ -28,6 +28,9 @@ class _FakeLangfuseImpl:
     def start_as_current_observation(self, **kwargs):
         return _FakeContext(self, "observation", kwargs)
 
+    def start_as_current_span(self, **kwargs):
+        return _FakeContext(self, "span", kwargs)
+
     def start_as_current_generation(self, **kwargs):
         return _FakeContext(self, "generation", kwargs)
 
@@ -112,6 +115,8 @@ def test_langfuse_client_traces_events_and_generations(monkeypatch):
         client.event("benchmark_evidence", output={"rps": 1.0})
         with client.generation("nginx_expert", model="gpt-oss-120b", input={"messages": []}):
             client.update_generation(output={"summary": "ok"}, usage_details={"prompt_tokens": 1})
+        with client.tool_span("tool.inspect_nginx_config", input={"directive_count": 13}):
+            client.update_span(output={"needs_fixing": 12})
         client.update_span(output={"done": True})
     client.flush()
     client.shutdown()
@@ -119,7 +124,9 @@ def test_langfuse_client_traces_events_and_generations(monkeypatch):
     fake = client._client
     assert fake.init_kwargs["base_url"] == "http://langfuse.local"
     assert fake.calls[0][0] == "observation"
+    assert fake.calls[0][1]["session_id"] == "s1"
     assert any(call[0] == "generation" for call in fake.calls)
+    assert any(call[0] == "span" for call in fake.calls)
     assert any(call[0] == "event" for call in fake.calls)
     assert any(call[0] == "update_generation" for call in fake.calls)
     assert client.last_trace_url == "http://langfuse/project/p/traces/t"

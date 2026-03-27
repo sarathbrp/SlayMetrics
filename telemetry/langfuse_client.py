@@ -22,12 +22,20 @@ class LangfuseClient:
     def __init__(self, client: Any | None, metadata: dict[str, Any] | None = None):
         self._client = client
         self._metadata = metadata or {}
+        self._session_id = str((metadata or {}).get("session_id") or "").strip() or None
+        self._user_id = str((metadata or {}).get("user_id") or "").strip() or None
+        self._base_metadata = {
+            key: value
+            for key, value in (metadata or {}).items()
+            if key not in {"session_id", "user_id"}
+        }
         self._last_trace_url: str | None = None
         self._generation_api_supported = bool(
             client
             and hasattr(client, "start_as_current_generation")
             and hasattr(client, "update_current_generation")
         )
+        self._span_api_supported = bool(client and hasattr(client, "start_as_current_span"))
 
     @property
     def enabled(self) -> bool:
@@ -88,11 +96,12 @@ class LangfuseClient:
             yield None
             return
 
-        merged = {**self._metadata, **(metadata or {})}
+        merged = {**self._base_metadata, **(metadata or {})}
         with self._client.start_as_current_observation(
             name=name,
             input=_jsonable(input),
             metadata=_jsonable(merged),
+            **self._identity_kwargs(),
         ) as observation:
             self._last_trace_url = self._safe_trace_url()
             try:
@@ -102,7 +111,20 @@ class LangfuseClient:
 
     @contextmanager
     def span(self, name: str, *, input: Any = None, metadata: dict[str, Any] | None = None):
-        with self.trace(name, input=input, metadata=metadata) as observation:
+        if not self._client:
+            yield None
+            return
+
+        with self._make_span_context(name=name, input=input, metadata=metadata or {}) as observation:
+            self._last_trace_url = self._safe_trace_url()
+            try:
+                yield observation
+            finally:
+                self._last_trace_url = self._safe_trace_url() or self._last_trace_url
+
+    @contextmanager
+    def tool_span(self, name: str, *, input: Any = None, metadata: dict[str, Any] | None = None):
+        with self.span(name, input=input, metadata=metadata) as observation:
             yield observation
 
     @contextmanager
@@ -119,7 +141,7 @@ class LangfuseClient:
             yield None
             return
 
-        merged = {**self._metadata, **(metadata or {})}
+        merged = metadata or {}
         generation_context = self._make_generation_context(
             name=name,
             model=model,
@@ -146,11 +168,11 @@ class LangfuseClient:
         if self._generation_api_supported:
             self._client.update_current_generation(
                 output=_jsonable(output),
-                metadata=_jsonable({**self._metadata, **(metadata or {})}),
+                metadata=_jsonable(metadata or {}),
                 usage_details=usage_details or None,
             )
             return
-        merged = {**self._metadata, **(metadata or {})}
+        merged = dict(metadata or {})
         if usage_details:
             merged["usage_details"] = usage_details
         self._client.update_current_span(
@@ -176,6 +198,7 @@ class LangfuseClient:
                     input=_jsonable(input),
                     metadata=_jsonable(merged),
                     model_parameters=_jsonable(model_parameters or {}),
+                    **self._identity_kwargs(),
                 )
             except AttributeError:
                 self._generation_api_supported = False
@@ -195,6 +218,7 @@ class LangfuseClient:
                     "compat_mode": "observation_generation_fallback",
                 }
             ),
+            **self._identity_kwargs(),
         )
 
     def update_span(self, *, output: Any = None, metadata: dict[str, Any] | None = None) -> None:
@@ -202,7 +226,7 @@ class LangfuseClient:
             return
         self._client.update_current_span(
             output=_jsonable(output),
-            metadata=_jsonable({**self._metadata, **(metadata or {})}),
+            metadata=_jsonable(metadata or {}),
         )
 
     def event(
@@ -220,8 +244,9 @@ class LangfuseClient:
             name=name,
             input=_jsonable(input),
             output=_jsonable(output),
-            metadata=_jsonable({**self._metadata, **(metadata or {})}),
+            metadata=_jsonable(metadata or {}),
             level=level,
+            **self._identity_kwargs(),
         )
 
     def flush(self) -> None:
@@ -241,6 +266,33 @@ class LangfuseClient:
             return self._client.get_trace_url()
         except Exception:
             return None
+
+    def _make_span_context(self, *, name: str, input: Any = None, metadata: dict[str, Any] | None = None):
+        merged = metadata or {}
+        if self._span_api_supported:
+            try:
+                return self._client.start_as_current_span(
+                    name=name,
+                    input=_jsonable(input),
+                    metadata=_jsonable(merged),
+                    **self._identity_kwargs(),
+                )
+            except AttributeError:
+                self._span_api_supported = False
+        return self._client.start_as_current_observation(
+            name=name,
+            input=_jsonable(input),
+            metadata=_jsonable(merged),
+            **self._identity_kwargs(),
+        )
+
+    def _identity_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if self._session_id:
+            kwargs["session_id"] = self._session_id
+        if self._user_id:
+            kwargs["user_id"] = self._user_id
+        return kwargs
 
 
 def summarize_messages(messages: list[Any]) -> list[dict[str, Any]]:

@@ -243,13 +243,11 @@ def build(model) -> DiagnosisWorkflow:
     ) -> None:
         client = getattr(deps, "langfuse", None)
         if client:
-            client.event(
-                name,
-                input=input,
-                output=output,
-                metadata=metadata,
-                level=level,
-            )
+            with client.tool_span(name, input=input, metadata=metadata):
+                client.update_span(
+                    output=output if level != "ERROR" else {"error": output},
+                    metadata={"level": level} if level else None,
+                )
 
     def _coerce_tool_changes(
         raw_changes: dict[str, str] | str | None,
@@ -1340,8 +1338,12 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"IRQ Inspection:\n{json.dumps(irq_inspection, ensure_ascii=True)}"
     )
 
-    nginx_analysis, nginx_usage = _invoke_json_planner(model, "nginx_expert", nginx_prompt, deps)
-    rhel_analysis, rhel_usage = _invoke_json_planner(model, "rhel_expert", rhel_prompt, deps)
+    nginx_analysis, nginx_usage = _invoke_json_planner(
+        model, "planner.nginx_expert", nginx_prompt, deps
+    )
+    rhel_analysis, rhel_usage = _invoke_json_planner(
+        model, "planner.rhel_expert", rhel_prompt, deps
+    )
     if _planner_debug_enabled(deps):
         tool_result(
             "debug",
@@ -1362,7 +1364,9 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
-    synthesis, synth_usage = _invoke_json_planner(model, "synthesizer", synth_prompt, deps)
+    synthesis, synth_usage = _invoke_json_planner(
+        model, "planner.synthesizer", synth_prompt, deps
+    )
     if _planner_debug_enabled(deps):
         tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=True)[:1500]}")
 
