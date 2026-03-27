@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 
 import agents.agent as diagnosis_agent
@@ -60,45 +61,20 @@ async def run(model, deps: AgentDeps) -> str:
     )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 2: Baseline benchmarks — all 3 sizes (direct wrk2 — no LLM)
+    # STEP 2: Baseline benchmarks (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
-    logger.step("Step 2: Running baseline benchmarks (small/medium/large)...")
     bench_cfg = cfg["service"]["benchmark"]
-    baselines = {}
+    bench_tool = bench_cfg.get("tool", "wrk2")
 
-    for size in PAYLOAD_SIZES:
-        url = bench_cfg.get(f"{size}_file_url")
-        if not url:
-            continue
-        result = deps.adapter.benchmark(
-            duration=bench_cfg.get("duration", 30),
-            url=url,
-        )
-        baselines[size] = {
-            "rps": result.requests_per_sec,
-            "p50": result.latency_p50_ms,
-            "p99": result.latency_p99_ms,
-            "cpu_pct": result.cpu_pct,
-            "mem_mb": result.mem_mb,
-            "error_rate": result.error_rate,
-            "url": url,
-        }
-        logger.benchmark(
-            f"Baseline ({size})",
-            result.requests_per_sec,
-            result.latency_p99_ms,
-            result.cpu_pct,
-            result.mem_mb,
-        )
-        memory.save_context(
-            session_id,
-            "benchmark",
-            f"baseline_{size}",
-            json.dumps(baselines[size]),
-            f"Baseline {size}: {result.requests_per_sec:.1f} RPS",
-        )
+    if bench_tool == "hackathon":
+        logger.step("Step 2: Running hackathon baseline benchmark...")
+        baselines = _run_hackathon_benchmark(deps, cfg, "baseline", session_id)
+    else:
+        logger.step("Step 2: Running baseline benchmarks (small/medium/large)...")
+        baselines = _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id)
 
-    baseline_rps = baselines.get("small", {}).get("rps", 0)
+    baseline_rps = baselines.get("small", {}).get("rps",
+                   baselines.get("homepage", {}).get("rps", 0))
     memory.update_profile(session_id, baseline_rps=baseline_rps, best_rps=baseline_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -175,37 +151,18 @@ async def run(model, deps: AgentDeps) -> str:
     memory.update_profile(session_id, best_rps=best_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 6: Final benchmarks — all 3 sizes (direct wrk2 — no LLM)
+    # STEP 6: Final benchmarks (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
-    logger.step("Step 6: Running final benchmarks (small/medium/large)...")
-    finals = {}
-
-    for size in PAYLOAD_SIZES:
-        url = bench_cfg.get(f"{size}_file_url")
-        if not url:
-            continue
-        result = deps.adapter.benchmark(
-            duration=bench_cfg.get("duration", 30),
-            url=url,
-        )
-        finals[size] = {
-            "rps": result.requests_per_sec,
-            "p50": result.latency_p50_ms,
-            "p99": result.latency_p99_ms,
-            "cpu_pct": result.cpu_pct,
-            "mem_mb": result.mem_mb,
-            "url": url,
-        }
-        logger.benchmark(
-            f"Final ({size})",
-            result.requests_per_sec,
-            result.latency_p99_ms,
-            result.cpu_pct,
-            result.mem_mb,
-        )
+    if bench_tool == "hackathon":
+        logger.step("Step 6: Running hackathon final benchmark...")
+        finals = _run_hackathon_benchmark(deps, cfg, "tuned", session_id)
+    else:
+        logger.step("Step 6: Running final benchmarks (small/medium/large)...")
+        finals = _run_wrk2_benchmarks(deps, cfg, "Final", session_id)
 
     # Update best_rps from actual final benchmarks
-    final_small_rps = finals.get("small", {}).get("rps", 0)
+    final_small_rps = finals.get("small", {}).get("rps",
+                      finals.get("homepage", {}).get("rps", 0))
     if final_small_rps > best_rps:
         best_rps = final_small_rps
     memory.update_profile(session_id, best_rps=best_rps)
@@ -348,10 +305,7 @@ def _build_context_prompt(
 
     baselines_text = ""
     for size, data in baselines.items():
-        baselines_text += (
-            f"  {size}: {data['rps']:.1f} RPS, p99={data['p99']:.1f}ms, "
-            f"CPU={data['cpu_pct']:.1f}%\n"
-        )
+        baselines_text += f"  {size}: {data['rps']:.1f} RPS, p99={data.get('p99', 0):.1f}ms\n"
 
     prior_text = ""
     if prior_fixes:
@@ -366,3 +320,94 @@ Baselines:
 {prior_text}
 Inspect, apply proven fixes, benchmark after, save_findings.
 """
+
+
+HACKATHON_WORKLOADS = ["homepage", "small", "medium", "large", "mixed"]
+
+
+def _run_hackathon_benchmark(deps, cfg, label, session_id):
+    """Run the hackathon's official benchmark.sh and parse results."""
+    bench_cfg = cfg["service"]["benchmark"]
+    script = bench_cfg.get("script", "/root/hackathon-tools/benchmark.sh")
+    name = bench_cfg.get("contestant_name", "slaymetrics")
+    target_env = bench_cfg.get("target_host_env", "DUT_HOST")
+    target_host = os.environ.get(target_env, cfg["target"]["host"])
+
+    contestant = f"{name}-{label}"
+    cmd = f"TARGET_HOST={target_host} {script} {contestant}"
+
+    logger.status("benchmark", f"Running: {cmd}")
+    logger.status("benchmark", "This takes ~5 minutes (5 workloads)...")
+
+    result = deps.bench.execute(cmd, timeout=600)
+    logger.log("benchmark", f"Exit code: {result.exit_code}", "info")
+
+    # Parse results from JSON files
+    results = {}
+    results_dir = "/root/hackathon-results"
+    for workload in HACKATHON_WORKLOADS:
+        json_path = f"{results_dir}/{contestant}_{workload}.json"
+        r = deps.bench.execute(f"cat {json_path} 2>/dev/null")
+        if r.ok and r.stdout.strip():
+            try:
+                data = json.loads(r.stdout)
+                res = data.get("results", {})
+                rps = res.get("requests", {}).get("per_sec", 0)
+                lat = res.get("latency", {})
+                p99_str = lat.get("percentiles", {}).get("p99", "0ms")
+                p99 = float(p99_str.replace("ms", "").replace("s", "000"))
+                results[workload] = {
+                    "rps": rps,
+                    "p50": float(lat.get("percentiles", {}).get("p50", "0ms").replace("ms", "").replace("s", "000")),
+                    "p99": p99,
+                    "cpu_pct": 0,
+                    "mem_mb": 0,
+                    "error_rate": 0,
+                }
+                logger.benchmark(f"{label} ({workload})", rps, p99, 0, 0)
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                logger.log("benchmark", f"Failed to parse {workload}: {e}", "warn")
+
+    # Save to context
+    for workload, data in results.items():
+        deps.memory.save_context(
+            session_id, "benchmark", f"{label}_{workload}",
+            json.dumps(data),
+            f"{label} {workload}: {data['rps']:.1f} RPS",
+        )
+
+    return results
+
+
+def _run_wrk2_benchmarks(deps, cfg, label, session_id):
+    """Run wrk2 benchmarks for small/medium/large — fallback mode."""
+    bench_cfg = cfg["service"]["benchmark"]
+    results = {}
+
+    for size in PAYLOAD_SIZES:
+        url = bench_cfg.get(f"{size}_file_url")
+        if not url:
+            continue
+        result = deps.adapter.benchmark(
+            duration=bench_cfg.get("duration", 30), url=url,
+        )
+        results[size] = {
+            "rps": result.requests_per_sec,
+            "p50": result.latency_p50_ms,
+            "p99": result.latency_p99_ms,
+            "cpu_pct": result.cpu_pct,
+            "mem_mb": result.mem_mb,
+            "error_rate": result.error_rate,
+            "url": url,
+        }
+        logger.benchmark(
+            f"{label} ({size})", result.requests_per_sec,
+            result.latency_p99_ms, result.cpu_pct, result.mem_mb,
+        )
+        deps.memory.save_context(
+            session_id, "benchmark", f"{label.lower()}_{size}",
+            json.dumps(results[size]),
+            f"{label} {size}: {result.requests_per_sec:.1f} RPS",
+        )
+
+    return results

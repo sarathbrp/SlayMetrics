@@ -38,7 +38,7 @@ target:
   ssh_timeout: 30
 
 bench:
-  host: localhost                   # where wrk2 runs (localhost = this machine)
+  host: localhost                   # agent runs here, wrk runs here
   ssh_user: root
   ssh_key: ~/.ssh/id_rsa
   ssh_timeout: 30
@@ -50,20 +50,20 @@ service:
   systemd_unit: nginx.service
   log_path: /var/log/nginx/access.log
   benchmark:
-    tool: wrk2
+    # Use hackathon's official benchmark.sh instead of wrk2
+    tool: hackathon
+    script: /root/hackathon-tools/benchmark.sh
+    contestant_name_env: CONTESTANT_NAME
+    contestant_name: slaymetrics
+    target_host_env: DUT_HOST
+    # Fallback wrk2 config (used if benchmark.sh not available)
     duration: 30
-    threads: 4
-    connections: 400
-    rate: 150000
-    # URLs use DUT_HOST from .env; fallback to localhost
+    threads: 16
+    connections: 1000
+    rate: 1000000
     small_file_url: "http://${DUT_HOST:-localhost}/1kb.html"
     medium_file_url: "http://${DUT_HOST:-localhost}/100kb.html"
     large_file_url: "http://${DUT_HOST:-localhost}/1mb.html"
-  metrics:
-    - requests_per_sec
-    - latency_p50
-    - latency_p99
-    - error_rate
 
 rhel:
   checks:
@@ -79,11 +79,11 @@ rhel:
     - kernel_version
 
 agent:
-  improvement_threshold_pct: 5        # min % improvement to count a fix as worthwhile
-  max_iterations: 50                   # safety cap on hypothesis loop
+  improvement_threshold_pct: 5
+  max_iterations: 50
   benchmark_after_every_fix: true
   stability:
-    enabled: false                     # enable for final run (30 min test)
-    duration_sec: 1800                 # 30 minutes total
-    sample_interval_sec: 60            # one wrk2 run per minute
-    url_key: small_file_url            # which payload to use for stability
+    enabled: false
+    duration_sec: 1800
+    sample_interval_sec: 60
+    url_key: small_file_url
