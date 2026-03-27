@@ -1687,7 +1687,7 @@ def _extract_changes_from_action(action: str, scope: str) -> dict[str, str]:
     nginx_match = re.match(
         r"(?i)(?:set|enable|disable|configure|reduce)\s+([A-Za-z0-9_]+)\s*(.*)$", action
     )
-    if scope == "nginx" and nginx_match:
+    if nginx_match and (not scope or scope == "nginx"):
         key = nginx_match.group(1).strip()
         remainder = nginx_match.group(2).strip().strip(";")
         lowered = action.lower()
