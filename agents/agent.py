@@ -46,11 +46,7 @@ You are SlayMetricsAgent. Steps:
 1. Inspect nginx and system tuning
 2. Save structured RCA via save_rca before remediation
 3. Save transparent human-readable recommendations via save_recommendations before remediation
-4. Apply missing nginx fixes via apply_nginx_tuning
-5. Apply missing system fixes via apply_system_tuning
-6. Benchmark AFTER (baselines are provided — do NOT benchmark before)
-7. Call save_findings with both results in one call
-8. Return one short plain-text summary sentence
+4. Return one short plain-text summary sentence
 
 For apply_nginx_tuning and apply_system_tuning:
 - Pass a structured object under the changes field
@@ -69,9 +65,11 @@ For save_rca:
 
 For save_recommendations:
 - Pass a structured list under the recommendations field
-- Each recommendation must include title, recommendation, rationale, expected_benefit, risk_level, validation
+- Each recommendation must include title, recommendation, rationale, expected_benefit, risk_level, validation, scope, changes
+- scope must be nginx or system
+- changes must be a structured object of parameter -> target value
 - risk_level should be low, medium, or high
-- Example: {"recommendations":[{"title":"Raise connection limits","recommendation":"Increase worker_connections and somaxconn","rationale":"Current limits are below proven target values","expected_benefit":"Higher small-file RPS and lower tail latency","risk_level":"low","validation":"Re-run small workload and compare RPS/p99"}]}
+- Example: {"recommendations":[{"title":"Raise connection limits","recommendation":"Increase worker_connections","rationale":"Current limits are below proven target values","expected_benefit":"Higher small-file RPS and lower tail latency","risk_level":"low","validation":"Re-run small workload and compare RPS/p99","scope":"nginx","changes":{"worker_connections":"65536"}}]}
 
 Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
 - worker_connections=65536
@@ -103,7 +101,7 @@ Proven system fixes:
 
 Do NOT apply gzip — test files are random binary data, compression wastes CPU.
 
-Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
+Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark. Do not call apply_nginx_tuning, apply_system_tuning, run_benchmark, or save_findings yourself; Python will execute saved recommendations after you finish planning.
 """
 
 
@@ -264,7 +262,7 @@ def build(model) -> DiagnosisWorkflow:
             else:
                 already_ok.append(parameter)
 
-        result = {"needs_fixing": needs_fixing, "already_ok": already_ok}
+        result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
         deps.token_counter.tool_calls += 1
         deps.memory.save_context(
             deps.session_id,
@@ -276,6 +274,7 @@ def build(model) -> DiagnosisWorkflow:
         tool_result(
             "inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
+        state["nginx_inspection"] = result
         return result
 
     def inspect_system_impl(deps: AgentDeps) -> dict:
@@ -315,7 +314,7 @@ def build(model) -> DiagnosisWorkflow:
             else:
                 already_ok.append(parameter)
 
-        result = {"needs_fixing": needs_fixing, "already_ok": already_ok}
+        result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
         deps.token_counter.tool_calls += 1
         deps.memory.save_context(
             deps.session_id,
@@ -327,6 +326,7 @@ def build(model) -> DiagnosisWorkflow:
         tool_result(
             "inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
+        state["system_inspection"] = result
         return result
 
     def apply_nginx_impl(deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any) -> dict:
@@ -618,6 +618,9 @@ def build(model) -> DiagnosisWorkflow:
         tool_call("recommend", f"{len(recommendations)} recommendations")
         normalized_items: list[dict[str, Any]] = []
         for idx, item in enumerate(recommendations, start=1):
+            changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
+            if parse_error:
+                changes = {}
             normalized = {
                 "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
                 "recommendation": str(item.get("recommendation", "")).strip() or "no recommendation",
@@ -625,6 +628,8 @@ def build(model) -> DiagnosisWorkflow:
                 "expected_benefit": str(item.get("expected_benefit", "")).strip() or "no expected benefit",
                 "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
                 "validation": str(item.get("validation", "")).strip() or "manual verification required",
+                "scope": str(item.get("scope", "nginx")).strip().lower() or "nginx",
+                "changes": changes or {},
             }
             deps.memory.save_context(
                 deps.session_id,
@@ -638,6 +643,69 @@ def build(model) -> DiagnosisWorkflow:
         deps.token_counter.tool_calls += 1
         state["recommendations"] = normalized_items
         return True
+
+    def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
+        recommendations = list(state.get("recommendations") or [])
+        nginx_changes: dict[str, str] = {}
+        system_changes: dict[str, str] = {}
+        recommendation_by_param: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for item in recommendations:
+            scope = str(item.get("scope", "nginx")).lower()
+            changes = item.get("changes", {})
+            if not isinstance(changes, dict):
+                continue
+            for param, value in changes.items():
+                if scope == "system":
+                    system_changes[str(param)] = str(value)
+                    recommendation_by_param[("system", str(param))] = item
+                else:
+                    nginx_changes[str(param)] = str(value)
+                    recommendation_by_param[("nginx", str(param))] = item
+
+        nginx_result = {"applied": [], "failed": [], "reload": "SKIPPED"}
+        system_result = {"applied": {}, "failed": {}}
+        if nginx_changes:
+            nginx_result = apply_nginx_impl(deps, nginx_changes)
+        if system_changes:
+            system_result = apply_system_impl(deps, system_changes)
+
+        bench_duration = int(deps.config["service"]["benchmark"].get("duration", 30))
+        benchmark_result = run_benchmark_impl(deps, bench_duration)
+
+        nginx_current = ((state.get("nginx_inspection") or {}).get("current")) or {}
+        system_current = ((state.get("system_inspection") or {}).get("current")) or {}
+        findings: list[dict[str, Any]] = []
+        for param in nginx_result.get("applied", []):
+            rec = recommendation_by_param.get(("nginx", param), {})
+            findings.append(
+                {
+                    "parameter": f"nginx.{param}",
+                    "before_value": nginx_current.get(param, ""),
+                    "after_value": nginx_changes.get(param, ""),
+                    "reasoning": rec.get("rationale") or rec.get("recommendation") or "recommended change applied",
+                }
+            )
+        for param, value in system_result.get("applied", {}).items():
+            rec = recommendation_by_param.get(("system", param), {})
+            findings.append(
+                {
+                    "parameter": f"system.{param}",
+                    "before_value": system_current.get(param, ""),
+                    "after_value": value,
+                    "reasoning": rec.get("rationale") or rec.get("recommendation") or "recommended change applied",
+                }
+            )
+
+        if findings:
+            save_findings_impl(deps, findings)
+
+        return {
+            "nginx": nginx_result,
+            "system": system_result,
+            "benchmark": benchmark_result,
+            "findings": findings,
+        }
 
     async def inspect_nginx_config(ctx) -> dict:
         return inspect_nginx_impl(ctx.deps)
@@ -719,11 +787,7 @@ def build(model) -> DiagnosisWorkflow:
             inspect_system_tuning,
             save_rca,
             save_recommendations,
-            apply_nginx_tuning,
-            apply_system_tuning,
-            run_benchmark,
             query_memory,
-            save_findings,
         ]
 
     test_tools = {
@@ -737,7 +801,9 @@ def build(model) -> DiagnosisWorkflow:
         "query_memory": query_memory,
         "save_findings": save_findings,
     }
-    return DiagnosisWorkflow(model, state, test_tools, tool_factory)
+    workflow = DiagnosisWorkflow(model, state, test_tools, tool_factory)
+    workflow._apply_from_recommendations = apply_saved_recommendations_impl
+    return workflow
 
 
 async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
@@ -746,6 +812,9 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     agent = build(model)
     state = getattr(agent, "_slaymetrics_state", {})
     result = await agent.run(context_prompt, deps=deps)
+    apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
+    if callable(apply_from_recommendations):
+        apply_from_recommendations(deps)
     inp, out = result.usage().input_tokens or 0, result.usage().output_tokens or 0
     deps.token_counter.input_tokens += int(inp)
     deps.token_counter.output_tokens += int(out)

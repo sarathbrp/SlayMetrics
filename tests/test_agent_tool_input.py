@@ -328,6 +328,8 @@ def test_save_recommendations_persists_human_readable_items():
                     "expected_benefit": "Higher small-file throughput",
                     "risk_level": "low",
                     "validation": "Re-run small workload and compare p99/RPS",
+                    "scope": "nginx",
+                    "changes": {"sendfile": "on"},
                 }
             ],
         )
@@ -416,3 +418,48 @@ def test_run_does_not_double_count_usage(monkeypatch):
 
     assert deps.token_counter.input_tokens == 11
     assert deps.token_counter.output_tokens == 7
+
+
+def test_run_applies_saved_recommendations(monkeypatch):
+    deps = _ctx().deps
+
+    class FakeRunResult:
+        output = "Plan complete."
+
+        def usage(self):
+            return SimpleNamespace(input_tokens=3, output_tokens=2)
+
+        def all_messages(self):
+            return []
+
+    class FakeAgent:
+        _slaymetrics_state = {
+            "nginx_applied": False,
+            "system_applied": False,
+            "after_rps": 0.0,
+            "findings": [],
+            "recommendations": [{"title": "x"}],
+        }
+
+        async def run(self, prompt, deps):
+            return FakeRunResult()
+
+        def _apply_from_recommendations(self, deps):
+            self._slaymetrics_state["nginx_applied"] = True
+            self._slaymetrics_state["system_applied"] = True
+            self._slaymetrics_state["after_rps"] = 160.0
+            self._slaymetrics_state["findings"] = [{"parameter": "nginx.sendfile"}]
+            self._slaymetrics_state["recommendations"] = [{"title": "Raise connection limits"}]
+            return {}
+
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
+
+    output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
+
+    assert output.nginx_applied is True
+    assert output.system_applied is True
+    assert output.after_rps == 160.0
+    assert output.recommendations[0]["title"] == "Raise connection limits"
