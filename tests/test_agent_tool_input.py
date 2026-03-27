@@ -655,6 +655,89 @@ def test_coerce_recommendations_extracts_system_changes_from_commands():
     ]
 
 
+def test_coerce_records_accepts_issue_and_cause_shapes():
+    records = diagnosis_agent._coerce_records(
+        [
+            {"issue": "worker_connections set to 1024", "impact": "Queues requests under load."},
+            {"cause": "Network backlog too low", "impact": "SYN drops raise p99 latency."},
+        ]
+    )
+
+    assert records == [
+        {
+            "symptom": "worker_connections set to 1024",
+            "root_cause": "Queues requests under load.",
+            "confidence": 0.0,
+            "recommendation": "Queues requests under load.",
+            "evidence": [],
+        },
+        {
+            "symptom": "Network backlog too low",
+            "root_cause": "SYN drops raise p99 latency.",
+            "confidence": 0.0,
+            "recommendation": "SYN drops raise p99 latency.",
+            "evidence": [],
+        },
+    ]
+
+
+def test_coerce_recommendations_accepts_type_setting_value_shape():
+    recommendations = diagnosis_agent._coerce_recommendations(
+        [
+            {
+                "type": "nginx",
+                "description": "Increase worker_connections to handle more simultaneous connections.",
+                "setting": "worker_connections",
+                "value": "65536",
+                "rationale": "Matches the high core count and prevents request queuing.",
+            }
+        ]
+    )
+
+    assert recommendations == [
+        {
+            "title": "Increase worker_connections to handle more simultaneous connections.",
+            "recommendation": "Increase worker_connections to handle more simultaneous connections.",
+            "rationale": "Matches the high core count and prevents request queuing.",
+            "expected_benefit": "no expected benefit",
+            "risk_level": "medium",
+            "validation": "manual verification required",
+            "scope": "nginx",
+            "changes": {"worker_connections": "65536"},
+        }
+    ]
+
+
+def test_coerce_recommendations_accepts_setting_value_lists():
+    recommendations = diagnosis_agent._coerce_recommendations(
+        [
+            {
+                "type": "nginx",
+                "description": "Set open_file_cache_valid and open_file_cache_min_uses.",
+                "setting": ["open_file_cache_valid", "open_file_cache_min_uses"],
+                "value": ["30s", "2"],
+                "rationale": "Caches only frequently used files.",
+            }
+        ]
+    )
+
+    assert recommendations == [
+        {
+            "title": "Set open_file_cache_valid and open_file_cache_min_uses.",
+            "recommendation": "Set open_file_cache_valid and open_file_cache_min_uses.",
+            "rationale": "Caches only frequently used files.",
+            "expected_benefit": "no expected benefit",
+            "risk_level": "medium",
+            "validation": "manual verification required",
+            "scope": "nginx",
+            "changes": {
+                "open_file_cache_valid": "30s",
+                "open_file_cache_min_uses": "2",
+            },
+        }
+    ]
+
+
 def test_run_applies_saved_recommendations(monkeypatch):
     deps = _ctx().deps
 

@@ -226,11 +226,11 @@ def build(model) -> DiagnosisWorkflow:
         if not _debug_enabled(deps):
             return
         text = (
-            json.dumps(payload, ensure_ascii=True)
+            json.dumps(payload, ensure_ascii=False)
             if isinstance(payload, (dict, list))
             else str(payload)
         )
-        tool_result("debug", f"{label}: {text[:800]}")
+        tool_result("debug", f"{label}: {text}")
 
     def _langfuse_event(
         deps: AgentDeps,
@@ -1347,11 +1347,11 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
     if _planner_debug_enabled(deps):
         tool_result(
             "debug",
-            f"nginx_expert raw: {json.dumps(nginx_analysis, ensure_ascii=True)[:1200]}",
+            f"nginx_expert raw: {json.dumps(nginx_analysis, ensure_ascii=False)}",
         )
         tool_result(
             "debug",
-            f"rhel_expert raw: {json.dumps(rhel_analysis, ensure_ascii=True)[:1200]}",
+            f"rhel_expert raw: {json.dumps(rhel_analysis, ensure_ascii=False)}",
         )
 
     synth_prompt = (
@@ -1368,7 +1368,7 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         model, "planner.synthesizer", synth_prompt, deps
     )
     if _planner_debug_enabled(deps):
-        tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=True)[:1500]}")
+        tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=False)}")
 
     _save_planner_artifact(deps, "nginx_expert", nginx_analysis)
     _save_planner_artifact(deps, "rhel_expert", rhel_analysis)
@@ -1491,9 +1491,19 @@ def _coerce_records(value: Any, deps: AgentDeps | None = None) -> list[dict[str,
             if deps and _planner_debug_enabled(deps):
                 tool_result("debug", f"synthesized rca_{idx} dropped: non-dict item {item!r}")
             continue
-        symptom = str(item.get("symptom", "")).strip()
+        issue = str(item.get("issue", "")).strip()
+        cause = str(item.get("cause", "")).strip()
+        impact = str(item.get("impact", "")).strip()
+        symptom = str(item.get("symptom", "")).strip() or issue or cause
         root_cause = str(item.get("root_cause", "")).strip()
+        if not root_cause:
+            if impact:
+                root_cause = impact
+            else:
+                root_cause = cause
         recommendation = str(item.get("recommendation", "")).strip()
+        if not recommendation:
+            recommendation = impact or "no recommendation"
         if not symptom or not root_cause:
             if deps and _planner_debug_enabled(deps):
                 tool_result(
@@ -1563,6 +1573,38 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
     normalized = dict(item)
     changes = item.get("changes")
     if isinstance(changes, dict) and changes:
+        return normalized
+
+    rec_type = str(item.get("type", "")).strip().lower()
+    if rec_type in {"nginx", "system", "irq"}:
+        normalized["scope"] = "system" if rec_type in {"system", "irq"} else "nginx"
+
+    setting = item.get("setting")
+    value = item.get("value")
+    if isinstance(setting, list) and isinstance(value, list) and len(setting) == len(value):
+        normalized["changes"] = {str(k): str(v) for k, v in zip(setting, value)}
+        normalized["title"] = normalized.get("title") or str(item.get("description", "")).strip() or "batch setting"
+        normalized["recommendation"] = (
+            normalized.get("recommendation")
+            or str(item.get("description", "")).strip()
+            or "apply configuration changes"
+        )
+        normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
+        return normalized
+
+    if setting and value not in (None, ""):
+        normalized["changes"] = {str(setting): str(value)}
+        normalized["title"] = (
+            normalized.get("title")
+            or str(item.get("description", "")).strip()
+            or f"Set {setting}"
+        )
+        normalized["recommendation"] = (
+            normalized.get("recommendation")
+            or str(item.get("description", "")).strip()
+            or f"Set {setting} to {value}"
+        )
+        normalized["rationale"] = normalized.get("rationale") or normalized.get("justification") or ""
         return normalized
 
     directive = str(item.get("directive", "")).strip()
