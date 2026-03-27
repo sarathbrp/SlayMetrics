@@ -85,8 +85,25 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     bench_cfg = cfg["service"]["benchmark"]
     bench_tool = bench_cfg.get("tool", "wrk2")
+    baseline_mode = str((cfg.get("agent") or {}).get("baseline_mode", "fresh")).strip().lower()
+    reused = _load_reusable_baseline(deps) if baseline_mode == "reuse" else None
 
-    if bench_tool == "hackathon":
+    if reused:
+        logger.step("Step 2: Reusing stored baseline benchmark...")
+        baselines = reused["baselines"]
+        telemetry_entries = reused["telemetry_entries"]
+        logger.status(
+            "benchmark",
+            "Reused baseline from session "
+            f"{reused['source_session_id']} for host {cfg['target']['host']}",
+        )
+        for workload in HACKATHON_WORKLOADS:
+            data = baselines.get(workload, {})
+            if data:
+                logger.benchmark(
+                    f"baseline ({workload})", data.get("rps", 0), data.get("p99", 0), 0, 0
+                )
+    elif bench_tool == "hackathon":
         logger.step("Step 2: Running hackathon baseline benchmark...")
         with (
             langfuse.span(
@@ -102,6 +119,7 @@ async def run(model, deps: AgentDeps) -> str:
                 scope="baseline",
                 runner=lambda: _run_hackathon_benchmark(deps, cfg, "baseline", session_id),
             )
+        telemetry_entries = memory.get_contexts(session_id, "telemetry", limit=8)
     else:
         logger.step("Step 2: Running baseline benchmarks (small/medium/large)...")
         with (
@@ -118,6 +136,7 @@ async def run(model, deps: AgentDeps) -> str:
                 scope="baseline",
                 runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id),
             )
+        telemetry_entries = memory.get_contexts(session_id, "telemetry", limit=8)
 
     baseline_rps = baselines.get("small", {}).get(
         "rps", baselines.get("homepage", {}).get("rps", 0)
@@ -132,7 +151,6 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 2.5: Aggregate benchmark evidence from bench + DUT telemetry
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 2.5: Aggregating benchmark evidence...")
-    telemetry_entries = memory.get_contexts(session_id, "telemetry", limit=8)
     benchmark_evidence = _build_benchmark_evidence(baselines, telemetry_entries)
     if langfuse:
         langfuse.event(
@@ -655,6 +673,42 @@ def _safe_int(value) -> int:
         return int(str(value).strip())
     except (TypeError, ValueError, AttributeError):
         return 0
+
+
+def _load_reusable_baseline(deps: AgentDeps) -> dict[str, object] | None:
+    host = deps.config["target"]["host"]
+    source_session_id = deps.memory.get_latest_session_for_host(
+        host, exclude_session_id=deps.session_id
+    )
+    if not source_session_id:
+        return None
+
+    baselines: dict[str, dict] = {}
+    for workload in HACKATHON_WORKLOADS:
+        rows = deps.memory.get_contexts(
+            source_session_id,
+            type="benchmark",
+            source_prefix=f"baseline_{workload}",
+            limit=1,
+        )
+        if not rows:
+            continue
+        content = rows[0].get("content", "")
+        try:
+            parsed = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            baselines[workload] = parsed
+
+    telemetry_entries = deps.memory.get_contexts(source_session_id, "telemetry", limit=8)
+    if not baselines:
+        return None
+    return {
+        "source_session_id": source_session_id,
+        "baselines": baselines,
+        "telemetry_entries": telemetry_entries,
+    }
 
 
 HACKATHON_WORKLOADS = ["homepage", "small", "medium", "large", "mixed"]

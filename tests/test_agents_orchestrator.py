@@ -53,6 +53,10 @@ class FakeMemory:
     def get_profile(self, session_id):
         return {"service": "nginx", "host": "localhost"}
 
+    def get_latest_session_for_host(self, host, exclude_session_id=None):
+        del host, exclude_session_id
+        return None
+
     def get_queue(self, session_id):
         return []
 
@@ -119,6 +123,7 @@ def _deps():
             },
             "rhel": {"checks": ["cpu_governor"]},
             "agent": {
+                "baseline_mode": "fresh",
                 "stability": {
                     "enabled": True,
                     "duration_sec": 2,
@@ -127,6 +132,56 @@ def _deps():
                 }
             },
         },
+    )
+
+
+def test_orchestrator_reuses_stored_baseline(monkeypatch):
+    deps = _deps()
+    deps.memory.get_latest_session_for_host = lambda host, exclude_session_id=None: "prior-s1"
+
+    def fake_get_contexts(session_id, type=None, source_prefix=None, limit=None):
+        del type, limit
+        if session_id == "prior-s1" and source_prefix == "baseline_small":
+            return [{"content": '{"rps": 123.0, "p99": 4.0, "cpu_pct": 0, "mem_mb": 0, "error_rate": 0}'}]
+        if session_id == "prior-s1" and source_prefix == "baseline_homepage":
+            return [{"content": '{"rps": 456.0, "p99": 1.0, "cpu_pct": 0, "mem_mb": 0, "error_rate": 0}'}]
+        if session_id == "prior-s1" and source_prefix is None:
+            return [
+                {
+                    "source": "baseline:series",
+                    "content": '{"summary":{"sample_count":3,"duration_sec":2,"run_queue_avg":0.5,"run_queue_max":1,"rx_drop_delta":1,"rx_drop_rate_per_sec":0.1,"worker_core_spread_max":8},"first_sample":{"nginx_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":10,"tx_drop_total":0,"tcp_established":90},"last_sample":{"nginx_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":11,"tx_drop_total":0,"tcp_established":95}}',
+                }
+            ]
+        return []
+
+    deps.memory.get_contexts = fake_get_contexts
+    deps.config["agent"]["baseline_mode"] = "reuse"
+
+    monkeypatch.setattr(orchestrator.system_checks, "run_all", lambda ssh, checks: [])
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run",
+        lambda model, deps, context_prompt: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                notes="planned",
+                recommendations=[],
+                rca_records=[],
+                nginx_applied=False,
+                system_applied=False,
+                after_rps=0.0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(orchestrator.reporter, "generate", lambda *a, **k: "report.md")
+
+    report = asyncio.run(orchestrator.run("model", deps))
+
+    assert report == "report.md"
+    assert any(
+        args[2] == "benchmark_evidence" and "123.0" in args[3]
+        for args in deps.memory.saved
+        if isinstance(args, tuple) and len(args) >= 4
     )
 
 

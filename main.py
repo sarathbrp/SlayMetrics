@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import uuid
 from pathlib import Path
 
@@ -168,6 +167,7 @@ async def main(
     verbose: bool = False,
     max_phase: int = 4,
     planner_mode: str = "single",
+    baseline_mode: str = "fresh",
 ) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
     load_dotenv()
@@ -176,6 +176,7 @@ async def main(
     cfg.setdefault("agent", {})
     cfg["agent"]["max_phase"] = max_phase
     cfg["agent"]["planner_mode"] = planner_mode
+    cfg["agent"]["baseline_mode"] = baseline_mode
 
     # Session ID — generate or reuse
     if session_id is None:
@@ -232,6 +233,7 @@ async def main(
             "service": cfg["service"]["name"],
             "planner_mode": planner_mode,
             "max_phase": max_phase,
+            "baseline_mode": baseline_mode,
             "llm_profile": profile_name,
             "dut_host": host,
             "bench_host": bench_host,
@@ -265,6 +267,7 @@ async def main(
                 "session_id": session_id,
                 "planner_mode": planner_mode,
                 "max_phase": max_phase,
+                "baseline_mode": baseline_mode,
                 "llm_profile": profile_name,
             },
         ):
@@ -319,6 +322,15 @@ if __name__ == "__main__":
         default="single",
         help="Planning path: single planner or nginx-vs-rhel debate with synthesis",
     )
+    parser.add_argument(
+        "--baseline-mode",
+        choices=["fresh", "reuse"],
+        default="fresh",
+        help=(
+            "Baseline acquisition: run a fresh baseline or reuse "
+            "the latest stored one for this host"
+        ),
+    )
     args = parser.parse_args()
     try:
         asyncio.run(
@@ -328,6 +340,7 @@ if __name__ == "__main__":
                 args.verbose,
                 args.max_phase,
                 args.planner_mode,
+                args.baseline_mode,
             )
         )
     except KeyboardInterrupt:

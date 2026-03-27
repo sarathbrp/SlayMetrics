@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -215,17 +216,17 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         "service": {"name": "nginx"},
     }
     monkeypatch.setitem(
-        main.sys.modules,
+        sys.modules,
         "langchain_ollama",
         SimpleNamespace(ChatOllama=lambda **kwargs: ("ollama", kwargs)),
     )
     monkeypatch.setitem(
-        main.sys.modules,
+        sys.modules,
         "langchain_anthropic",
         SimpleNamespace(ChatAnthropic=lambda **kwargs: ("anthropic", kwargs)),
     )
     monkeypatch.setitem(
-        main.sys.modules,
+        sys.modules,
         "langchain_openai",
         SimpleNamespace(ChatOpenAI=lambda **kwargs: ("openai", kwargs)),
     )
@@ -345,14 +346,15 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         lambda metadata=None, enabled=True: FakeLangfuse() if enabled else SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
     )
     monkeypatch.setitem(
-        main.sys.modules,
+        sys.modules,
         "core.orchestrator",
         SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
     )
-    asyncio.run(main.main("cfg.yaml", None, False, 3, "debate"))
+    asyncio.run(main.main("cfg.yaml", None, False, 3, "debate", "reuse"))
     assert fake_memory.created is True
     assert cfg_main["agent"]["max_phase"] == 3
     assert cfg_main["agent"]["planner_mode"] == "debate"
+    assert cfg_main["agent"]["baseline_mode"] == "reuse"
     assert ("auth_check",) in langfuse_calls
     assert any(call[0] == "trace" for call in langfuse_calls)
     assert ("flush",) in langfuse_calls
@@ -384,6 +386,6 @@ def test_remote_embeddings(monkeypatch):
         def __init__(self, api_key=None):
             self.embeddings = FakeEmbeddingsAPI()
 
-    monkeypatch.setitem(main.sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
     emb = RemoteEmbeddings("voyage-3")
     assert emb.embed("hello") == [1.0, 2.0]

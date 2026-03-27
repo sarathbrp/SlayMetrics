@@ -79,6 +79,7 @@ agent:
   improvement_threshold_pct: 5
   max_iterations: 50
   max_phase: 4
+  baseline_mode: fresh
   debug_planner_payloads: false
   benchmark_after_every_fix: true
   stability:

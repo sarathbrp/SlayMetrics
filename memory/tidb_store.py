@@ -138,6 +138,24 @@ class TiDBStore:
             cur.execute("SELECT * FROM profile WHERE session_id = %s LIMIT 1", (session_id,))
             return cur.fetchone()
 
+    def get_latest_session_for_host(
+        self, host: str, exclude_session_id: str | None = None
+    ) -> str | None:
+        query = """
+            SELECT session_id
+            FROM profile
+            WHERE host = %s
+        """
+        params: list[object] = [host]
+        if exclude_session_id:
+            query += " AND session_id <> %s"
+            params.append(exclude_session_id)
+        query += " ORDER BY updated_at DESC, created_at DESC LIMIT 1"
+        with self._cursor() as cur:
+            cur.execute(query, tuple(params))
+            row = cur.fetchone()
+        return row["session_id"] if row else None
+
     # ── Facts ────────────────────────────────────────────────────────────────
 
     def save_fact(
@@ -273,7 +291,7 @@ class TiDBStore:
             rows = [row for row in rows if str(row.get("source", "")).startswith(prefix)]
             for row in rows:
                 row["type"] = logical_type
-                row["source"] = str(row.get("source", ""))[len(prefix):]
+                row["source"] = str(row.get("source", ""))[len(prefix) :]
         return rows
 
     # ── Vector search ────────────────────────────────────────────────────────
