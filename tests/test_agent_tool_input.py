@@ -148,6 +148,17 @@ def test_apply_system_tuning_accepts_top_level_kwargs_shape():
     assert result["applied"].get("transparent_hugepage") == "never"
 
 
+def test_apply_nginx_tuning_strips_leading_dot_from_keys():
+    agent = build(TestModel())
+    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    ctx = _ctx()
+
+    result = asyncio.run(tool(ctx, **{".sendfile": "on"}))
+
+    assert result["reload"] == "OK"
+    assert result["applied"] == ["sendfile"]
+
+
 def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
     agent = build(TestModel())
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function

@@ -92,6 +92,7 @@ def build(model) -> Agent:
         for key, value in changes_obj.items():
             if not isinstance(key, str):
                 key = str(key)
+            key = key.lstrip(".")
             if isinstance(value, (dict, list)):
                 normalized[key] = json.dumps(value, separators=(",", ":"))
             else:
@@ -111,10 +112,11 @@ def build(model) -> Agent:
         for key, value in extra_changes.items():
             if key == "changes":
                 continue
+            key = str(key).lstrip(".")
             if isinstance(value, (dict, list)):
-                merged[str(key)] = json.dumps(value, separators=(",", ":"))
+                merged[key] = json.dumps(value, separators=(",", ":"))
             else:
-                merged[str(key)] = str(value)
+                merged[key] = str(value)
         return merged, None
 
     # Proven optimal values — inspect compares against these
