@@ -244,7 +244,7 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
                             "model": "/models/gpt-oss-120b",
                             "model_env": "GPT_OSS_MODEL",
                             "base_url": "http://example-gpt-oss-host:8002/v1",
-                            "api_key_env": "GPT_OSS_API_KEY",
+                            "api_key_env": "GPT_OSS_API_KEY",  # pragma: allowlist secret
                         }
                     },
                 }
@@ -315,9 +315,10 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         "core.orchestrator",
         SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
     )
-    asyncio.run(main.main("cfg.yaml", None, False, 3))
+    asyncio.run(main.main("cfg.yaml", None, False, 3, "debate"))
     assert fake_memory.created is True
     assert cfg_main["agent"]["max_phase"] == 3
+    assert cfg_main["agent"]["planner_mode"] == "debate"
 
 
 def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):

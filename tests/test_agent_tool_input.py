@@ -490,6 +490,50 @@ def test_run_does_not_double_count_usage(monkeypatch):
     assert deps.token_counter.output_tokens == 7
 
 
+def test_run_uses_debate_planner_mode(monkeypatch):
+    deps = SimpleNamespace(
+        memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
+        session_id="s1",
+        token_counter=TokenCounter(),
+        config={"agent": {"planner_mode": "debate", "max_phase": 3}},
+    )
+
+    class FakeAgent:
+        _slaymetrics_state = {
+            "nginx_applied": False,
+            "system_applied": False,
+            "after_rps": 0.0,
+            "findings": [],
+            "rca_records": [],
+            "recommendations": [],
+        }
+
+    class FakeRunResult:
+        output = "Debate complete."
+
+        def usage(self):
+            return SimpleNamespace(input_tokens=4, output_tokens=3)
+
+        def all_messages(self):
+            return []
+
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(
+        diagnosis_agent,
+        "_run_debate_planner",
+        lambda agent, model, deps, context_prompt: asyncio.sleep(0, result=FakeRunResult()),
+    )
+    monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
+
+    output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
+
+    assert output.notes == "Debate complete."
+    assert deps.token_counter.input_tokens == 4
+    assert deps.token_counter.output_tokens == 3
+
+
 def test_run_applies_saved_recommendations(monkeypatch):
     deps = _ctx().deps
 

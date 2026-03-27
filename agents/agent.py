@@ -1018,9 +1018,13 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     llm_call("agent", "Starting diagnosis — sending context to LLM...")
     agent = build(model)
     state = getattr(agent, "_slaymetrics_state", {})
-    result = await agent.run(context_prompt, deps=deps)
-    apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
     config = getattr(deps, "config", {}) or {}
+    planner_mode = str((config.get("agent") or {}).get("planner_mode", "single")).strip().lower()
+    if planner_mode == "debate":
+        result = await _run_debate_planner(agent, model, deps, context_prompt)
+    else:
+        result = await agent.run(context_prompt, deps=deps)
+    apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
     max_phase = int((config.get("agent") or {}).get("max_phase", 4))
     if callable(apply_from_recommendations) and max_phase >= 4:
         apply_from_recommendations(deps)
@@ -1067,6 +1071,173 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
         notes=notes,
         rca_records=list(state.get("rca_records") or []),
         recommendations=list(state.get("recommendations") or []),
+    )
+
+
+async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str):
+    ctx = SimpleNamespace(deps=deps)
+    inspect_nginx = agent._function_toolset.tools["inspect_nginx_config"].function
+    inspect_system = agent._function_toolset.tools["inspect_system_tuning"].function
+    inspect_irq = agent._function_toolset.tools["inspect_irq_distribution"].function
+    save_rca = agent._function_toolset.tools["save_rca"].function
+    save_recommendations = agent._function_toolset.tools["save_recommendations"].function
+
+    nginx_inspection = await inspect_nginx(ctx)
+    system_inspection = await inspect_system(ctx)
+    irq_inspection = await inspect_irq(ctx)
+
+    nginx_prompt = (
+        "You are an NGINX performance expert. Review only nginx config evidence. "
+        "Do not recommend kernel or IRQ changes. Return strict JSON with keys "
+        "summary, rca_records, recommendations, counterpoints.\n\n"
+        f"Shared Context:\n{context_prompt}\n\n"
+        f"NGINX Inspection:\n{json.dumps(nginx_inspection, ensure_ascii=True)}"
+    )
+    rhel_prompt = (
+        "You are a RHEL Linux performance expert. "
+        "Review only kernel/system/IRQ evidence. "
+        "Do not recommend nginx-only config changes "
+        "unless they directly depend on system evidence. "
+        "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
+        f"Shared Context:\n{context_prompt}\n\n"
+        f"System Inspection:\n{json.dumps(system_inspection, ensure_ascii=True)}\n\n"
+        f"IRQ Inspection:\n{json.dumps(irq_inspection, ensure_ascii=True)}"
+    )
+
+    nginx_analysis, nginx_usage = _invoke_json_planner(model, "nginx_expert", nginx_prompt)
+    rhel_analysis, rhel_usage = _invoke_json_planner(model, "rhel_expert", rhel_prompt)
+
+    synth_prompt = (
+        "You are the synthesis arbiter between an NGINX expert "
+        "and a RHEL Linux performance expert. "
+        "Merge their outputs into one final plan. "
+        "Keep only grounded recommendations supported by evidence. "
+        "Prefer nginx fixes first, system fixes second, IRQ fixes only if clearly justified. "
+        "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
+        f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
+        f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
+    )
+    synthesis, synth_usage = _invoke_json_planner(model, "synthesizer", synth_prompt)
+
+    _save_planner_artifact(deps, "nginx_expert", nginx_analysis)
+    _save_planner_artifact(deps, "rhel_expert", rhel_analysis)
+    _save_planner_artifact(deps, "synthesizer", synthesis)
+
+    rca_records = _coerce_records(synthesis.get("rca_records"))
+    recommendations = _coerce_recommendations(synthesis.get("recommendations"))
+    if rca_records:
+        await save_rca(ctx, rca_records)
+    if recommendations:
+        await save_recommendations(ctx, recommendations)
+
+    total_in = (
+        nginx_usage["input_tokens"] + rhel_usage["input_tokens"] + synth_usage["input_tokens"]
+    )
+    total_out = (
+        nginx_usage["output_tokens"] + rhel_usage["output_tokens"] + synth_usage["output_tokens"]
+    )
+    return SimpleNamespace(
+        output=str(synthesis.get("summary") or "Debate planning completed.").strip(),
+        usage=lambda: SimpleNamespace(input_tokens=total_in, output_tokens=total_out),
+        all_messages=lambda: [],
+    )
+
+
+def _invoke_json_planner(model, name: str, prompt: str) -> tuple[dict[str, Any], dict[str, int]]:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    response = model.invoke(
+        [
+            SystemMessage(
+                content=(
+                    f"You are {name}. Return JSON only. No markdown fences. "
+                    "If unsure, return empty arrays instead of prose."
+                )
+            ),
+            HumanMessage(content=prompt),
+        ]
+    )
+    text = _extract_final_text([response])
+    payload = _extract_json_dict(text)
+    usage = getattr(response, "usage_metadata", None) or {}
+    return payload, {
+        "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+    }
+
+
+def _extract_json_dict(text: str) -> dict[str, Any]:
+    if not text:
+        return {}
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if "\n" in candidate:
+            candidate = candidate.split("\n", 1)[1]
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    candidate = candidate[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _coerce_records(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        records.append(
+            {
+                "symptom": str(item.get("symptom", "")).strip() or "unknown symptom",
+                "root_cause": str(item.get("root_cause", "")).strip() or "unknown root cause",
+                "confidence": _coerce_float(item.get("confidence", 0.0)),
+                "recommendation": str(item.get("recommendation", "")).strip()
+                or "no recommendation",
+                "evidence": item.get("evidence", []),
+            }
+        )
+    return records
+
+
+def _coerce_recommendations(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    recommendations: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        recommendations.append(
+            {
+                "title": str(item.get("title", "")).strip() or "untitled recommendation",
+                "recommendation": str(item.get("recommendation", "")).strip()
+                or "no recommendation",
+                "rationale": str(item.get("rationale", "")).strip() or "no rationale",
+                "expected_benefit": str(item.get("expected_benefit", "")).strip()
+                or "no expected benefit",
+                "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
+                "validation": str(item.get("validation", "")).strip()
+                or "manual verification required",
+                "scope": str(item.get("scope", "nginx")).strip().lower() or "nginx",
+                "changes": item.get("changes", {}),
+            }
+        )
+    return recommendations
+
+
+def _save_planner_artifact(deps: AgentDeps, source: str, payload: dict[str, Any]) -> None:
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        source,
+        json.dumps(payload, ensure_ascii=True),
+        f"{source} planner output",
     )
 
 

@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import uuid
 from pathlib import Path
 
@@ -166,6 +165,7 @@ async def main(
     session_id: str | None,
     verbose: bool = False,
     max_phase: int = 4,
+    planner_mode: str = "single",
 ) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
     load_dotenv()
@@ -173,6 +173,7 @@ async def main(
     cfg = load_config(config_path)
     cfg.setdefault("agent", {})
     cfg["agent"]["max_phase"] = max_phase
+    cfg["agent"]["planner_mode"] = planner_mode
 
     # Session ID — generate or reuse
     if session_id is None:
@@ -275,8 +276,22 @@ if __name__ == "__main__":
         default=4,
         help="Maximum phase to run: 3 stops after RCA/recommendations, 4 runs remediation",
     )
+    parser.add_argument(
+        "--planner-mode",
+        choices=["single", "debate"],
+        default="single",
+        help="Planning path: single planner or nginx-vs-rhel debate with synthesis",
+    )
     args = parser.parse_args()
     try:
-        asyncio.run(main(args.config, args.session, args.verbose, args.max_phase))
+        asyncio.run(
+            main(
+                args.config,
+                args.session,
+                args.verbose,
+                args.max_phase,
+                args.planner_mode,
+            )
+        )
     except KeyboardInterrupt:
         print("\nAborted.")
