@@ -23,6 +23,7 @@ def generate(
 
     profile = memory.get_profile(session_id) or {}
     facts = memory.get_facts(session_id)
+    rca_entries = memory.get_contexts(session_id, type="rca")
     queue = memory.get_queue(session_id)
 
     fixes = [f for f in facts if f.get("type") == "fix"]
@@ -49,6 +50,7 @@ def generate(
         stability=stability,
         throughput=throughput,
         token_history=token_history,
+        rca_entries=rca_entries,
     )
 
     # ── JSON report ──────────────────────────────────────────────────────────
@@ -66,6 +68,7 @@ def generate(
         "fixes_applied": [_clean(f) for f in fixes],
         "findings": [_clean(f) for f in findings],
         "negatives": [_clean(f) for f in negatives],
+        "rca": [_clean(_clean_rca_entry(entry)) for entry in rca_entries],
         "hypothesis_queue": [_clean(q) for q in queue],
         "tokens": {
             "input": token_counter.input_tokens,
@@ -111,6 +114,7 @@ def _md_report(
     stability=None,
     throughput=None,
     token_history=None,
+    rca_entries=None,
 ) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     service = profile.get("service", "unknown")
@@ -282,6 +286,22 @@ def _md_report(
 
     lines += ["", "---", ""]
 
+    if rca_entries:
+        lines += ["## Root Cause Analysis", ""]
+        for entry in rca_entries:
+            data = _clean_rca_entry(entry)
+            evidence = data.get("evidence", [])
+            evidence_text = "; ".join(str(item) for item in evidence) if evidence else "No evidence recorded."
+            lines += [
+                f"### {data.get('symptom', 'Unknown symptom')}",
+                f"- Root cause: {data.get('root_cause', 'Unknown root cause')}",
+                f"- Confidence: {float(data.get('confidence', 0.0)):.2f}",
+                f"- Recommendation: {data.get('recommendation', 'No recommendation')}",
+                f"- Evidence: {evidence_text}",
+                "",
+            ]
+        lines += ["---", ""]
+
     # ── Decision Log ──────────────────────────────────────────────────────────
     lines += ["## Decision Log", ""]
 
@@ -403,3 +423,15 @@ def _template_reasoning(parameter: str) -> str:
 
 def _clean(row: dict) -> dict:
     return {k: v for k, v in row.items() if k != "embedding"}
+
+
+def _clean_rca_entry(entry: dict) -> dict:
+    content = entry.get("content", "{}")
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return {"symptom": entry.get("summary", "Unknown RCA entry")}

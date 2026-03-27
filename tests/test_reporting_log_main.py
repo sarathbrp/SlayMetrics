@@ -44,6 +44,10 @@ class FakeMemory:
             }
         ]
 
+    def get_contexts(self, session_id, type=None, source_prefix=None, limit=None):
+        del session_id, type, source_prefix, limit
+        return []
+
     def get_queue(self, session_id):
         return [{"name": "h1", "priority": 1, "status": "done", "outcome": "ok"}]
 

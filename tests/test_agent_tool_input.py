@@ -12,9 +12,11 @@ from tools.ssh import SSHResult
 class FakeMemory:
     def __init__(self):
         self.saved_facts: list[dict] = []
+        self.saved: list[tuple] = []
 
     def save_context(self, *args, **kwargs) -> None:
-        del args, kwargs
+        del kwargs
+        self.saved.append(args)
 
     def save_fact(self, **kwargs) -> None:
         self.saved_facts.append(kwargs)
@@ -281,6 +283,33 @@ def test_diagnosis_output_coerces_granite_friendly_shapes():
     assert output.after_rps == 1918406.5
     assert output.improvement_pct == 0.0
     assert output.notes.startswith("[")
+    assert output.rca_records == []
+
+
+def test_save_rca_persists_structured_records():
+    agent = build("model")
+    tool = agent._function_toolset.tools["save_rca"].function
+    ctx = _ctx()
+
+    result = asyncio.run(
+        tool(
+            ctx,
+            [
+                {
+                    "symptom": "High small-file p99 latency",
+                    "root_cause": "Backlog and worker limits are below target",
+                    "confidence": 0.9,
+                    "recommendation": "Raise worker and socket limits",
+                    "evidence": ["p99 > 1000ms", "somaxconn=4096"],
+                }
+            ],
+        )
+    )
+
+    assert result is True
+    saved = ctx.deps.memory.saved[-1]
+    assert saved[1] == "rca"
+    assert "Backlog and worker limits" in saved[4]
 
 
 def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):

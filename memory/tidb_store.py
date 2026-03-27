@@ -215,6 +215,29 @@ class TiDBStore:
             )
         return cid
 
+    def get_contexts(
+        self,
+        session_id: str,
+        type: str | None = None,
+        source_prefix: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        query = "SELECT * FROM context WHERE session_id = %s"
+        params: list[object] = [session_id]
+        if type:
+            query += " AND type = %s"
+            params.append(type)
+        if source_prefix:
+            query += " AND source LIKE %s"
+            params.append(f"{source_prefix}%")
+        query += " ORDER BY created_at DESC"
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+        with self._cursor() as cur:
+            cur.execute(query, tuple(params))
+            return cur.fetchall()
+
     # ── Vector search ────────────────────────────────────────────────────────
 
     def semantic_search(

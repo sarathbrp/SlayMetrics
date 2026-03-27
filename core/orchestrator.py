@@ -7,6 +7,7 @@ import statistics
 import agents.agent as diagnosis_agent
 import core.reporter as reporter
 import rhel.system_checks as system_checks
+from telemetry import collect_snapshot, persist_snapshot
 from agents import AgentDeps
 from core import log as logger
 
@@ -68,10 +69,14 @@ async def run(model, deps: AgentDeps) -> str:
 
     if bench_tool == "hackathon":
         logger.step("Step 2: Running hackathon baseline benchmark...")
+        _capture_telemetry(deps, scope="baseline", source="pre")
         baselines = _run_hackathon_benchmark(deps, cfg, "baseline", session_id)
+        _capture_telemetry(deps, scope="baseline", source="post")
     else:
         logger.step("Step 2: Running baseline benchmarks (small/medium/large)...")
+        _capture_telemetry(deps, scope="baseline", source="pre")
         baselines = _run_wrk2_benchmarks(deps, cfg, "Baseline", session_id)
+        _capture_telemetry(deps, scope="baseline", source="post")
 
     baseline_rps = baselines.get("small", {}).get("rps",
                    baselines.get("homepage", {}).get("rps", 0))
@@ -136,6 +141,7 @@ async def run(model, deps: AgentDeps) -> str:
         checks_summary=checks_summary,
         baselines=baselines,
         prior_fixes=prior_fixes,
+        telemetry_summary=_build_telemetry_summary(memory.get_contexts(session_id, "telemetry", limit=4)),
     )
 
     logger.log("orchestrator", f"Context prompt: {len(context_prompt)} chars", "info")
@@ -160,10 +166,14 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     if bench_tool == "hackathon":
         logger.step("Step 6: Running hackathon final benchmark...")
+        _capture_telemetry(deps, scope="final", source="pre")
         finals = _run_hackathon_benchmark(deps, cfg, "tuned", session_id)
+        _capture_telemetry(deps, scope="final", source="post")
     else:
         logger.step("Step 6: Running final benchmarks (small/medium/large)...")
+        _capture_telemetry(deps, scope="final", source="pre")
         finals = _run_wrk2_benchmarks(deps, cfg, "Final", session_id)
+        _capture_telemetry(deps, scope="final", source="post")
 
     # Update best_rps from actual final benchmarks
     final_small_rps = finals.get("small", {}).get("rps",
@@ -307,6 +317,7 @@ def _build_context_prompt(
     checks_summary,
     baselines,
     prior_fixes=None,
+    telemetry_summary: str = "",
 ) -> str:
     checks_text = "\n".join(checks_summary)
 
@@ -320,13 +331,48 @@ def _build_context_prompt(
         prior_text += ", ".join(f"{pf['parameter']}" for pf in prior_fixes)
         prior_text += "\n"
 
+    telemetry_text = f"Telemetry:\n{telemetry_summary}\n" if telemetry_summary else ""
+
     return f"""{rhel_ver} | {kernel_ver} | {cpu_cores} CPU | {ram_gb}GB
 Checks: {checks_text}
 Baselines:
 {baselines_text}
 {prior_text}
+{telemetry_text}
 Inspect, apply proven fixes, benchmark after, save_findings.
 """
+
+
+def _capture_telemetry(deps: AgentDeps, *, scope: str, source: str) -> None:
+    snapshot = collect_snapshot(
+        deps.ssh,
+        scope=scope,
+        host=deps.config["target"]["host"],
+        source=source,
+    )
+    persist_snapshot(deps.memory, deps.session_id, snapshot)
+
+
+def _build_telemetry_summary(entries: list[dict]) -> str:
+    lines: list[str] = []
+    for entry in entries[:4]:
+        source = entry.get("source", "telemetry")
+        try:
+            payload = json.loads(entry.get("content", "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        summary = payload.get("summary", {})
+        lines.append(
+            f"- {source}: workers={summary.get('nginx_worker_count', 0)}, "
+            f"cores={summary.get('nginx_worker_cores', [])}, "
+            f"somaxconn={summary.get('somaxconn', 'unknown')}, "
+            f"syn_backlog={summary.get('tcp_max_syn_backlog', 'unknown')}, "
+            f"ports={summary.get('ip_local_port_range', 'unknown')}, "
+            f"rx_drop={summary.get('rx_drop_total', 'unknown')}, "
+            f"tx_drop={summary.get('tx_drop_total', 'unknown')}, "
+            f"estab={summary.get('tcp_established', 'unknown')}"
+        )
+    return "\n".join(lines)
 
 
 HACKATHON_WORKLOADS = ["homepage", "small", "medium", "large", "mixed"]

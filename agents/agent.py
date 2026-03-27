@@ -30,21 +30,24 @@ class DiagnosisOutput:
     after_rps: float = 0.0
     improvement_pct: float = 0.0
     notes: str = ""
+    rca_records: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         self.after_rps = _coerce_float(self.after_rps)
         self.improvement_pct = _coerce_float(self.improvement_pct)
         self.notes = _coerce_notes(self.notes)
+        self.rca_records = list(self.rca_records or [])
 
 
 SYSTEM_PROMPT = """\
 You are SlayMetricsAgent. Steps:
 1. Inspect nginx and system tuning
-2. Apply missing nginx fixes via apply_nginx_tuning
-3. Apply missing system fixes via apply_system_tuning
-4. Benchmark AFTER (baselines are provided — do NOT benchmark before)
-5. Call save_findings with both results in one call
-6. Return one short plain-text summary sentence
+2. Save structured RCA via save_rca before remediation
+3. Apply missing nginx fixes via apply_nginx_tuning
+4. Apply missing system fixes via apply_system_tuning
+5. Benchmark AFTER (baselines are provided — do NOT benchmark before)
+6. Call save_findings with both results in one call
+7. Return one short plain-text summary sentence
 
 For apply_nginx_tuning and apply_system_tuning:
 - Pass a structured object under the changes field
@@ -54,6 +57,12 @@ For apply_nginx_tuning and apply_system_tuning:
 For save_findings:
 - Pass a structured list under the findings field
 - Example: {"findings":[{"parameter":"nginx.access_log","before_value":"on","after_value":"off"}]}
+
+For save_rca:
+- Pass a structured list under the records field
+- Each RCA record must include symptom, root_cause, confidence, recommendation
+- evidence may be a list of short strings
+- Example: {"records":[{"symptom":"High p99 on small payloads","root_cause":"listen backlog and worker limits are below target","confidence":0.9,"recommendation":"Raise worker_connections and somaxconn","evidence":["small p99 above 1000ms","somaxconn below proven target"]}]}
 
 Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
 - worker_connections=65536
@@ -145,6 +154,7 @@ def build(model) -> DiagnosisWorkflow:
         "system_applied": False,
         "after_rps": 0.0,
         "findings": [],
+        "rca_records": [],
     }
     memory_query_count = 0
     max_memory_queries = 3
@@ -559,6 +569,41 @@ def build(model) -> DiagnosisWorkflow:
         state["findings"] = findings
         return True
 
+    def save_rca_impl(deps: AgentDeps, records: list[dict[str, Any]]) -> bool:
+        tool_call("rca", f"{len(records)} records")
+        normalized_records: list[dict[str, Any]] = []
+        for idx, record in enumerate(records, start=1):
+            symptom = str(record.get("symptom", "")).strip() or "unknown symptom"
+            root_cause = str(record.get("root_cause", "")).strip() or "unknown root cause"
+            recommendation = str(record.get("recommendation", "")).strip() or "no recommendation"
+            confidence = _coerce_float(record.get("confidence", 0.0))
+            evidence = record.get("evidence", [])
+            if isinstance(evidence, str):
+                evidence_list = [evidence]
+            elif isinstance(evidence, list):
+                evidence_list = [str(item) for item in evidence[:6]]
+            else:
+                evidence_list = [str(evidence)]
+            normalized = {
+                "symptom": symptom,
+                "root_cause": root_cause,
+                "confidence": confidence,
+                "recommendation": recommendation,
+                "evidence": evidence_list,
+            }
+            deps.memory.save_context(
+                deps.session_id,
+                "rca",
+                f"rca_{idx}",
+                json.dumps(normalized),
+                f"{symptom} -> {root_cause} (conf={confidence:.2f})",
+            )
+            normalized_records.append(normalized)
+            tool_result("rca", f"{symptom} -> {root_cause} ({confidence:.2f})")
+        deps.token_counter.tool_calls += 1
+        state["rca_records"] = normalized_records
+        return True
+
     async def inspect_nginx_config(ctx) -> dict:
         return inspect_nginx_impl(ctx.deps)
 
@@ -579,6 +624,9 @@ def build(model) -> DiagnosisWorkflow:
 
     async def save_findings(ctx, findings: list[dict[str, Any]]) -> bool:
         return save_findings_impl(ctx.deps, findings)
+
+    async def save_rca(ctx, records: list[dict[str, Any]]) -> bool:
+        return save_rca_impl(ctx.deps, records)
 
     def tool_factory(deps: AgentDeps):
         from langchain_core.tools import tool
@@ -618,9 +666,15 @@ def build(model) -> DiagnosisWorkflow:
             """Save all findings from a structured findings list."""
             return save_findings_impl(deps, findings)
 
+        @tool
+        def save_rca(records: list[dict[str, Any]]) -> bool:
+            """Save structured root-cause analysis records before remediation."""
+            return save_rca_impl(deps, records)
+
         return [
             inspect_nginx_config,
             inspect_system_tuning,
+            save_rca,
             apply_nginx_tuning,
             apply_system_tuning,
             run_benchmark,
@@ -631,6 +685,7 @@ def build(model) -> DiagnosisWorkflow:
     test_tools = {
         "inspect_nginx_config": inspect_nginx_config,
         "inspect_system_tuning": inspect_system_tuning,
+        "save_rca": save_rca,
         "apply_nginx_tuning": apply_nginx_tuning,
         "apply_system_tuning": apply_system_tuning,
         "run_benchmark": run_benchmark,
@@ -684,6 +739,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
         after_rps=after_rps,
         improvement_pct=improvement_pct,
         notes=notes,
+        rca_records=list(state.get("rca_records") or []),
     )
 
 

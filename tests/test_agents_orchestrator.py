@@ -17,6 +17,15 @@ class FakeMemory:
     def save_context(self, *args):
         self.saved.append(args)
 
+    def get_contexts(self, session_id, type=None, source_prefix=None, limit=None):
+        del session_id, type, source_prefix, limit
+        return [
+            {
+                "source": "baseline:post",
+                "content": '{"summary":{"nginx_worker_count":112,"nginx_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":1024}}',
+            }
+        ]
+
     def save_fact(self, **kwargs):
         self.saved.append(("fact", kwargs))
 
@@ -228,6 +237,12 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_snapshot",
+        lambda *a, **k: {"scope": k["scope"], "source": k["source"], "host": "localhost", "summary": {}, "sections": {}},
+    )
+    monkeypatch.setattr(orchestrator, "persist_snapshot", lambda *a, **k: None)
     for name in ["panel", "step", "check", "status", "benchmark", "log"]:
         monkeypatch.setattr(orchestrator.logger, name, lambda *a, **k: None)
     report = asyncio.run(orchestrator.run("model", deps))
@@ -240,5 +255,7 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         ["- x"],
         {"small": {"rps": 1.0, "p50": 1.0, "p99": 2.0, "cpu_pct": 3.0, "error_rate": 0.0}},
         [{"parameter": "p", "value": "v", "impact": 1.0}],
+        "- baseline:post: workers=112",
     )
     assert "Already applied (skip)" in prompt
+    assert "Telemetry:" in prompt
