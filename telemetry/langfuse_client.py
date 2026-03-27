@@ -36,6 +36,7 @@ class LangfuseClient:
             and hasattr(client, "update_current_generation")
         )
         self._span_api_supported = bool(client and hasattr(client, "start_as_current_span"))
+        self._identity_kwargs_supported = True
 
     @property
     def enabled(self) -> bool:
@@ -97,12 +98,7 @@ class LangfuseClient:
             return
 
         merged = {**self._base_metadata, **(metadata or {})}
-        with self._client.start_as_current_observation(
-            name=name,
-            input=_jsonable(input),
-            metadata=_jsonable(merged),
-            **self._identity_kwargs(),
-        ) as observation:
+        with self._make_observation_context(name=name, input=input, metadata=merged) as observation:
             self._last_trace_url = self._safe_trace_url()
             try:
                 yield observation
@@ -196,9 +192,9 @@ class LangfuseClient:
                     name=name,
                     model=model,
                     input=_jsonable(input),
-                    metadata=_jsonable(merged),
+                    metadata=_jsonable(self._with_identity_metadata(merged)),
                     model_parameters=_jsonable(model_parameters or {}),
-                    **self._identity_kwargs(),
+                    **self._safe_identity_kwargs(),
                 )
             except AttributeError:
                 self._generation_api_supported = False
@@ -207,18 +203,17 @@ class LangfuseClient:
                     "Generation API unavailable at runtime; falling back to observation spans",
                     "warn",
                 )
-        return self._client.start_as_current_observation(
+            except TypeError:
+                self._identity_kwargs_supported = False
+        return self._make_observation_context(
             name=name,
-            input=_jsonable(input),
-            metadata=_jsonable(
-                {
-                    **merged,
-                    "model": model,
-                    "model_parameters": _jsonable(model_parameters or {}),
-                    "compat_mode": "observation_generation_fallback",
-                }
-            ),
-            **self._identity_kwargs(),
+            input=input,
+            metadata={
+                **merged,
+                "model": model,
+                "model_parameters": _jsonable(model_parameters or {}),
+                "compat_mode": "observation_generation_fallback",
+            },
         )
 
     def update_span(self, *, output: Any = None, metadata: dict[str, Any] | None = None) -> None:
@@ -244,9 +239,9 @@ class LangfuseClient:
             name=name,
             input=_jsonable(input),
             output=_jsonable(output),
-            metadata=_jsonable(metadata or {}),
+            metadata=_jsonable(self._with_identity_metadata(metadata or {})),
             level=level,
-            **self._identity_kwargs(),
+            **self._safe_identity_kwargs(),
         )
 
     def flush(self) -> None:
@@ -274,16 +269,27 @@ class LangfuseClient:
                 return self._client.start_as_current_span(
                     name=name,
                     input=_jsonable(input),
-                    metadata=_jsonable(merged),
-                    **self._identity_kwargs(),
+                    metadata=_jsonable(self._with_identity_metadata(merged)),
+                    **self._safe_identity_kwargs(),
                 )
             except AttributeError:
                 self._span_api_supported = False
+            except TypeError:
+                self._identity_kwargs_supported = False
+        return self._make_observation_context(name=name, input=input, metadata=merged)
+
+    def _make_observation_context(
+        self,
+        *,
+        name: str,
+        input: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ):
         return self._client.start_as_current_observation(
             name=name,
             input=_jsonable(input),
-            metadata=_jsonable(merged),
-            **self._identity_kwargs(),
+            metadata=_jsonable(self._with_identity_metadata(metadata or {})),
+            **self._safe_identity_kwargs(),
         )
 
     def _identity_kwargs(self) -> dict[str, Any]:
@@ -293,6 +299,19 @@ class LangfuseClient:
         if self._user_id:
             kwargs["user_id"] = self._user_id
         return kwargs
+
+    def _safe_identity_kwargs(self) -> dict[str, Any]:
+        if not self._identity_kwargs_supported:
+            return {}
+        return self._identity_kwargs()
+
+    def _with_identity_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(metadata)
+        if self._session_id and "session_id" not in merged:
+            merged["session_id"] = self._session_id
+        if self._user_id and "user_id" not in merged:
+            merged["user_id"] = self._user_id
+        return merged
 
 
 def summarize_messages(messages: list[Any]) -> list[dict[str, Any]]:
