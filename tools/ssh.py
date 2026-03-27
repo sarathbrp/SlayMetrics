@@ -115,9 +115,9 @@ class SSHClient:
         self.disconnect()
 
 
-def from_config(cfg: dict) -> LocalClient | SSHClient:
-    t = cfg["target"]
-    host = t["host"]
+def from_config(cfg: dict, section: str = "target") -> LocalClient | SSHClient:
+    t = cfg[section]
+    host = t.get("host", "localhost")
     if host in ("localhost", "127.0.0.1", "::1"):
         return LocalClient()
     return SSHClient(

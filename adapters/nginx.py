@@ -25,10 +25,12 @@ HTTP_DIRECTIVES = {
 
 
 class NginxAdapter(ServiceAdapter):
-    def __init__(self, cfg: dict, ssh: LocalClient | SSHClient):
+    def __init__(self, cfg: dict, ssh: LocalClient | SSHClient,
+                 bench: LocalClient | SSHClient | None = None):
         self._cfg = cfg["service"]
         self._bench_cfg = self._cfg["benchmark"]
-        self._ssh = ssh
+        self._ssh = ssh        # DUT — config changes, sar monitoring
+        self._bench = bench or ssh  # Bench node — wrk2 runs here
 
     def get_config(self) -> dict:
         result = self._ssh.execute(f"cat {self._cfg['config_path']}")
@@ -147,32 +149,30 @@ class NginxAdapter(ServiceAdapter):
     def benchmark(self, duration: int = 30, url: str = "") -> BenchmarkResult:
         target_url = url or self._bench_cfg.get("small_file_url", "http://localhost/")
         threads = self._bench_cfg.get("threads", 4)
-        connections = self._bench_cfg.get("connections", 100)
-        rate = self._bench_cfg.get("rate", 2000)
+        connections = self._bench_cfg.get("connections", 400)
+        rate = self._bench_cfg.get("rate", 150000)
 
-        # Run wrk2 + resource monitoring in a single compound command
-        cmd = (
-            f"sar -u {duration} 1 > /tmp/slay_sar.log 2>&1 & "
-            f"wrk2 -t{threads} -c{connections} -d{duration}s -R{rate} "
-            f"--latency {target_url}; "
-            f"wait; "
-            f"echo '---SAR---'; cat /tmp/slay_sar.log 2>/dev/null; "
-            f"echo '---MEM---'; free -m 2>/dev/null | grep Mem"
+        # Start sar on DUT for resource monitoring
+        self._ssh.execute(
+            f"sar -u {duration} 1 > /tmp/slay_sar.log 2>&1 &"
         )
-        result = self._ssh.execute(cmd, timeout=duration + 60)
-        stdout = result.stdout
 
-        # Split wrk2 output from resource data
-        wrk_output = stdout.split("---SAR---")[0] if "---SAR---" in stdout else stdout
-        bench = _parse_wrk2(wrk_output, duration, target_url)
+        # Run wrk2 on bench node (may be same machine or separate)
+        wrk_cmd = (
+            f"wrk2 -t{threads} -c{connections} -d{duration}s -R{rate} "
+            f"--latency {target_url}"
+        )
+        result = self._bench.execute(wrk_cmd, timeout=duration + 60)
+        bench = _parse_wrk2(result.stdout, duration, target_url)
 
-        # Parse resource usage (graceful fallback if sar not installed)
-        if "---SAR---" in stdout:
-            sar_section = stdout.split("---SAR---")[1].split("---MEM---")[0]
-            bench.cpu_pct = _parse_sar_avg(sar_section)
-        if "---MEM---" in stdout:
-            mem_section = stdout.split("---MEM---")[1].strip()
-            bench.mem_mb = _parse_free_used(mem_section)
+        # Collect resource data from DUT
+        sar_result = self._ssh.execute(
+            "sleep 2; cat /tmp/slay_sar.log 2>/dev/null"
+        )
+        bench.cpu_pct = _parse_sar_avg(sar_result.stdout)
+
+        mem_result = self._ssh.execute("free -m 2>/dev/null | grep Mem")
+        bench.mem_mb = _parse_free_used(mem_result.stdout)
 
         return bench
 

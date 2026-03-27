@@ -202,13 +202,20 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
     # Load knowledge base (facts/ folder) — skips if unchanged
     load_knowledge(cfg, embedder, memory)
 
-    ssh = ssh_from_config(cfg)
+    ssh = ssh_from_config(cfg, section="target")
     ssh.connect()
     host = cfg["target"]["host"]
     mode = "local (subprocess)" if host in ("localhost", "127.0.0.1", "::1") else f"SSH ({host})"
-    logger.status("main", f"Target: {host} via {mode}")
+    logger.status("main", f"DUT: {host} via {mode}")
 
-    adapter = load_adapter(cfg, ssh)
+    # Bench executor — where wrk2 runs (may be same machine or separate)
+    bench = ssh_from_config(cfg, section="bench") if "bench" in cfg else ssh
+    bench.connect()
+    bench_host = cfg.get("bench", {}).get("host", host)
+    bench_mode = "local (subprocess)" if bench_host in ("localhost", "127.0.0.1", "::1") else f"SSH ({bench_host})"
+    logger.status("main", f"Bench: {bench_host} via {bench_mode}")
+
+    adapter = load_adapter(cfg, ssh, bench=bench)
     model = get_model(cfg)
 
     profile_name = cfg["llm"]["active_profile"]
@@ -250,6 +257,8 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
         # Silent cleanup
         logger.close()
         ssh.disconnect()
+        if bench is not ssh:
+            bench.disconnect()
         memory.disconnect()
 
 

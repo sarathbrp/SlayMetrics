@@ -31,7 +31,13 @@ memory:
   password_env: TIDB_PASSWORD          # pragma: allowlist secret
 
 target:
-  host: 192.168.1.100
+  host: 192.168.1.100              # DUT — nginx runs here, agent SSH tunes this
+  ssh_user: root
+  ssh_key: ~/.ssh/id_rsa
+  ssh_timeout: 30
+
+bench:
+  host: localhost                   # where wrk2 runs (localhost = this machine)
   ssh_user: root
   ssh_key: ~/.ssh/id_rsa
   ssh_timeout: 30
