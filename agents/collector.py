@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from dataclasses import dataclass
 
 from agents import AgentDeps
 from core.log import log
 
 
-class CollectionOutput(BaseModel):
+@dataclass
+class CollectionOutput:
     checks_run: list[str]
     findings: list[str]
     raw_summary: str
 
 
 async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
-    """Collect service config, logs, and metrics directly — no LLM needed."""
+    del model, task
     checks_run = []
     findings = []
 
-    # 1. Service config
     log("collector", "Reading service config...", "action")
     config = deps.adapter.get_config()
     config_preview = config.get("raw", "")[:2000]
@@ -33,7 +33,6 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
     deps.token_counter.tool_calls += 1
     log("collector", f"Config loaded ({len(config.get('raw', ''))} chars)", "info")
 
-    # 2. Service logs
     log("collector", "Fetching service logs...", "action")
     logs = deps.adapter.get_logs(tail=50)
     deps.memory.save_context(
@@ -49,7 +48,6 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
     deps.token_counter.tool_calls += 1
     log("collector", f"{log_lines} log lines retrieved", "info")
 
-    # 3. Live metrics
     log("collector", "Collecting live metrics...", "action")
     metrics = deps.adapter.get_metrics()
     deps.memory.save_context(
@@ -60,8 +58,8 @@ async def run(model, deps: AgentDeps, task: str) -> CollectionOutput:
         "live service metrics snapshot",
     )
     checks_run.append("live_metrics")
-    for k, v in metrics.items():
-        findings.append(f"{k}: {str(v)[:100]}")
+    for key, value in metrics.items():
+        findings.append(f"{key}: {str(value)[:100]}")
     deps.token_counter.tool_calls += 1
     log("collector", f"{len(metrics)} metric groups collected", "info")
 

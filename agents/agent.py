@@ -2,49 +2,29 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
-
-from pydantic import BaseModel, Field, field_validator
-from pydantic_ai import Agent, RunContext
 
 from adapters.base import BenchmarkResult
 from agents import AgentDeps, TokenCounter
 from core.log import llm_call, log, tokens, tool_call, tool_result
 
 
-class DiagnosisOutput(BaseModel):
-    """Minimal output — orchestrator builds the full report from tool returns."""
+@dataclass
+class DiagnosisOutput:
+    """Canonical internal diagnosis result built in Python after the graph run."""
 
     nginx_applied: bool
     system_applied: bool
     after_rps: float = 0.0
     improvement_pct: float = 0.0
-    notes: str = Field(default="")
+    notes: str = ""
 
-    @field_validator("after_rps", "improvement_pct", mode="before")
-    @classmethod
-    def _coerce_float(cls, value: Any) -> float:
-        if value in (None, ""):
-            return 0.0
-        if isinstance(value, bool):
-            return float(value)
-        if isinstance(value, (int, float)):
-            return float(value)
-        try:
-            return float(str(value).strip())
-        except (TypeError, ValueError):
-            return 0.0
-
-    @field_validator("notes", mode="before")
-    @classmethod
-    def _coerce_notes(cls, value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, (list, dict)):
-            return json.dumps(value, ensure_ascii=True)
-        return str(value)
+    def __post_init__(self) -> None:
+        self.after_rps = _coerce_float(self.after_rps)
+        self.improvement_pct = _coerce_float(self.improvement_pct)
+        self.notes = _coerce_notes(self.notes)
 
 
 SYSTEM_PROMPT = """\
@@ -55,6 +35,14 @@ You are SlayMetricsAgent. Steps:
 4. Benchmark AFTER (baselines are provided — do NOT benchmark before)
 5. Call save_findings with both results in one call
 6. Return one short plain-text summary sentence
+
+For apply_nginx_tuning and apply_system_tuning:
+- Pass a single string argument named payload
+- payload must be a JSON object string, for example: {"access_log":"off","listen_backlog":"65535"}
+
+For save_findings:
+- Pass a single string argument named findings_json
+- findings_json must be a JSON array string
 
 Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
 - worker_connections=65536
@@ -90,21 +78,71 @@ Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
 """
 
 
-def build(model) -> Agent:
+class DiagnosisWorkflow:
+    def __init__(self, model, state: dict[str, Any], test_tools: dict[str, Any], tool_factory):
+        self.model = model
+        self._slaymetrics_state = state
+        self._tool_factory = tool_factory
+        self._function_toolset = SimpleNamespace(
+            tools={name: SimpleNamespace(function=fn) for name, fn in test_tools.items()}
+        )
+
+    async def run(self, context_prompt: str, deps: AgentDeps):
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langgraph.graph import END, StateGraph
+        from langgraph.graph.message import add_messages
+        from langgraph.prebuilt import ToolNode
+
+        from typing import Annotated, TypedDict
+
+        class GraphState(TypedDict):
+            messages: Annotated[list, add_messages]
+
+        tools = self._tool_factory(deps)
+        llm = self.model.bind_tools(tools)
+
+        def call_model(state: GraphState):
+            messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+            response = llm.invoke(messages)
+            return {"messages": [response]}
+
+        def route(state: GraphState):
+            last = state["messages"][-1]
+            return "tools" if getattr(last, "tool_calls", None) else "end"
+
+        graph = StateGraph(GraphState)
+        graph.add_node("agent", call_model)
+        graph.add_node("tools", ToolNode(tools))
+        graph.set_entry_point("agent")
+        graph.add_conditional_edges("agent", route, {"tools": "tools", "end": END})
+        graph.add_edge("tools", "agent")
+
+        app = graph.compile()
+        result = await app.ainvoke(
+            {"messages": [HumanMessage(content=context_prompt)]},
+            config={"recursion_limit": 25},
+        )
+        messages = result["messages"]
+        output = _extract_final_text(messages)
+        usage = _aggregate_usage(messages)
+        return SimpleNamespace(
+            output=output,
+            usage=lambda: SimpleNamespace(
+                input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"]
+            ),
+            all_messages=lambda: messages,
+        )
+
+
+def build(model) -> DiagnosisWorkflow:
     state: dict[str, Any] = {
         "nginx_applied": False,
         "system_applied": False,
         "after_rps": 0.0,
         "findings": [],
     }
-
-    agent: Agent[AgentDeps, str] = Agent(
-        model,
-        deps_type=AgentDeps,
-        output_type=str,
-        system_prompt=SYSTEM_PROMPT,
-    )
-    setattr(agent, "_slaymetrics_state", state)
+    memory_query_count = 0
+    max_memory_queries = 3
 
     def _normalize_changes(
         raw_changes: dict[str, str] | str | None, tool_name: str
@@ -116,20 +154,18 @@ def build(model) -> Agent:
             try:
                 changes_obj = json.loads(changes_obj)
             except json.JSONDecodeError as e:
-                return None, f"{tool_name}: invalid JSON for 'changes' ({e.msg})"
+                return None, f"{tool_name}: invalid JSON payload ({e.msg})"
 
         if not isinstance(changes_obj, dict):
-            return None, f"{tool_name}: 'changes' must be a dictionary"
+            return None, f"{tool_name}: payload must be a dictionary"
 
         normalized: dict[str, str] = {}
         for key, value in changes_obj.items():
-            if not isinstance(key, str):
-                key = str(key)
-            key = key.lstrip(".")
+            key_str = str(key).lstrip(".")
             if isinstance(value, (dict, list)):
-                normalized[key] = json.dumps(value, separators=(",", ":"))
+                normalized[key_str] = json.dumps(value, separators=(",", ":"))
             else:
-                normalized[key] = str(value)
+                normalized[key_str] = str(value)
         return normalized, None
 
     def _coerce_tool_changes(
@@ -145,15 +181,17 @@ def build(model) -> Agent:
         for key, value in extra_changes.items():
             if key == "changes":
                 continue
-            key = str(key).lstrip(".")
+            key_str = str(key).lstrip(".")
             if isinstance(value, (dict, list)):
-                merged[key] = json.dumps(value, separators=(",", ":"))
+                merged[key_str] = json.dumps(value, separators=(",", ":"))
             else:
-                merged[key] = str(value)
+                merged[key_str] = str(value)
         return merged, None
 
-    # Proven optimal values — inspect compares against these
-    NGINX_TARGETS = {
+    def _parse_payload_arg(payload: str | None, tool_name: str) -> tuple[dict[str, str] | None, str | None]:
+        return _normalize_changes(payload, tool_name)
+
+    nginx_targets = {
         "worker_connections": "65536",
         "worker_rlimit_nofile": "200000",
         "worker_cpu_affinity": "auto",
@@ -169,7 +207,7 @@ def build(model) -> Agent:
         "aio": "threads",
     }
 
-    SYSTEM_TARGETS = {
+    system_targets = {
         "net.core.somaxconn": "65535",
         "net.ipv4.tcp_max_syn_backlog": "65535",
         "net.core.netdev_max_backlog": "65535",
@@ -183,42 +221,31 @@ def build(model) -> Agent:
         "cpu_governor": "performance",
     }
 
-    @agent.tool
-    async def inspect_nginx_config(ctx: RunContext[AgentDeps]) -> str:
-        """Inspect nginx config and return only what needs fixing vs proven targets. Returns JSON string."""
+    def inspect_nginx_impl(deps: AgentDeps) -> dict:
         tool_call("inspect", "nginx config — comparing against proven fixes")
-        ssh = ctx.deps.ssh
-
-        raw = ssh.execute("nginx -T 2>/dev/null").stdout
-
-        # Parse current values
-        current = {}
-        for d in NGINX_TARGETS:
-            if d == "listen_backlog":
-                m = re.search(r"listen\s+.*backlog=(\d+)", raw)
-                current[d] = m.group(1) if m else "not set"
+        raw = deps.ssh.execute("nginx -T 2>/dev/null").stdout
+        current: dict[str, str] = {}
+        for directive in nginx_targets:
+            if directive == "listen_backlog":
+                match = re.search(r"listen\s+.*backlog=(\d+)", raw)
+                current[directive] = match.group(1) if match else "not set"
             else:
-                m = re.search(rf"^\s*{d}\s+(.+?);", raw, re.MULTILINE)
-                current[d] = m.group(1).strip() if m else "not set"
+                match = re.search(rf"^\s*{directive}\s+(.+?);", raw, re.MULTILINE)
+                current[directive] = match.group(1).strip() if match else "not set"
 
-        # Compare against targets
         needs_fixing = {}
         already_ok = []
-        for param, target in NGINX_TARGETS.items():
-            cur = current.get(param, "not set")
+        for parameter, target in nginx_targets.items():
+            cur = current.get(parameter, "not set")
             if cur == "not set" or cur != target:
-                needs_fixing[param] = {"current": cur, "target": target}
+                needs_fixing[parameter] = {"current": cur, "target": target}
             else:
-                already_ok.append(param)
+                already_ok.append(parameter)
 
-        result = {
-            "needs_fixing": needs_fixing,
-            "already_ok": already_ok,
-        }
-
-        ctx.deps.token_counter.tool_calls += 1
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        result = {"needs_fixing": needs_fixing, "already_ok": already_ok}
+        deps.token_counter.tool_calls += 1
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             "inspect_nginx",
             str(result),
@@ -227,17 +254,12 @@ def build(model) -> Agent:
         tool_result(
             "inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
-        return json.dumps(result)
+        return result
 
-    @agent.tool
-    async def inspect_system_tuning(ctx: RunContext[AgentDeps]) -> str:
-        """Inspect system tuning and return only what needs fixing vs proven targets. Returns JSON string."""
+    def inspect_system_impl(deps: AgentDeps) -> dict:
         tool_call("inspect", "system tuning — comparing against proven fixes")
-        ssh = ctx.deps.ssh
-
+        ssh = deps.ssh
         current = {}
-
-        # Sysctl params
         for key in [
             "net.core.somaxconn",
             "net.ipv4.tcp_max_syn_backlog",
@@ -248,43 +270,33 @@ def build(model) -> Agent:
             "net.core.rmem_max",
             "net.core.wmem_max",
         ]:
-            r = ssh.execute(f"sysctl -n {key} 2>/dev/null")
-            current[key] = r.stdout.strip()
+            result = ssh.execute(f"sysctl -n {key} 2>/dev/null")
+            current[key] = result.stdout.strip()
 
-        # THP
-        r = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
-        m = re.search(r"\[(\w+)\]", r.stdout)
-        current["transparent_hugepage"] = m.group(1) if m else "unknown"
-
-        # SELinux
+        thp = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
+        match = re.search(r"\[(\w+)\]", thp.stdout)
+        current["transparent_hugepage"] = match.group(1) if match else "unknown"
         current["selinux"] = (
             ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip().lower()
         )
-
-        # CPU governor
-        r = ssh.execute(
+        governor = ssh.execute(
             "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
         )
-        current["cpu_governor"] = r.stdout.strip() or "not available"
+        current["cpu_governor"] = governor.stdout.strip() or "not available"
 
-        # Compare against targets
         needs_fixing = {}
         already_ok = []
-        for param, target in SYSTEM_TARGETS.items():
-            cur = current.get(param, "unknown")
+        for parameter, target in system_targets.items():
+            cur = current.get(parameter, "unknown")
             if cur != target:
-                needs_fixing[param] = {"current": cur, "target": target}
+                needs_fixing[parameter] = {"current": cur, "target": target}
             else:
-                already_ok.append(param)
+                already_ok.append(parameter)
 
-        result = {
-            "needs_fixing": needs_fixing,
-            "already_ok": already_ok,
-        }
-
-        ctx.deps.token_counter.tool_calls += 1
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        result = {"needs_fixing": needs_fixing, "already_ok": already_ok}
+        deps.token_counter.tool_calls += 1
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             "inspect_system",
             str(result),
@@ -293,75 +305,64 @@ def build(model) -> Agent:
         tool_result(
             "inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
-        return json.dumps(result)
+        return result
 
-    @agent.tool
-    async def apply_nginx_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str | None = None, **kwargs: Any
-    ) -> str:
-        """Apply multiple nginx config changes in one batch, then reload.
-        Example: {"sendfile": "on", "tcp_nopush": "on",
-        "open_file_cache": "max=10000 inactive=60s"}
-        """
+    def apply_nginx_impl(deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any) -> dict:
         normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_nginx")
         if parse_error:
             tool_call("apply_nginx", "invalid input payload")
             tool_result("apply_nginx", f"FAILED: {parse_error}")
-            ctx.deps.token_counter.tool_calls += 1
+            deps.token_counter.tool_calls += 1
             return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
 
-        if normalized_changes is None:
-            return {"applied": [], "failed": [], "reload": "FAILED", "error": "invalid payload"}
-        changes_dict = normalized_changes
-        allowed = getattr(ctx.deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
+        changes_dict = normalized_changes or {}
+        allowed = getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
         unsupported: list[str] = []
         if allowed is not None:
-            unsupported = [k for k in changes_dict if k not in allowed]
-            changes_dict = {k: v for k, v in changes_dict.items() if k in allowed}
+            unsupported = [key for key in changes_dict if key not in allowed]
+            changes_dict = {key: value for key, value in changes_dict.items() if key in allowed}
             if unsupported and not changes_dict:
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
                 tool_call("apply_nginx", "unsupported directives")
                 tool_result("apply_nginx", f"FAILED: {error}")
-                ctx.deps.token_counter.tool_calls += 1
+                deps.token_counter.tool_calls += 1
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
         tool_call("apply_nginx", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
 
-        config_path = ctx.deps.config["service"]["config_path"]
-        batch_backup = f"/tmp/slay_nginx_batch_{ctx.deps.session_id}.conf"
-        ctx.deps.ssh.execute(f"cp {config_path} {batch_backup}")
+        config_path = deps.config["service"]["config_path"]
+        batch_backup = f"/tmp/slay_nginx_batch_{deps.session_id}.conf"
+        deps.ssh.execute(f"cp {config_path} {batch_backup}")
 
         applied = []
         failed = list(unsupported)
         for param, value in changes_dict.items():
-            success = ctx.deps.adapter.apply_config(param, value)
+            success = deps.adapter.apply_config(param, value)
             if success:
                 applied.append(param)
             else:
                 failed.append(param)
-                ctx.deps.ssh.execute(f"cp {batch_backup} {config_path}")
+                deps.ssh.execute(f"cp {batch_backup} {config_path}")
                 result = {
                     "applied": applied,
                     "failed": failed,
                     "reload": "FAILED",
                     "error": f"failed to apply nginx directive: {param}",
                 }
-                ctx.deps.token_counter.tool_calls += 1
-                ctx.deps.memory.save_context(
-                    ctx.deps.session_id,
+                deps.token_counter.tool_calls += 1
+                deps.memory.save_context(
+                    deps.session_id,
                     "command_output",
                     f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
                     f"applied={applied} failed={failed}",
                     "nginx batch apply",
                 )
                 tool_result("apply_nginx", f"FAILED: {result['error']}")
-                return json.dumps(result)
+                return result
 
-        # Test config before reload
-        test = ctx.deps.ssh.execute("nginx -t 2>&1")
+        test = deps.ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
-            # Config is broken — revert to backup and report error
-            ctx.deps.ssh.execute(f"cp {batch_backup} {config_path}")
+            deps.ssh.execute(f"cp {batch_backup} {config_path}")
             error_msg = test.stdout.strip()[:200]
             result = {
                 "applied": applied,
@@ -369,168 +370,134 @@ def build(model) -> Agent:
                 "reload": "FAILED",
                 "error": f"nginx -t failed: {error_msg}",
             }
-            ctx.deps.token_counter.tool_calls += 1
-            ctx.deps.memory.save_context(
-                ctx.deps.session_id,
+            deps.token_counter.tool_calls += 1
+            deps.memory.save_context(
+                deps.session_id,
                 "command_output",
                 f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
                 f"applied={applied} failed={failed}",
                 "nginx batch apply failed",
             )
             tool_result("apply_nginx", f"FAILED: {error_msg}")
-            return json.dumps(result)
+            return result
 
-        # Config valid — reload
-        reload_ok = ctx.deps.adapter.reload()
-
-        result = {
-            "applied": applied,
-            "failed": failed,
-            "reload": "OK" if reload_ok else "FAILED",
-        }
+        reload_ok = deps.adapter.reload()
+        result = {"applied": applied, "failed": failed, "reload": "OK" if reload_ok else "FAILED"}
         if unsupported:
             result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
         state["nginx_applied"] = state["nginx_applied"] or bool(applied and reload_ok)
         summary = f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}"
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
             summary,
             "nginx batch apply",
         )
         tool_result("apply_nginx", summary)
-        return json.dumps(result)
+        return result
 
-    @agent.tool
-    async def apply_system_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str | None = None, **kwargs: Any
-    ) -> str:
-        """Apply multiple sysctl/kernel changes in one batch.
-        Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never",
-        "selinux": "permissive"}
-        """
+    def apply_system_impl(deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any) -> dict:
         normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_system")
         if parse_error:
             tool_call("apply_system", "invalid input payload")
             tool_result("apply_system", f"FAILED: {parse_error}")
-            ctx.deps.token_counter.tool_calls += 1
+            deps.token_counter.tool_calls += 1
             return {"applied": {}, "failed": {"_input": parse_error}}
 
-        if normalized_changes is None:
-            return {"applied": {}, "failed": {"_input": "invalid payload"}}
-        changes_dict = normalized_changes
-        tool_call(
-            "apply_system",
-            f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}",
-        )
+        changes_dict = normalized_changes or {}
+        tool_call("apply_system", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
 
-        ssh = ctx.deps.ssh
+        ssh = deps.ssh
         applied = {}
         failed = {}
-
         for param, value in changes_dict.items():
             if param == "transparent_hugepage":
-                r = ssh.execute(f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1")
-                if r.ok:
+                result = ssh.execute(
+                    f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
+                )
+                if result.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()
+                    failed[param] = result.stderr.strip()
             elif param == "selinux":
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
-                r = ssh.execute(f"setenforce {mode} 2>&1")
+                ssh.execute(f"setenforce {mode} 2>&1")
                 applied[param] = value
             elif param == "cpu_governor":
-                r = ssh.execute(
+                result = ssh.execute(
                     f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>&1"
                 )
-                if r.ok:
+                if result.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()
+                    failed[param] = result.stderr.strip()
             elif param == "net.ipv4.ip_local_port_range":
-                # ip_local_port_range needs quotes around the value
-                r = ssh.execute(f'sysctl -w net.ipv4.ip_local_port_range="{value}" 2>&1')
-                if r.ok:
+                result = ssh.execute(f'sysctl -w net.ipv4.ip_local_port_range="{value}" 2>&1')
+                if result.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()
+                    failed[param] = result.stderr.strip()
             else:
-                r = ssh.execute(f"sysctl -w {param}={value} 2>&1")
-                if r.ok:
+                result = ssh.execute(f"sysctl -w {param}={value} 2>&1")
+                if result.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()
+                    failed[param] = result.stderr.strip()
 
-        result = {"applied": applied, "failed": failed}
-
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
         state["system_applied"] = state["system_applied"] or bool(applied)
         summary = f"applied={list(applied.keys())} failed={list(failed.keys())}"
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             f"apply_system:{','.join(changes_dict.keys())}"[:250],
             summary,
             "system batch apply",
         )
         tool_result("apply_system", summary)
-        return json.dumps(result)
+        return {"applied": applied, "failed": failed}
 
-    @agent.tool
-    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30) -> str:
-        """Run wrk2 benchmark against the small file URL. Returns RPS and latency."""
-        bench_cfg = ctx.deps.config["service"]["benchmark"]
+    def run_benchmark_impl(deps: AgentDeps, duration: int = 30) -> dict:
+        bench_cfg = deps.config["service"]["benchmark"]
         url = bench_cfg.get("small_file_url", "http://localhost/")
         bench_tool = bench_cfg.get("tool", "wrk2")
         benchmark_label = "benchmark.sh" if bench_tool == "hackathon" else "wrk2"
         tool_call("benchmark", f"{benchmark_label} {duration}s -> {url}")
-        result: BenchmarkResult = ctx.deps.adapter.benchmark(duration, url)
+        result: BenchmarkResult = deps.adapter.benchmark(duration, url)
         tool_result(
             "benchmark",
             f"{result.requests_per_sec:.1f} RPS, "
             f"p99={result.latency_p99_ms:.1f}ms, CPU={result.cpu_pct:.1f}%",
         )
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        deps.memory.save_context(
+            deps.session_id,
             "benchmark",
             url,
             f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms CPU={result.cpu_pct:.1f}%",
             "post-fix benchmark",
         )
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
         state["after_rps"] = float(result.requests_per_sec)
-        return json.dumps(result.__dict__)
+        return result.__dict__
 
-    _memory_query_count = 0
-    MAX_MEMORY_QUERIES = 3
-
-    @agent.tool
-    async def query_memory(ctx: RunContext[AgentDeps], symptom: str) -> str:
-        """Search the knowledge base and past findings. Limited to 3 queries. Returns JSON string."""
-        nonlocal _memory_query_count
-        _memory_query_count += 1
-        if _memory_query_count > MAX_MEMORY_QUERIES:
-            tool_call("memory", f"BLOCKED — limit reached ({MAX_MEMORY_QUERIES})")
+    def query_memory_impl(deps: AgentDeps, symptom: str) -> list[dict]:
+        nonlocal memory_query_count
+        memory_query_count += 1
+        if memory_query_count > max_memory_queries:
+            tool_call("memory", f"BLOCKED — limit reached ({max_memory_queries})")
             tool_result("memory", "limit reached; returning no additional memory results")
-            ctx.deps.token_counter.tool_calls += 1
-            return "[]"
-        tool_call("memory", f"query {_memory_query_count}/{MAX_MEMORY_QUERIES}: {symptom}")
-        results = ctx.deps.memory.semantic_search(symptom, ctx.deps.session_id, top_k=5)
+            deps.token_counter.tool_calls += 1
+            return []
+        tool_call("memory", f"query {memory_query_count}/{max_memory_queries}: {symptom}")
+        results = deps.memory.semantic_search(symptom, deps.session_id, top_k=5)
         tool_result("memory", f"{len(results)} results found")
-        ctx.deps.token_counter.tool_calls += 1
-        return json.dumps(results, default=str)
+        deps.token_counter.tool_calls += 1
+        return results
 
-    @agent.tool
-    async def save_findings(
-        ctx: RunContext[AgentDeps],
-        findings: list[dict[str, Any]],
-    ) -> bool:
-        """Save all fix results to memory in one call.
-        Each finding: {parameter, before_value, after_value, before_rps, after_rps, impact_pct}
-        """
+    def save_findings_impl(deps: AgentDeps, findings: list[dict[str, Any]]) -> bool:
         tool_call("save", f"{len(findings)} findings")
 
         def _coerce_optional_float(value: Any) -> float | None:
@@ -547,33 +514,135 @@ def build(model) -> Agent:
                     return None
             return None
 
-        for f in findings:
-            param = f.get("parameter", "unknown")
-            before_rps = _coerce_optional_float(f.get("before_rps", 0))
-            after_rps = _coerce_optional_float(f.get("after_rps", 0))
-            impact_pct = _coerce_optional_float(f.get("impact_pct", 0))
-            ctx.deps.memory.save_fact(
-                session_id=ctx.deps.session_id,
+        for finding in findings:
+            param = finding.get("parameter", "unknown")
+            before_rps = _coerce_optional_float(finding.get("before_rps", 0))
+            after_rps = _coerce_optional_float(finding.get("after_rps", 0))
+            impact_pct = _coerce_optional_float(finding.get("impact_pct", 0))
+            deps.memory.save_fact(
+                session_id=deps.session_id,
                 type="fix",
                 parameter=param,
-                reasoning=f.get("reasoning", "proven fix applied"),
-                before_value=f.get("before_value", ""),
-                after_value=f.get("after_value", ""),
+                reasoning=finding.get("reasoning", "proven fix applied"),
+                before_value=finding.get("before_value", ""),
+                after_value=finding.get("after_value", ""),
                 before_rps=before_rps,
                 after_rps=after_rps,
                 impact_pct=impact_pct,
             )
             impact_label = "n/a" if impact_pct is None else f"{impact_pct:+.1f}%"
             tool_result("save", f"{param} ({impact_label})")
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
         state["findings"] = findings
         return True
 
-    return agent
+    async def inspect_nginx_config(ctx) -> dict:
+        return inspect_nginx_impl(ctx.deps)
+
+    async def inspect_system_tuning(ctx) -> dict:
+        return inspect_system_impl(ctx.deps)
+
+    async def apply_nginx_tuning(ctx, changes: dict[str, str] | str | None = None, **kwargs: Any) -> dict:
+        return apply_nginx_impl(ctx.deps, changes, **kwargs)
+
+    async def apply_system_tuning(ctx, changes: dict[str, str] | str | None = None, **kwargs: Any) -> dict:
+        return apply_system_impl(ctx.deps, changes, **kwargs)
+
+    async def run_benchmark(ctx, duration: int = 30) -> dict:
+        return run_benchmark_impl(ctx.deps, duration)
+
+    async def query_memory(ctx, symptom: str) -> list[dict]:
+        return query_memory_impl(ctx.deps, symptom)
+
+    async def save_findings(ctx, findings: list[dict[str, Any]]) -> bool:
+        return save_findings_impl(ctx.deps, findings)
+
+    def tool_factory(deps: AgentDeps):
+        from langchain_core.tools import tool
+
+        @tool
+        def inspect_nginx_config() -> dict:
+            """Inspect nginx config and return only what needs fixing vs proven targets."""
+            return inspect_nginx_impl(deps)
+
+        @tool
+        def inspect_system_tuning() -> dict:
+            """Inspect system tuning and return only what needs fixing vs proven targets."""
+            return inspect_system_impl(deps)
+
+        @tool
+        def apply_nginx_tuning(payload: str = "{}") -> dict:
+            """Apply multiple nginx config changes from a JSON object string payload."""
+            changes, parse_error = _parse_payload_arg(payload, "apply_nginx")
+            if parse_error:
+                tool_call("apply_nginx", "invalid input payload")
+                tool_result("apply_nginx", f"FAILED: {parse_error}")
+                deps.token_counter.tool_calls += 1
+                return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
+            return apply_nginx_impl(deps, changes)
+
+        @tool
+        def apply_system_tuning(payload: str = "{}") -> dict:
+            """Apply multiple system changes from a JSON object string payload."""
+            changes, parse_error = _parse_payload_arg(payload, "apply_system")
+            if parse_error:
+                tool_call("apply_system", "invalid input payload")
+                tool_result("apply_system", f"FAILED: {parse_error}")
+                deps.token_counter.tool_calls += 1
+                return {"applied": {}, "failed": {"_input": parse_error}}
+            return apply_system_impl(deps, changes)
+
+        @tool
+        def run_benchmark(duration: int = 30) -> dict:
+            """Run the post-fix benchmark."""
+            return run_benchmark_impl(deps, duration)
+
+        @tool
+        def query_memory(symptom: str) -> list[dict]:
+            """Search the knowledge base and past findings."""
+            return query_memory_impl(deps, symptom)
+
+        @tool
+        def save_findings(findings_json: str = "[]") -> bool:
+            """Save all findings from a JSON array string."""
+            try:
+                findings = json.loads(findings_json)
+            except json.JSONDecodeError as e:
+                tool_call("save", "invalid findings_json payload")
+                tool_result("save", f"FAILED: invalid findings_json ({e.msg})")
+                deps.token_counter.tool_calls += 1
+                return False
+            if not isinstance(findings, list):
+                tool_call("save", "invalid findings_json payload")
+                tool_result("save", "FAILED: findings_json must decode to a list")
+                deps.token_counter.tool_calls += 1
+                return False
+            return save_findings_impl(deps, findings)
+
+        return [
+            inspect_nginx_config,
+            inspect_system_tuning,
+            apply_nginx_tuning,
+            apply_system_tuning,
+            run_benchmark,
+            query_memory,
+            save_findings,
+        ]
+
+    test_tools = {
+        "inspect_nginx_config": inspect_nginx_config,
+        "inspect_system_tuning": inspect_system_tuning,
+        "apply_nginx_tuning": apply_nginx_tuning,
+        "apply_system_tuning": apply_system_tuning,
+        "run_benchmark": run_benchmark,
+        "query_memory": query_memory,
+        "save_findings": save_findings,
+    }
+    return DiagnosisWorkflow(model, state, test_tools, tool_factory)
 
 
 async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
-    """Run the single agent with full context."""
+    """Run the diagnosis workflow and derive the final structured result in Python."""
     llm_call("agent", "Starting diagnosis — sending context to LLM...")
     agent = build(model)
     state = getattr(agent, "_slaymetrics_state", {})
@@ -582,15 +651,15 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     inp, out = deps.token_counter.add(result.usage())
     llm_call("agent", f"LLM finished — {inp:,} in / {out:,} out tokens")
     tokens("agent", inp, out, deps.token_counter.summary())
+
     rows = deps.token_counter.tool_token_rows()
     if rows:
         top = ", ".join(
-            f"{r['tool']}={r['total_tokens']:,}t/{r['calls']}c"
-            for r in sorted(rows, key=lambda x: x["total_tokens"], reverse=True)[:5]
+            f"{row['tool']}={row['total_tokens']:,}t/{row['calls']}c"
+            for row in sorted(rows, key=lambda item: item["total_tokens"], reverse=True)[:5]
         )
         log("agent", f"Tool token attribution: {top}", "result")
 
-    profile = {}
     try:
         profile = deps.memory.get_profile(deps.session_id) or {}
     except Exception:
@@ -603,7 +672,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     if not notes:
         findings = state.get("findings") or []
         if findings:
-            params = ", ".join(str(f.get("parameter", "unknown")) for f in findings[:4])
+            params = ", ".join(str(finding.get("parameter", "unknown")) for finding in findings[:4])
             notes = f"Applied findings: {params}."
         else:
             notes = "Diagnosis completed."
@@ -617,57 +686,89 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     )
 
 
+def _extract_final_text(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "")))
+            text = "".join(text_parts).strip()
+            if text:
+                return text
+    return ""
+
+
+def _coerce_float(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _coerce_notes(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
+
+
 def _attribute_tool_tokens(run_result: Any, token_counter: TokenCounter) -> None:
-    """Approximate per-tool token attribution from model message usage deltas."""
     try:
         messages = run_result.all_messages()
     except Exception:
         return
 
-    pending_post_tools: list[str] = []
-    for msg in messages:
-        usage = getattr(msg, "usage", None)
-        parts = getattr(msg, "parts", None) or []
-
-        tool_names = [p.tool_name for p in parts if getattr(p, "part_kind", "") == "tool-call"]
-
-        if usage and pending_post_tools and not tool_names:
-            _distribute_usage(
-                token_counter,
-                pending_post_tools,
-                int(usage.input_tokens or 0),
-                int(usage.output_tokens or 0),
-                phase="post",
-            )
-            pending_post_tools = []
-
-        if usage and tool_names:
-            _distribute_usage(
-                token_counter,
-                tool_names,
-                int(usage.input_tokens or 0),
-                int(usage.output_tokens or 0),
-                phase="call",
-            )
-            pending_post_tools = list(tool_names)
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None) or {}
+        if not usage:
+            continue
+        input_tokens = (
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or usage.get("input_token_count")
+            or 0
+        )
+        output_tokens = (
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or usage.get("output_token_count")
+            or 0
+        )
+        if input_tokens or output_tokens:
+            token_counter.input_tokens += int(input_tokens)
+            token_counter.output_tokens += int(output_tokens)
 
 
-def _distribute_usage(
-    token_counter: TokenCounter,
-    tool_names: list[str],
-    input_tokens: int,
-    output_tokens: int,
-    phase: str,
-) -> None:
-    n = len(tool_names)
-    if n == 0:
-        return
-    in_base, in_rem = divmod(max(0, input_tokens), n)
-    out_base, out_rem = divmod(max(0, output_tokens), n)
-    for i, name in enumerate(tool_names):
-        in_part = in_base + (1 if i < in_rem else 0)
-        out_part = out_base + (1 if i < out_rem else 0)
-        if phase == "call":
-            token_counter.add_tool_tokens(name, calls=1, call_input=in_part, call_output=out_part)
-        else:
-            token_counter.add_tool_tokens(name, post_input=in_part, post_output=out_part)
+def _aggregate_usage(messages: list[Any]) -> dict[str, int]:
+    input_tokens = 0
+    output_tokens = 0
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None) or {}
+        if not usage:
+            continue
+        input_tokens += int(
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or usage.get("input_token_count")
+            or 0
+        )
+        output_tokens += int(
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or usage.get("output_token_count")
+            or 0
+        )
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}

@@ -16,6 +16,7 @@ from agents import AgentDeps, TokenCounter
 from core import log as logger
 from memory.embeddings import from_config as embedder_from_config
 from memory.tidb_store import from_config as tidb_from_config
+from models import create_model
 from tools.ssh import from_config as ssh_from_config
 
 
@@ -54,37 +55,7 @@ def load_config(path: str) -> dict:
 
 
 def get_model(cfg: dict):
-    from pydantic_ai.models.anthropic import AnthropicModel
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
-
-    profile_name = cfg["llm"]["active_profile"]
-    profile = cfg["llm"]["profiles"][profile_name]
-    logger.status(
-        "main", f"LLM profile: {profile_name} ({profile['backend']} / {profile['model']})"
-    )
-
-    match profile["backend"]:
-        case "claude":
-            api_key = os.environ.get(profile.get("api_key_env", "ANTHROPIC_API_KEY"))
-            if not api_key:
-                logger.log(
-                    "main", f"{profile.get('api_key_env', 'ANTHROPIC_API_KEY')} not set", "error"
-                )
-                sys.exit(1)
-            return AnthropicModel(profile["model"])
-        case "vllm" | "ollama":
-            provider = OpenAIProvider(
-                base_url=profile["base_url"],
-                api_key="ollama",  # pragma: allowlist secret
-            )
-            return OpenAIChatModel(
-                profile["model"],
-                provider=provider,
-            )
-        case _:
-            logger.log("main", f"Unknown backend: {profile['backend']}", "error")
-            sys.exit(1)
+    return create_model(cfg)
 
 
 def load_knowledge(cfg: dict, embedder, memory) -> None:

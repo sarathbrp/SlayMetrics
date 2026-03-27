@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from pydantic_ai.models.test import TestModel
-
 from agents import TokenCounter
 import agents.agent as diagnosis_agent
 from agents.agent import DiagnosisOutput, build
@@ -71,7 +69,7 @@ def _ctx():
 
 
 def test_apply_nginx_tuning_accepts_json_string_changes():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -89,7 +87,7 @@ def test_apply_nginx_tuning_accepts_json_string_changes():
 
 
 def test_apply_nginx_tuning_invalid_json_returns_structured_error():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -102,7 +100,7 @@ def test_apply_nginx_tuning_invalid_json_returns_structured_error():
 
 
 def test_apply_system_tuning_invalid_json_returns_structured_error():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     ctx = _ctx()
 
@@ -114,7 +112,7 @@ def test_apply_system_tuning_invalid_json_returns_structured_error():
 
 
 def test_apply_nginx_tuning_rejects_unsupported_directives():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -128,7 +126,7 @@ def test_apply_nginx_tuning_rejects_unsupported_directives():
 
 
 def test_apply_nginx_tuning_accepts_top_level_kwargs_shape():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -140,7 +138,7 @@ def test_apply_nginx_tuning_accepts_top_level_kwargs_shape():
 
 
 def test_apply_system_tuning_accepts_top_level_kwargs_shape():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     ctx = _ctx()
 
@@ -150,7 +148,7 @@ def test_apply_system_tuning_accepts_top_level_kwargs_shape():
 
 
 def test_apply_nginx_tuning_strips_leading_dot_from_keys():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -161,7 +159,7 @@ def test_apply_nginx_tuning_strips_leading_dot_from_keys():
 
 
 def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -201,7 +199,7 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
 
     ctx = _ctx()
     ctx.deps.adapter = FailingAdapter(ctx.deps.ssh)
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
 
     result = asyncio.run(tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}))
@@ -214,7 +212,7 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
 
 
 def test_save_findings_coerces_non_numeric_impact_pct():
-    agent = build(TestModel())
+    agent = build("model")
     tool = agent._function_toolset.tools["save_findings"].function
     ctx = _ctx()
 

@@ -188,28 +188,23 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     cfg = {
         "llm": {
             "active_profile": "v",
-            "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}},
+            "profiles": {"v": {"backend": "ollama", "model": "m", "base_url": "u"}},
         },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
     }
     monkeypatch.setitem(
         main.sys.modules,
-        "pydantic_ai.models.openai",
-        SimpleNamespace(OpenAIChatModel=lambda model, provider: ("model", model, provider)),
+        "langchain_ollama",
+        SimpleNamespace(ChatOllama=lambda **kwargs: ("ollama", kwargs)),
     )
     monkeypatch.setitem(
         main.sys.modules,
-        "pydantic_ai.providers.openai",
-        SimpleNamespace(OpenAIProvider=lambda base_url, api_key: ("provider", base_url, api_key)),
-    )
-    monkeypatch.setitem(
-        main.sys.modules,
-        "pydantic_ai.models.anthropic",
-        SimpleNamespace(AnthropicModel=lambda model: ("anthropic", model)),
+        "langchain_anthropic",
+        SimpleNamespace(ChatAnthropic=lambda **kwargs: ("anthropic", kwargs)),
     )
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
-    assert main.get_model(cfg)[0] == "model"
+    assert main.get_model(cfg)[0] == "ollama"
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     try:
@@ -230,7 +225,7 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     cfg_main = {
         "llm": {
             "active_profile": "v",
-            "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}},
+            "profiles": {"v": {"backend": "ollama", "model": "m", "base_url": "u"}},
         },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},

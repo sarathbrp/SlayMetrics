@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from pydantic_ai.models.test import TestModel
-
 from agents import TokenCounter
 from agents.agent import build
 
@@ -29,7 +27,7 @@ def test_query_memory_soft_cap_after_three_calls():
     )
     ctx = SimpleNamespace(deps=deps)
 
-    agent = build(TestModel())
+    agent = build("model")
     query_memory = agent._function_toolset.tools["query_memory"].function
 
     r1 = asyncio.run(query_memory(ctx, "cpu saturation"))

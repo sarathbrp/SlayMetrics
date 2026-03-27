@@ -1,26 +1,21 @@
 llm:
-  active_profile: ollama-local          # change this one line to switch LLM
+  active_profile: granite-local         # change this one line to switch LLM
 
   profiles:
-    granite-local:                     # default: fully local, air-gapped
-      backend: vllm
-      model: granite-3.1-8b-lab-v2.1
-      base_url: http://localhost:8000/v1
+    granite-local:                     # local Granite 4 via Ollama
+      backend: ollama
+      model: granite4:7b-a1b-h
+      base_url: http://localhost:11434
 
-    claude-remote:                     # best reasoning, requires API key
+    gpt-oss-local:                     # local GPT-OSS via Ollama
+      backend: ollama
+      model: gpt-oss-120b
+      base_url: http://localhost:11434
+
+    claude-remote:                     # remote Anthropic fallback
       backend: claude
       model: claude-opus-4-6
       api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
-
-    claude-haiku:                      # fast + cheap, good enough for diagnosis
-      backend: claude
-      model: claude-haiku-4-5-20251001
-      api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
-
-    ollama-local:                      # lightweight alternative, zero infra
-      backend: ollama
-      model: granite4:7b-a1b-h
-      base_url: http://localhost:11434/v1
 
 memory:
   backend: tidb

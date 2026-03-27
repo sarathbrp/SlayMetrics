@@ -86,8 +86,8 @@ else
 fi
 
 # ── 3. Python venv + deps ────────────────────────────────────────────────────
-if [ -f "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -c "import pydantic_ai" &>/dev/null 2>&1; then
-    ok "Python venv      $VENV_DIR (pydantic-ai installed)"
+if [ -f "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -c "import langgraph, langchain" &>/dev/null 2>&1; then
+    ok "Python venv      $VENV_DIR (LangChain/LangGraph deps installed)"
     PRESENT+=("pydeps")
 else
     miss "Python venv      not found or deps missing"

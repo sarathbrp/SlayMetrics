@@ -17,15 +17,15 @@ Every decision is logged with the data and reasoning that drove it. No black box
 
 ```
 Steps 1-4: Direct (subprocess + vector search) → zero LLM tokens
-Step 5:    ONE agent call with full context
+Step 5:    LangGraph diagnosis loop with model-selected tools
 Steps 6-8: Direct (wrk2 + template) → zero LLM tokens
 ```
 
-- **Single agent** with 7 consolidated tools (inspect, apply, benchmark, save)
+- **LangGraph runtime** with a single diagnosis workflow and 7 consolidated tools
 - **TiDB** pyramid memory (profile → facts → context) with vector search
 - **Cross-session learning** — agent remembers past fixes, never repeats
 - **Knowledge base** — Red Hat performance docs loaded via RAG from `facts/` folder
-- **LocalClient** — uses subprocess for localhost targets, SSH for remote
+- **LangChain model registry** — Granite, GPT-OSS, and Claude profiles
 
 ## Quick Start
 
@@ -55,7 +55,7 @@ vi config.yaml
 
 ```yaml
 llm:
-  active_profile: ollama-local     # or: granite-local, claude-haiku, claude-remote
+  active_profile: granite-local    # or: gpt-oss-local, claude-remote
 
 target:
   host: 127.0.0.1                  # localhost = subprocess, remote = SSH
@@ -95,10 +95,9 @@ Change one line in `config.yaml`:
 
 ```yaml
 llm:
-  active_profile: ollama-local      # local Granite 4 7B A1B via Ollama — default
-  active_profile: granite-local     # Granite 3.1 8B via vLLM — air-gapped
-  active_profile: claude-haiku      # Claude Haiku — optional remote fallback
-  active_profile: claude-remote     # Claude Opus — optional remote fallback
+  active_profile: granite-local     # local Granite 4 7B A1B via Ollama — default
+  active_profile: gpt-oss-local     # local GPT-OSS 120B via Ollama
+  active_profile: claude-remote     # Claude Opus — remote fallback
 ```
 
 ## Knowledge Base

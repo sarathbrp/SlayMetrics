@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from pydantic_ai.models.test import TestModel
-
 from adapters.base import BenchmarkResult
 from agents import TokenCounter, analyzer, benchmark, collector, remediation
 from core import orchestrator
@@ -130,7 +128,7 @@ def test_benchmark_and_collector_run():
 
 def test_analyzer_tools_and_run(monkeypatch):
     deps = _deps()
-    agent = analyzer.build(TestModel())
+    agent = analyzer.build("model")
     query_memory = agent._function_toolset.tools["query_memory"].function
     get_past_facts = agent._function_toolset.tools["get_past_facts"].function
     run_diagnostic = agent._function_toolset.tools["run_diagnostic_command"].function
@@ -166,7 +164,7 @@ def test_analyzer_tools_and_run(monkeypatch):
 
 def test_remediation_tools_and_run(monkeypatch):
     deps = _deps()
-    agent = remediation.build(TestModel())
+    agent = remediation.build("model")
     ctx = SimpleNamespace(deps=deps)
     assert (
         asyncio.run(agent._function_toolset.tools["run_benchmark"].function(ctx, 1))[
