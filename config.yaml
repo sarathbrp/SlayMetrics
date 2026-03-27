@@ -1,19 +1,19 @@
 llm:
-  active_profile: gpt-oss-local         # change this one line to switch LLM
+  active_profile: gpt-oss-api           # change this one line to switch LLM
 
   profiles:
-    granite-local:                     # local Granite 4 via Ollama
+    granite-api:                       # Granite 4 via Ollama API
       backend: ollama
       model: granite4:7b-a1b-h
       base_url: http://localhost:11434
 
-    gpt-oss-local:                     # GPT-OSS via OpenAI-compatible endpoint
+    gpt-oss-api:                       # GPT-OSS via OpenAI-compatible endpoint
       backend: openai
       model: gpt-oss-120b
       base_url: ${GPT_OSS_BASE_URL}
       api_key_env: GPT_OSS_API_KEY
 
-    claude-remote:                     # remote Anthropic fallback
+    claude-api:                        # Claude via Anthropic API
       backend: claude
       model: claude-opus-4-6
       api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret

@@ -55,7 +55,7 @@ vi config.yaml
 
 ```yaml
 llm:
-  active_profile: gpt-oss-local    # or: granite-local, claude-remote
+  active_profile: gpt-oss-api      # or: granite-api, claude-api
 
 target:
   host: 127.0.0.1                  # localhost = subprocess, remote = SSH
@@ -95,11 +95,11 @@ Change one line in `config.yaml`:
 
 ```yaml
 llm:
-  active_profile: gpt-oss-local     # GPT-OSS 120B via deployed OpenAI-compatible endpoint — default
-  active_profile: granite-local     # local Granite 4 7B A1B via Ollama
-  active_profile: claude-remote     # Claude Opus — remote fallback
+  active_profile: gpt-oss-api       # GPT-OSS 120B via deployed OpenAI-compatible endpoint — default
+  active_profile: granite-api       # Granite 4 7B A1B via Ollama API
+  active_profile: claude-api        # Claude Opus via Anthropic API
 
-`gpt-oss-local` reads its deployment settings from the environment:
+`gpt-oss-api` reads its deployment settings from the environment:
 
 ```bash
 export GPT_OSS_BASE_URL=http://your-gpt-oss-host:8002/v1
