@@ -7,12 +7,13 @@ from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 
 from adapters.base import BenchmarkResult
-from agents import AgentDeps, TokenCounter
+from agents import AgentDeps
 from core.log import llm_call, log, tokens, tool_call, tool_result
 
 try:
     from langgraph.graph.message import add_messages
 except ModuleNotFoundError:
+
     def add_messages(left: list[Any], right: list[Any]) -> list[Any]:
         return [*left, *right]
 
@@ -42,11 +43,18 @@ class DiagnosisOutput:
 
 
 SYSTEM_PROMPT = """\
-You are SlayMetricsAgent. Steps:
-1. Inspect nginx and system tuning
-2. Save structured RCA via save_rca before remediation
-3. Save transparent human-readable recommendations via save_recommendations before remediation
-4. Return one short plain-text summary sentence
+You are SlayMetricsAgent.
+
+Diagnostic sequence:
+1. Inspect NGINX configuration first.
+2. Inspect RHEL/kernel/system tuning second.
+3. Inspect IRQ distribution and CPU affinity last.
+4. Save structured RCA via save_rca after all three stages are reviewed.
+5. Save transparent human-readable recommendations via save_recommendations.
+6. Return one short plain-text summary sentence.
+
+Do not benchmark or apply changes during planning. Python will do one combined apply
+and one benchmark after planning is complete.
 
 For apply_nginx_tuning and apply_system_tuning:
 - Pass a structured object under the changes field
@@ -61,47 +69,31 @@ For save_rca:
 - Pass a structured list under the records field
 - Each RCA record must include symptom, root_cause, confidence, recommendation
 - evidence may be a list of short strings
-- Example: {"records":[{"symptom":"High p99 on small payloads","root_cause":"listen backlog and worker limits are below target","confidence":0.9,"recommendation":"Raise worker_connections and somaxconn","evidence":["small p99 above 1000ms","somaxconn below proven target"]}]}
+- Example: {"records":[{"symptom":"High p99","root_cause":"backlog too low","confidence":0.9}]}
 
 For save_recommendations:
 - Pass a structured list under the recommendations field
-- Each recommendation must include title, recommendation, rationale, expected_benefit, risk_level, validation, scope, changes
+- Each recommendation must include title, recommendation, rationale,
+  expected_benefit, risk_level, validation, scope, changes
 - scope must be nginx or system
 - changes must be a structured object of parameter -> target value
 - risk_level should be low, medium, or high
-- Example: {"recommendations":[{"title":"Raise connection limits","recommendation":"Increase worker_connections","rationale":"Current limits are below proven target values","expected_benefit":"Higher small-file RPS and lower tail latency","risk_level":"low","validation":"Re-run small workload and compare RPS/p99","scope":"nginx","changes":{"worker_connections":"65536"}}]}
+- Example: {"recommendations":[{"title":"Raise limit","scope":"nginx","changes":{"aio":"threads"}}]}
 
-Proven nginx fixes (bare metal, 112 cores, 2 NUMA nodes, 25Gbps NIC):
-- worker_connections=65536
-- worker_rlimit_nofile=200000
-- worker_cpu_affinity=auto
-- open_file_cache=max=200000 inactive=60s
-- open_file_cache_valid=30s
-- open_file_cache_min_uses=2
-- access_log=off
-- tcp_nodelay=on
-- keepalive_requests=10000
-- keepalive_timeout=30
-- reset_timedout_connection=on
-- listen_backlog=65535
-- aio=threads
-
-Proven system fixes:
-- net.core.somaxconn=65535
-- net.ipv4.tcp_max_syn_backlog=65535
-- net.core.netdev_max_backlog=65535
-- net.core.rmem_max=16777216
-- net.core.wmem_max=16777216
-- net.ipv4.tcp_tw_reuse=1
-- net.ipv4.tcp_max_tw_buckets=2000000
-- net.ipv4.ip_local_port_range=1024 65535
-- transparent_hugepage=never
-- selinux=permissive
-- cpu_governor=performance
+Use the inspect tool outputs as the source of truth for current values and candidate target values.
+Do not invent target values outside the inspect outputs.
 
 Do NOT apply gzip — test files are random binary data, compression wastes CPU.
 
-Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark. Do not call apply_nginx_tuning, apply_system_tuning, run_benchmark, or save_findings yourself; Python will execute saved recommendations after you finish planning.
+Rules:
+- Stage 1 must focus on NGINX configuration only.
+- Stage 2 must focus on RHEL/kernel/system tuning only.
+- Stage 3 must focus on IRQ distribution / CPU affinity evidence only.
+- Only recommend IRQ-related action if the IRQ stage evidence supports it.
+- Skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
+- Do not call apply_nginx_tuning, apply_system_tuning, run_benchmark,
+  or save_findings yourself; Python will execute saved recommendations
+  after you finish planning.
 """
 
 
@@ -244,8 +236,84 @@ def build(model) -> DiagnosisWorkflow:
         "cpu_governor": "performance",
     }
 
+    def inspect_irq_impl(deps: AgentDeps) -> dict:
+        tool_call("inspect", "irq distribution — checking for IRQ lock and CPU spread")
+        ssh = deps.ssh
+        interrupts = ssh.execute(
+            "cat /proc/interrupts | grep -E 'eth|ens|eno|virtio' | head -n 20"
+        ).stdout
+        workers = ssh.execute("ps -eo pid,psr,comm | grep nginx").stdout
+        telemetry_rows = deps.memory.get_contexts(
+            deps.session_id, type="telemetry", source_prefix="baseline:", limit=6
+        )
+
+        worker_cores: list[int] = []
+        for line in workers.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == "nginx":
+                try:
+                    worker_cores.append(int(parts[1]))
+                except ValueError:
+                    continue
+
+        latest_series = {}
+        for row in telemetry_rows:
+            if row.get("source") != "baseline:series":
+                continue
+            try:
+                latest_series = json.loads(row.get("content", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                latest_series = {}
+            break
+
+        summary = latest_series.get("summary", {}) if isinstance(latest_series, dict) else {}
+        latest_sample = (
+            latest_series.get("last_sample", {}) if isinstance(latest_series, dict) else {}
+        )
+        current = {
+            "irq_lines": interrupts.strip()[:2000] or "no ethernet IRQs found",
+            "nginx_worker_cores": sorted(set(worker_cores)),
+            "worker_core_spread": len(set(worker_cores)),
+            "telemetry_run_queue_max": summary.get("run_queue_max", 0),
+            "telemetry_rx_drop_delta": summary.get("rx_drop_delta", 0),
+            "telemetry_rx_drop_rate_per_sec": summary.get("rx_drop_rate_per_sec", 0),
+            "telemetry_tcp_established": latest_sample.get("tcp_established", 0),
+        }
+        needs_investigation = []
+        if not interrupts.strip():
+            needs_investigation.append("no_nic_irq_visibility")
+        if current["worker_core_spread"] <= 2 and current["telemetry_rx_drop_delta"]:
+            needs_investigation.append("possible_irq_or_worker_core_lock")
+        if current["telemetry_run_queue_max"] and current["telemetry_run_queue_max"] >= 4:
+            needs_investigation.append("run_queue_pressure_during_load")
+
+        result = {
+            "needs_investigation": needs_investigation,
+            "current": current,
+        }
+        deps.token_counter.tool_calls += 1
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "inspect_irq",
+            str(result),
+            (
+                f"irq: {len(needs_investigation)} signals, "
+                f"worker_spread={current['worker_core_spread']}"
+            ),
+        )
+        tool_result(
+            "inspect",
+            (
+                f"irq: {len(needs_investigation)} signals, "
+                f"worker_spread={current['worker_core_spread']}"
+            ),
+        )
+        state["irq_inspection"] = result
+        return result
+
     def inspect_nginx_impl(deps: AgentDeps) -> dict:
-        tool_call("inspect", "nginx config — comparing against proven fixes")
+        tool_call("inspect", "nginx config — stage 1 analysis")
         raw = deps.ssh.execute("nginx -T 2>/dev/null").stdout
         current: dict[str, str] = {}
         for directive in nginx_targets:
@@ -281,7 +349,7 @@ def build(model) -> DiagnosisWorkflow:
         return result
 
     def inspect_system_impl(deps: AgentDeps) -> dict:
-        tool_call("inspect", "system tuning — comparing against proven fixes")
+        tool_call("inspect", "rhel/kernel tuning — stage 2 analysis")
         ssh = deps.ssh
         current = {}
         for key in [
@@ -332,7 +400,9 @@ def build(model) -> DiagnosisWorkflow:
         state["system_inspection"] = result
         return result
 
-    def apply_nginx_impl(deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any) -> dict:
+    def apply_nginx_impl(
+        deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any
+    ) -> dict:
         normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_nginx")
         if parse_error:
             tool_call("apply_nginx", "invalid input payload")
@@ -424,7 +494,9 @@ def build(model) -> DiagnosisWorkflow:
         tool_result("apply_nginx", summary)
         return result
 
-    def apply_system_impl(deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any) -> dict:
+    def apply_system_impl(
+        deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any
+    ) -> dict:
         normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_system")
         if parse_error:
             tool_call("apply_system", "invalid input payload")
@@ -501,7 +573,11 @@ def build(model) -> DiagnosisWorkflow:
             deps.session_id,
             "benchmark",
             url,
-            f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms CPU={result.cpu_pct:.1f}%",
+            (
+                f"RPS={result.requests_per_sec:.1f} "
+                f"p99={result.latency_p99_ms:.1f}ms "
+                f"CPU={result.cpu_pct:.1f}%"
+            ),
             "post-fix benchmark",
         )
         deps.token_counter.tool_calls += 1
@@ -549,7 +625,9 @@ def build(model) -> DiagnosisWorkflow:
         baseline_rps = _coerce_optional_float(profile.get("baseline_rps")) or 0.0
         run_after_rps = _coerce_optional_float(state.get("after_rps")) or 0.0
         derived_impact = (
-            ((run_after_rps - baseline_rps) / baseline_rps * 100) if baseline_rps and run_after_rps else 0.0
+            ((run_after_rps - baseline_rps) / baseline_rps * 100)
+            if baseline_rps and run_after_rps
+            else 0.0
         )
 
         for finding in findings:
@@ -563,7 +641,7 @@ def build(model) -> DiagnosisWorkflow:
             if after_rps is None and run_after_rps:
                 after_rps = run_after_rps
             if impact_pct is None and before_rps and after_rps:
-                impact_pct = ((after_rps - before_rps) / before_rps * 100)
+                impact_pct = (after_rps - before_rps) / before_rps * 100
             elif impact_pct is None and derived_impact:
                 impact_pct = derived_impact
 
@@ -635,15 +713,20 @@ def build(model) -> DiagnosisWorkflow:
                 key: value for key, value in (changes or {}).items() if key in allowed_params
             }
             if not filtered_changes:
-                tool_result("recommend", f"skipped recommendation_{idx}: no allowed performance changes")
+                tool_result(
+                    "recommend", f"skipped recommendation_{idx}: no allowed performance changes"
+                )
                 continue
             normalized = {
                 "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
-                "recommendation": str(item.get("recommendation", "")).strip() or "no recommendation",
+                "recommendation": str(item.get("recommendation", "")).strip()
+                or "no recommendation",
                 "rationale": str(item.get("rationale", "")).strip() or "no rationale",
-                "expected_benefit": str(item.get("expected_benefit", "")).strip() or "no expected benefit",
+                "expected_benefit": str(item.get("expected_benefit", "")).strip()
+                or "no expected benefit",
                 "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
-                "validation": str(item.get("validation", "")).strip() or "manual verification required",
+                "validation": str(item.get("validation", "")).strip()
+                or "manual verification required",
                 "scope": scope,
                 "changes": filtered_changes,
             }
@@ -660,7 +743,9 @@ def build(model) -> DiagnosisWorkflow:
         state["recommendations"] = normalized_items
         return True
 
-    def _evaluate_nginx_guardrails(deps: AgentDeps, benchmark_result: dict[str, Any]) -> dict[str, Any]:
+    def _evaluate_nginx_guardrails(
+        deps: AgentDeps, benchmark_result: dict[str, Any]
+    ) -> dict[str, Any]:
         def _load_baseline_benchmark() -> dict[str, Any]:
             for source in ("baseline_small", "baseline_homepage"):
                 try:
@@ -755,7 +840,9 @@ def build(model) -> DiagnosisWorkflow:
                     "parameter": f"nginx.{param}",
                     "before_value": nginx_current.get(param, ""),
                     "after_value": nginx_changes.get(param, ""),
-                    "reasoning": rec.get("rationale") or rec.get("recommendation") or "recommended change applied",
+                    "reasoning": rec.get("rationale")
+                    or rec.get("recommendation")
+                    or "recommended change applied",
                 }
             )
         for param, value in system_result.get("applied", {}).items():
@@ -765,7 +852,9 @@ def build(model) -> DiagnosisWorkflow:
                     "parameter": f"system.{param}",
                     "before_value": system_current.get(param, ""),
                     "after_value": value,
-                    "reasoning": rec.get("rationale") or rec.get("recommendation") or "recommended change applied",
+                    "reasoning": rec.get("rationale")
+                    or rec.get("recommendation")
+                    or "recommended change applied",
                 }
             )
 
@@ -817,10 +906,17 @@ def build(model) -> DiagnosisWorkflow:
     async def inspect_system_tuning(ctx) -> dict:
         return inspect_system_impl(ctx.deps)
 
-    async def apply_nginx_tuning(ctx, changes: dict[str, str] | str | None = None, **kwargs: Any) -> dict:
+    async def inspect_irq_distribution(ctx) -> dict:
+        return inspect_irq_impl(ctx.deps)
+
+    async def apply_nginx_tuning(
+        ctx, changes: dict[str, str] | str | None = None, **kwargs: Any
+    ) -> dict:
         return apply_nginx_impl(ctx.deps, changes, **kwargs)
 
-    async def apply_system_tuning(ctx, changes: dict[str, str] | str | None = None, **kwargs: Any) -> dict:
+    async def apply_system_tuning(
+        ctx, changes: dict[str, str] | str | None = None, **kwargs: Any
+    ) -> dict:
         return apply_system_impl(ctx.deps, changes, **kwargs)
 
     async def run_benchmark(ctx, duration: int = 30) -> dict:
@@ -848,8 +944,13 @@ def build(model) -> DiagnosisWorkflow:
 
         @tool
         def inspect_system_tuning() -> dict:
-            """Inspect system tuning and return only what needs fixing vs proven targets."""
+            """Stage 2: inspect RHEL/kernel/system tuning and return candidate fixes."""
             return inspect_system_impl(deps)
+
+        @tool
+        def inspect_irq_distribution() -> dict:
+            """Stage 3: inspect IRQ distribution, worker CPU spread, and IRQ lock signals."""
+            return inspect_irq_impl(deps)
 
         @tool
         def apply_nginx_tuning(changes: dict[str, Any] | str | None = None) -> dict:
@@ -889,6 +990,7 @@ def build(model) -> DiagnosisWorkflow:
         return [
             inspect_nginx_config,
             inspect_system_tuning,
+            inspect_irq_distribution,
             save_rca,
             save_recommendations,
             query_memory,
@@ -897,6 +999,7 @@ def build(model) -> DiagnosisWorkflow:
     test_tools = {
         "inspect_nginx_config": inspect_nginx_config,
         "inspect_system_tuning": inspect_system_tuning,
+        "inspect_irq_distribution": inspect_irq_distribution,
         "save_rca": save_rca,
         "save_recommendations": save_recommendations,
         "apply_nginx_tuning": apply_nginx_tuning,

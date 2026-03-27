@@ -4,9 +4,9 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import agents.agent as diagnosis_agent
 from adapters.base import BenchmarkResult
 from agents import TokenCounter
-import agents.agent as diagnosis_agent
 from agents.agent import DiagnosisOutput, build
 from tools.ssh import SSHResult
 
@@ -33,6 +33,22 @@ class FakeMemory:
             return [
                 {
                     "content": json.dumps({"rps": 100.0, "p99": 2.0, "error_rate": 0.0}),
+                }
+            ]
+        if source_prefix == "baseline:":
+            return [
+                {
+                    "source": "baseline:series",
+                    "content": json.dumps(
+                        {
+                            "summary": {
+                                "run_queue_max": 5,
+                                "rx_drop_delta": 10,
+                                "rx_drop_rate_per_sec": 2.5,
+                            },
+                            "last_sample": {"tcp_established": 1200},
+                        }
+                    ),
                 }
             ]
         return []
@@ -105,6 +121,18 @@ def test_apply_nginx_tuning_accepts_json_string_changes():
     assert result["failed"] == []
     assert ("sendfile", "on") in ctx.deps.adapter.applied
     assert ("keepalive_requests", "1000") in ctx.deps.adapter.applied
+
+
+def test_inspect_irq_distribution_uses_telemetry_window_summary():
+    agent = build("model")
+    tool = agent._function_toolset.tools["inspect_irq_distribution"].function
+    ctx = _ctx()
+
+    result = asyncio.run(tool(ctx))
+
+    assert "possible_irq_or_worker_core_lock" in result["needs_investigation"]
+    assert result["current"]["telemetry_run_queue_max"] == 5
+    assert result["current"]["telemetry_rx_drop_delta"] == 10
 
 
 def test_apply_nginx_tuning_invalid_json_returns_structured_error():
