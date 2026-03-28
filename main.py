@@ -98,7 +98,7 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
 
     # Clear old knowledge
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM facts WHERE type = 'knowledge'")
+        cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
 
     total = 0
     for filepath in md_files:
@@ -111,12 +111,14 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO facts (id, session_id, type, parameter, reasoning, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO knowledge
+                        (id, discovered_by, scope, type, parameter, reasoning, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                     (
                         fid,
                         "__knowledge__",
+                        "universal",
                         "knowledge",
                         chunk["title"],
                         chunk["body"][:10000],
@@ -166,7 +168,7 @@ async def main(
     session_id: str | None,
     verbose: bool = False,
     max_phase: int = 4,
-    planner_mode: str = "single",
+    planner_mode: str = "debate",
     baseline_mode: str = "fresh",
 ) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
@@ -319,7 +321,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--planner-mode",
         choices=["single", "debate"],
-        default="single",
+        default="debate",
         help="Planning path: single planner or nginx-vs-rhel debate with synthesis",
     )
     parser.add_argument(

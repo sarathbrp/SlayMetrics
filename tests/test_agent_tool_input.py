@@ -564,6 +564,7 @@ def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
         memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
         session_id="s1",
         token_counter=TokenCounter(),
+        config={"agent": {"planner_mode": "single"}},
     )
 
     class FakeRunResult:
@@ -605,6 +606,7 @@ def test_run_does_not_double_count_usage(monkeypatch):
         memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
         session_id="s1",
         token_counter=TokenCounter(),
+        config={"agent": {"planner_mode": "single"}},
     )
 
     class FakeRunResult:
@@ -857,6 +859,7 @@ def test_coerce_recommendations_accepts_setting_value_lists():
 
 def test_run_applies_saved_recommendations(monkeypatch):
     deps = _ctx().deps
+    deps.config["agent"]["planner_mode"] = "single"
 
     class FakeRunResult:
         output = "Plan complete."

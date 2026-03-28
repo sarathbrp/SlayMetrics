@@ -111,7 +111,9 @@ class LangfuseClient:
             yield None
             return
 
-        with self._make_span_context(name=name, input=input, metadata=metadata or {}) as observation:
+        with self._make_span_context(
+            name=name, input=input, metadata=metadata or {}
+        ) as observation:
             self._last_trace_url = self._safe_trace_url()
             try:
                 yield observation
@@ -188,6 +190,7 @@ class LangfuseClient:
         merged = metadata or {}
         if self._generation_api_supported:
             try:
+                assert self._client is not None
                 return self._client.start_as_current_generation(
                     name=name,
                     model=model,
@@ -262,10 +265,13 @@ class LangfuseClient:
         except Exception:
             return None
 
-    def _make_span_context(self, *, name: str, input: Any = None, metadata: dict[str, Any] | None = None):
+    def _make_span_context(
+        self, *, name: str, input: Any = None, metadata: dict[str, Any] | None = None
+    ):
         merged = metadata or {}
         if self._span_api_supported:
             try:
+                assert self._client is not None
                 return self._client.start_as_current_span(
                     name=name,
                     input=_jsonable(input),
@@ -285,6 +291,7 @@ class LangfuseClient:
         input: Any = None,
         metadata: dict[str, Any] | None = None,
     ):
+        assert self._client is not None
         try:
             return self._client.start_as_current_observation(
                 name=name,

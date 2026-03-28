@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import agents.agent as diagnosis_agent
+from adapters.base import BenchmarkResult
 from agents import TokenCounter
 from agents.agent import (
     DiagnosisOutput,
@@ -23,20 +24,18 @@ from agents.agent import (
     _coerce_notes,
     _coerce_recommendations,
     _coerce_records,
-    _extract_final_text,
-    _normalize_synthesized_recommendation,
-    _sanitize_debug_text,
-    _extract_json_dict,
-    _resolve_model_name,
     _extract_changes_from_action,
     _extract_changes_from_commands,
-    _save_planner_artifact,
+    _extract_final_text,
+    _extract_json_dict,
     _hypothesis_enabled,
+    _normalize_synthesized_recommendation,
+    _resolve_model_name,
+    _sanitize_debug_text,
+    _save_planner_artifact,
     build,
 )
-from adapters.base import BenchmarkResult
 from tools.ssh import SSHResult
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -177,7 +176,7 @@ def _ctx():
         session_id="s1",
         token_counter=TokenCounter(),
         config={
-            "agent": {"debug_planner_payloads": False, "persist_hypotheses": False},
+            "agent": {"debug_planner_payloads": False, "persist_hypotheses": False, "planner_mode": "single"},
             "service": {
                 "benchmark": {"duration": 30, "small_file_url": "http://localhost/test"},
                 "config_path": "/etc/nginx/nginx.conf",
@@ -1137,7 +1136,7 @@ def test_run_with_tool_token_rows(monkeypatch):
     log_calls = []
     monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: log_calls.append(a))
 
-    output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
+    asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
     assert any("Tool token attribution" in str(a) for a in log_calls)
 
 def test_run_handles_get_profile_exception(monkeypatch):

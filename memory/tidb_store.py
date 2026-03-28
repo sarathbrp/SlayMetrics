@@ -5,6 +5,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pymysql
@@ -194,6 +195,24 @@ class TiDBStore:
 
     def connect(self) -> None:
         self._conn = pymysql.connect(**self._conn_kwargs)
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """Create tables if they don't exist by running schema.sql."""
+        if not isinstance(self._conn, pymysql.Connection):
+            return  # skip for test fakes
+        schema_path = Path(__file__).resolve().parent.parent / "schema.sql"
+        if not schema_path.exists():
+            return
+        sql = schema_path.read_text(encoding="utf-8")
+        with self._conn.cursor() as cur:
+            for stmt in sql.split(";"):
+                stmt = stmt.strip()
+                if stmt and not stmt.startswith("--"):
+                    try:
+                        cur.execute(stmt)
+                    except Exception:
+                        pass  # table already exists or other DDL conflict
 
     def disconnect(self) -> None:
         if self._conn:
@@ -755,12 +774,8 @@ class TiDBStore:
                     (session_id, size),
                 )
                 rows = cur.fetchall()
-            baseline: dict[str, Any] = next(
-                (r for r in rows if r["phase"] == "baseline"), {}
-            )
-            final: dict[str, Any] = next(
-                (r for r in rows if r["phase"] == "final"), {}
-            )
+            baseline: dict[str, Any] = next((r for r in rows if r["phase"] == "baseline"), {})
+            final: dict[str, Any] = next((r for r in rows if r["phase"] == "final"), {})
             b_rps = baseline.get("rps") or 0
             f_rps = final.get("rps") or 0
             result[size] = {

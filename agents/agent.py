@@ -1349,7 +1349,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     agent = build(model, config=getattr(deps, "config", None))
     state = getattr(agent, "_slaymetrics_state", {})
     config = getattr(deps, "config", {}) or {}
-    planner_mode = str((config.get("agent") or {}).get("planner_mode", "single")).strip().lower()
+    planner_mode = str((config.get("agent") or {}).get("planner_mode", "debate")).strip().lower()
     if planner_mode == "debate":
         result = await _run_debate_planner(agent, model, deps, context_prompt)
     else:

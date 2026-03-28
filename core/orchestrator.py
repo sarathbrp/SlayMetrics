@@ -4,6 +4,7 @@ import json
 import os
 import statistics
 from contextlib import nullcontext
+from typing import Any
 
 import agents.agent as diagnosis_agent
 import core.reporter as reporter
@@ -581,7 +582,7 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, object]:
+def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, Any]:
     baseline_small = baselines.get("small", {})
     baseline_homepage = baselines.get("homepage", {})
     series = _find_telemetry_entry(telemetry_entries, "baseline:series")
@@ -635,7 +636,7 @@ def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) ->
     return evidence
 
 
-def _build_benchmark_evidence_text(evidence: dict[str, object]) -> str:
+def _build_benchmark_evidence_text(evidence: dict[str, Any]) -> str:
     return (
         f"- baseline small: {float(evidence.get('baseline_small_rps', 0.0)):.1f} RPS, "
         f"p99={float(evidence.get('baseline_small_p99_ms', 0.0)):.1f}ms\n"
@@ -675,7 +676,7 @@ def _safe_int(value) -> int:
         return 0
 
 
-def _load_reusable_baseline(deps: AgentDeps) -> dict[str, object] | None:
+def _load_reusable_baseline(deps: AgentDeps) -> dict[str, Any] | None:
     host = deps.config["target"]["host"]
     source_session_id = deps.memory.get_latest_session_for_host(
         host, exclude_session_id=deps.session_id

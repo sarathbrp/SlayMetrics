@@ -92,6 +92,9 @@ def _check_file(path_str: str) -> list[str]:
         key = secret_match.group("key")
         if key.lower().endswith("_env"):
             continue
+        # Skip Python identifiers (contain lowercase) — only flag ALL_CAPS env-style keys
+        if any(c.islower() for c in key):
+            continue
         value = secret_match.group("value").strip()
         if _should_skip_secret_value(value):
             continue
