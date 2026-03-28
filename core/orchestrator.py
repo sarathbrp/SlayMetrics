@@ -69,6 +69,16 @@ async def run(model, deps: AgentDeps) -> str:
     ram_kb = ssh.execute("grep MemTotal /proc/meminfo | awk '{print $2}'").stdout.strip()
     ram_gb = int(ram_kb) // (1024 * 1024) if ram_kb.isdigit() else 0
 
+    # Collect NIC speed and disk throughput for workload-aware reasoning
+    nic_speed_raw = ssh.execute(
+        "cat /sys/class/net/$(ip route get 1 | awk '{print $5; exit}')/speed 2>/dev/null || echo 0"
+    ).stdout.strip()
+    nic_speed_mbps = int(nic_speed_raw) if nic_speed_raw.isdigit() else 0
+    disk_throughput = ssh.execute(
+        "dd if=/dev/zero of=/tmp/slay_disktest bs=1M count=256 oflag=direct 2>&1 | tail -1"
+    ).stdout.strip()
+    ssh.execute("rm -f /tmp/slay_disktest 2>/dev/null || true")
+
     memory.update_profile(
         session_id,
         rhel_version=rhel_ver[:64],
@@ -217,7 +227,11 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 4b: Assembling diagnosis evidence...")
     telemetry_summary = _build_telemetry_summary(telemetry_entries)
-    benchmark_evidence_text = _build_benchmark_evidence_text(benchmark_evidence)
+    benchmark_evidence_text = _build_benchmark_evidence_text(
+        benchmark_evidence,
+        nic_speed_mbps=nic_speed_mbps,
+        disk_throughput=disk_throughput,
+    )
     logger.status("evidence", "Benchmark and telemetry evidence assembled for RCA")
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -603,11 +617,21 @@ def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) ->
     rx_post = _safe_int(post_summary.get("rx_drop_total"))
     tx_pre = _safe_int(pre_summary.get("tx_drop_total"))
     tx_post = _safe_int(post_summary.get("tx_drop_total"))
+    # Include ALL workload baselines for per-size reasoning
+    baseline_medium = baselines.get("medium", {})
+    baseline_large = baselines.get("large", {})
+    baseline_mixed = baselines.get("mixed", {})
     evidence = {
         "baseline_small_rps": baseline_small.get("rps", 0.0),
         "baseline_small_p99_ms": baseline_small.get("p99", 0.0),
         "baseline_homepage_rps": baseline_homepage.get("rps", 0.0),
         "baseline_homepage_p99_ms": baseline_homepage.get("p99", 0.0),
+        "baseline_medium_rps": baseline_medium.get("rps", 0.0),
+        "baseline_medium_p99_ms": baseline_medium.get("p99", 0.0),
+        "baseline_large_rps": baseline_large.get("rps", 0.0),
+        "baseline_large_p99_ms": baseline_large.get("p99", 0.0),
+        "baseline_mixed_rps": baseline_mixed.get("rps", 0.0),
+        "baseline_mixed_p99_ms": baseline_mixed.get("p99", 0.0),
         "baseline_pre_workers": pre_summary.get("nginx_worker_count", 0),
         "baseline_post_workers": post_summary.get("nginx_worker_count", 0),
         "somaxconn": post_summary.get("somaxconn", pre_summary.get("somaxconn", "unknown")),
@@ -636,24 +660,52 @@ def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) ->
     return evidence
 
 
-def _build_benchmark_evidence_text(evidence: dict[str, Any]) -> str:
-    return (
-        f"- baseline small: {float(evidence.get('baseline_small_rps', 0.0)):.1f} RPS, "
-        f"p99={float(evidence.get('baseline_small_p99_ms', 0.0)):.1f}ms\n"
-        f"- baseline homepage: {float(evidence.get('baseline_homepage_rps', 0.0)):.1f} RPS, "
-        f"p99={float(evidence.get('baseline_homepage_p99_ms', 0.0)):.1f}ms\n"
-        f"- benchmark telemetry window: samples={evidence.get('telemetry_sample_count', 0)}, "
-        f"duration={evidence.get('telemetry_duration_sec', 0)}s, "
-        f"workers={evidence.get('baseline_post_workers', 0)}, "
-        f"somaxconn={evidence.get('somaxconn', 'unknown')}, "
-        f"syn_backlog={evidence.get('tcp_max_syn_backlog', 'unknown')}, "
-        f"runq_avg={evidence.get('run_queue_avg', 0)}, "
-        f"runq_max={evidence.get('run_queue_max', 0)}, "
-        f"rx_drop_delta={evidence.get('rx_drop_delta', 0)}, "
-        f"rx_drop_rate={evidence.get('rx_drop_rate_per_sec', 0)}, "
-        f"tx_drop_delta={evidence.get('tx_drop_delta', 0)}, "
-        f"established={evidence.get('tcp_established_post', 'unknown')}"
+def _build_benchmark_evidence_text(
+    evidence: dict[str, Any],
+    nic_speed_mbps: int = 0,
+    disk_throughput: str = "",
+) -> str:
+    lines = [
+        "Baseline benchmarks per workload:",
+        f"  homepage: {float(evidence.get('baseline_homepage_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_homepage_p99_ms', 0.0)):.1f}ms",
+        f"  small:    {float(evidence.get('baseline_small_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_small_p99_ms', 0.0)):.1f}ms",
+        f"  medium:   {float(evidence.get('baseline_medium_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_medium_p99_ms', 0.0)):.1f}ms",
+        f"  large:    {float(evidence.get('baseline_large_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_large_p99_ms', 0.0)):.1f}ms",
+        f"  mixed:    {float(evidence.get('baseline_mixed_rps', 0.0)):.1f} RPS, "
+        f"p99={float(evidence.get('baseline_mixed_p99_ms', 0.0)):.1f}ms",
+        "",
+        "Hardware constraints:",
+    ]
+    if nic_speed_mbps:
+        max_gbps = nic_speed_mbps / 1000
+        lines.append(
+            f"  NIC speed: {nic_speed_mbps} Mbps ({max_gbps:.0f} Gbps"
+            f" = ~{nic_speed_mbps // 8} MB/s max throughput)"
+        )
+    if disk_throughput:
+        lines.append(f"  Disk throughput: {disk_throughput}")
+    lines.extend(
+        [
+            "",
+            "Telemetry during baseline benchmark:",
+            f"  workers={evidence.get('baseline_post_workers', 0)}, "
+            f"somaxconn={evidence.get('somaxconn', 'unknown')}, "
+            f"syn_backlog={evidence.get('tcp_max_syn_backlog', 'unknown')}",
+            f"  runq_avg={evidence.get('run_queue_avg', 0)}, "
+            f"runq_max={evidence.get('run_queue_max', 0)}, "
+            f"rx_drop_delta={evidence.get('rx_drop_delta', 0)}, "
+            f"rx_drop_rate={evidence.get('rx_drop_rate_per_sec', 0)}",
+            "",
+            "IMPORTANT: Tuning changes must not regress ANY workload size.",
+            "Large files are NIC/disk-bound; changes like 'aio threads' can "
+            "conflict with sendfile and cause severe regression on large files.",
+        ]
     )
+    return "\n".join(lines)
 
 
 def _find_telemetry_entry(entries: list[dict], source: str) -> dict:
