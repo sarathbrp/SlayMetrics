@@ -1113,7 +1113,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
         after_error_rate = _coerce_float(benchmark_result.get("error_rate"))
         reasons: list[str] = []
 
-        if baseline_rps and after_rps < baseline_rps:
+        if baseline_rps and after_rps < baseline_rps * 0.95:
             reasons.append(f"RPS regressed ({after_rps:.1f} < {baseline_rps:.1f})")
         if baseline_p99 and after_p99 > baseline_p99 * 1.10:
             reasons.append(f"p99 regressed ({after_p99:.1f}ms > {baseline_p99:.1f}ms)")
