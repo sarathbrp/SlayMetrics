@@ -1764,6 +1764,223 @@ def build(model, config=None) -> DiagnosisWorkflow:
     return workflow
 
 
+async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
+    """Pre-flight validation agent: verify DUT serves all workloads correctly.
+
+    Runs before baseline benchmarks. Detects misconfigurations that would
+    produce invalid baselines (403s, connection refused, wrong content).
+    Uses LLM to diagnose and fix issues found.
+    """
+    ssh = deps.ssh
+    cfg = deps.config
+    host = cfg["target"].get("host", "localhost")
+    tool_call("preflight", "verifying DUT serves all workloads correctly")
+
+    # ── Collect diagnostics from DUT ────────────────────────────────
+    diag: dict[str, Any] = {}
+
+    # 1. HTTP response check — curl each workload type
+    test_urls = {
+        "homepage": f"http://{host}/",
+        "small": f"http://{host}/stress_test_data/small/000/000/file_000000000.html",
+        "medium": f"http://{host}/stress_test_data/medium/000/000/file_000000000.html",
+        "large": f"http://{host}/stress_test_data/large/000/000/file_000000000.html",
+    }
+    # Discover actual document root and test files
+    docroot_r = ssh.execute(
+        "nginx -T 2>/dev/null | grep -E '^\\s*root ' | head -1 | awk '{print $2}' | tr -d ';'"
+    )
+    docroot = docroot_r.stdout.strip() or "/var/www/nginx"
+    diag["document_root"] = docroot
+
+    url_results: dict[str, dict[str, Any]] = {}
+    for name, url in test_urls.items():
+        r = ssh.execute(
+            f"curl -s -o /dev/null -w '%{{http_code}} %{{size_download}} %{{time_total}}'"
+            f" {url} 2>&1"
+        )
+        parts = r.stdout.strip().split()
+        status = parts[0] if parts else "000"
+        size = parts[1] if len(parts) > 1 else "0"
+        time = parts[2] if len(parts) > 2 else "0"
+        url_results[name] = {"status": status, "size": size, "time": time}
+    diag["url_checks"] = url_results
+
+    # 2. SELinux state and AVC denials
+    diag["selinux_mode"] = ssh.execute("getenforce 2>/dev/null").stdout.strip()
+    diag["selinux_denials"] = ssh.execute(
+        "ausearch -m avc -ts recent 2>/dev/null | tail -20"
+    ).stdout.strip()[:2000]
+
+    # 3. File permissions and SELinux labels
+    diag["file_labels"] = ssh.execute(f"ls -laZ {docroot}/ 2>/dev/null | head -10").stdout.strip()
+    if "stress_test_data" in ssh.execute(f"ls {docroot}/").stdout:
+        diag["stress_data_labels"] = ssh.execute(
+            f"ls -laZ {docroot}/stress_test_data/small/000/000/ 2>/dev/null | head -5"
+        ).stdout.strip()
+
+    # 4. Nginx config validation
+    diag["nginx_test"] = ssh.execute("nginx -t 2>&1").stdout.strip()
+    diag["nginx_error_log"] = ssh.execute(
+        "tail -20 /var/log/nginx/error.log 2>/dev/null"
+    ).stdout.strip()[:1000]
+
+    # 5. Firewall / traffic control rules
+    diag["iptables_rules"] = ssh.execute(
+        "iptables -L -n 2>/dev/null | grep -v '^Chain\\|^target\\|^$' | head -20"
+    ).stdout.strip()
+    diag["nftables_rules"] = ssh.execute(
+        "nft list ruleset 2>/dev/null | grep -E 'drop|reject|limit' | head -10"
+    ).stdout.strip()
+    diag["tc_rules"] = ssh.execute(
+        "tc qdisc show 2>/dev/null | grep -v 'noqueue\\|pfifo_fast' | head -10"
+    ).stdout.strip()
+
+    # 6. Process-level throttling
+    diag["nginx_nice"] = ssh.execute(
+        "ps -o pid,ni,cls,rtprio,comm -C nginx | head -5"
+    ).stdout.strip()
+    diag["nginx_cgroup_cpu"] = ssh.execute(
+        "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null"
+        " || cat /sys/fs/cgroup/cpu/system.slice/nginx.service/cpu.cfs_quota_us"
+        " 2>/dev/null || echo 'no cgroup throttle'"
+    ).stdout.strip()
+    diag["nginx_service_limits"] = ssh.execute(
+        "systemctl show nginx.service 2>/dev/null"
+        " | grep -E 'LimitNOFILE|LimitMEMLOCK|CPUQuota|MemoryLimit'"
+    ).stdout.strip()
+
+    # 7. Background resource hogs
+    diag["top_cpu_procs"] = ssh.execute("ps aux --sort=-%cpu | head -10").stdout.strip()
+    diag["swap_usage"] = ssh.execute("free -m | grep Swap").stdout.strip()
+
+    # 8. Network interface checks
+    diag["mtu"] = ssh.execute(
+        "ip link show $(ip route get 1 | awk '{print $5; exit}') 2>/dev/null | grep mtu"
+    ).stdout.strip()
+    diag["nic_offload"] = ssh.execute(
+        "ethtool -k $(ip route get 1 | awk '{print $5; exit}') 2>/dev/null"
+        " | grep -E 'tcp-segmentation|generic-segmentation|generic-receive'"
+    ).stdout.strip()
+
+    # 9. CPU governor
+    diag["cpu_governor"] = ssh.execute(
+        "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
+    ).stdout.strip()
+
+    # ── Check if there are problems ─────────────────────────────────
+    problems = []
+    for name, result in url_results.items():
+        if result["status"] != "200":
+            problems.append(f"{name}: HTTP {result['status']} (expected 200)")
+
+    if not problems:
+        tool_result("preflight", "all workloads return HTTP 200 — OK")
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "preflight_validation",
+            json.dumps({"status": "ok", "checks": diag}),
+            "preflight: all workloads serve correctly",
+        )
+        return {"status": "ok", "problems": [], "fixes": [], "diagnostics": diag}
+
+    # ── Problems found — ask LLM to diagnose and fix ────────────────
+    tool_result(
+        "preflight",
+        f"PROBLEMS: {'; '.join(problems)}",
+    )
+
+    preflight_prompt = (
+        "You are a RHEL system administrator. The DUT (device under test) "
+        "is failing to serve some workload URLs correctly. "
+        "Diagnose the root cause and provide exact shell commands to fix it.\n\n"
+        "Return strict JSON with keys:\n"
+        '- "diagnosis": one-sentence root cause\n'
+        '- "fixes": list of shell commands to run on the DUT to fix the issue\n\n'
+        "Problems detected:\n"
+        + "\n".join(f"  - {p}" for p in problems)
+        + "\n\nDiagnostics collected from DUT:\n"
+        + json.dumps(diag, indent=2, ensure_ascii=False)[:6000]
+    )
+
+    fix_plan, fix_usage = _invoke_json_planner(
+        model, "planner.preflight_fix", preflight_prompt, deps
+    )
+    tool_result(
+        "preflight",
+        f"diagnosis: {fix_plan.get('diagnosis', 'unknown')}",
+    )
+
+    deps.token_counter.input_tokens += fix_usage["input_tokens"]
+    deps.token_counter.output_tokens += fix_usage["output_tokens"]
+
+    # Apply fixes
+    fixes_applied = []
+    fix_commands = fix_plan.get("fixes", [])
+    if isinstance(fix_commands, list):
+        for cmd in fix_commands:
+            cmd_str = str(cmd).strip()
+            if not cmd_str or cmd_str.startswith("#"):
+                continue
+            tool_call("preflight_fix", cmd_str[:100])
+            cmd_result = ssh.execute(cmd_str, timeout=120)
+            fixes_applied.append(
+                {
+                    "command": cmd_str,
+                    "ok": cmd_result.ok,
+                    "output": cmd_result.stdout.strip()[:200],
+                }
+            )
+
+    # Re-verify after fixes
+    recheck: dict[str, str] = {}
+    remaining_problems = []
+    for name, url in test_urls.items():
+        r = ssh.execute(f"curl -s -o /dev/null -w '%{{http_code}}' {url} 2>&1")
+        status = r.stdout.strip()
+        recheck[name] = status
+        if status != "200":
+            remaining_problems.append(f"{name}: still HTTP {status}")
+
+    if remaining_problems:
+        tool_result(
+            "preflight",
+            f"STILL FAILING after fixes: {'; '.join(remaining_problems)}",
+        )
+    else:
+        tool_result("preflight", "all workloads now return HTTP 200 — fixed")
+
+    # Persist results
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, "preflight_fix", fix_plan, iteration=_iter)
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        "preflight_validation",
+        json.dumps(
+            {
+                "status": "fixed" if not remaining_problems else "partial",
+                "problems": problems,
+                "diagnosis": fix_plan.get("diagnosis", ""),
+                "fixes_applied": fixes_applied,
+                "recheck": recheck,
+                "remaining": remaining_problems,
+            }
+        ),
+        f"preflight: {len(problems)} problems, "
+        f"{len(fixes_applied)} fixes, "
+        f"{len(remaining_problems)} remaining",
+    )
+
+    return {
+        "status": "fixed" if not remaining_problems else "partial",
+        "problems": problems,
+        "fixes": fixes_applied,
+        "diagnostics": diag,
+    }
+
+
 async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     """Run the diagnosis workflow and derive the final structured result in Python."""
     llm_call("agent", "Starting diagnosis — sending context to LLM...")

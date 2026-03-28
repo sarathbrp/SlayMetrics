@@ -173,6 +173,11 @@ def test_orchestrator_reuses_stored_baseline(monkeypatch):
             ),
         ),
     )
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}),
+    )
     monkeypatch.setattr(orchestrator.reporter, "generate", lambda *a, **k: "report.md")
 
     report = asyncio.run(orchestrator.run("model", deps))
@@ -294,6 +299,11 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
     )
     monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}),
+    )
+    monkeypatch.setattr(
         orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
     )
     monkeypatch.setattr(
@@ -385,6 +395,11 @@ def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
         orchestrator.diagnosis_agent,
         "run",
         lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
+    )
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}),
     )
     monkeypatch.setattr(
         orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")

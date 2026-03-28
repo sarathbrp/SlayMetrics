@@ -92,6 +92,27 @@ async def run(model, deps: AgentDeps) -> str:
     )
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 1.7: Pre-flight validation (LLM-assisted)
+    # Verify DUT serves all workloads correctly before benchmarking.
+    # ══════════════════════════════════════════════════════════════════════════
+    logger.step("Step 1.7: Pre-flight validation — verifying DUT serves all workloads...")
+    preflight_result = await diagnosis_agent.run_preflight(model, deps)
+    preflight_status = preflight_result.get("status", "unknown")
+    if preflight_status == "ok":
+        logger.status("preflight", "All workloads verified — proceeding to benchmark")
+    elif preflight_status == "fixed":
+        logger.status(
+            "preflight",
+            f"Fixed {len(preflight_result.get('problems', []))} issues — proceeding",
+        )
+    else:
+        remaining = preflight_result.get("problems", [])
+        logger.status(
+            "preflight",
+            f"WARNING: {len(remaining)} issues remain — baselines may be unreliable",
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 2: Baseline benchmarks (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     bench_cfg = cfg["service"]["benchmark"]
