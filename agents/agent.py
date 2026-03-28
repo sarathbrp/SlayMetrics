@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import unicodedata
@@ -1433,11 +1434,9 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
         f"IRQ Inspection:\n{json.dumps(irq_inspection, ensure_ascii=True)}"
     )
 
-    nginx_analysis, nginx_usage = _invoke_json_planner(
-        model, "planner.nginx_expert", nginx_prompt, deps
-    )
-    rhel_analysis, rhel_usage = _invoke_json_planner(
-        model, "planner.rhel_expert", rhel_prompt, deps
+    (nginx_analysis, nginx_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
+        asyncio.to_thread(_invoke_json_planner, model, "planner.nginx_expert", nginx_prompt, deps),
+        asyncio.to_thread(_invoke_json_planner, model, "planner.rhel_expert", rhel_prompt, deps),
     )
     if _planner_debug_enabled(deps):
         tool_result(
