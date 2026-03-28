@@ -120,8 +120,9 @@ class DiagnosisWorkflow:
 
         def call_model(state: GraphState):
             messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+            _lf = getattr(deps, "langfuse", None)
             with (
-                getattr(deps, "langfuse", None).generation(
+                _lf.generation(
                     "single_planner_turn",
                     model=_resolve_model_name(self.model),
                     input={"messages": summarize_messages(messages)},
@@ -131,13 +132,13 @@ class DiagnosisWorkflow:
                     },
                     model_parameters={"temperature": 0},
                 )
-                if getattr(deps, "langfuse", None)
+                if _lf
                 else _null_generation() as _
             ):
                 response = llm.invoke(messages)
                 usage = getattr(response, "usage_metadata", None) or {}
-                if getattr(deps, "langfuse", None):
-                    deps.langfuse.update_generation(
+                if _lf:
+                    _lf.update_generation(
                         output={
                             "content": _extract_final_text([response])[:2000],
                             "tool_calls": getattr(response, "tool_calls", None),
@@ -452,8 +453,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
             "net.core.rmem_max",
             "net.core.wmem_max",
         ]:
-            result = ssh.execute(f"sysctl -n {key} 2>/dev/null")
-            current[key] = result.stdout.strip()
+            sysctl_r = ssh.execute(f"sysctl -n {key} 2>/dev/null")
+            current[key] = sysctl_r.stdout.strip()
 
         thp = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
         match = re.search(r"\[(\w+)\]", thp.stdout)
@@ -680,13 +681,14 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     failed[param] = result.stderr.strip()
             elif param == "nofile":
                 cmds = [
-                    f"sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
+                    "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
                     f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
                     f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
                     f"systemctl set-property nginx.service LimitNOFILE={value} 2>/dev/null || true",
                     "systemctl daemon-reload && systemctl reload nginx 2>&1 || true",
                 ]
-                ok = all(ssh.execute(cmd).ok or True for cmd in cmds)
+                for cmd in cmds:
+                    ssh.execute(cmd)
                 applied[param] = value
             elif param == "irqbalance":
                 result = ssh.execute("systemctl enable --now irqbalance 2>&1")
@@ -1148,7 +1150,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     recommendation_by_param[("nginx", str(param))] = item
 
         nginx_result = {"applied": [], "failed": [], "reload": "SKIPPED"}
-        system_result = {"applied": {}, "failed": {}}
+        system_result: dict[str, Any] = {"applied": {}, "failed": {}}
         if nginx_changes:
             nginx_result = apply_nginx_impl(deps, nginx_changes)
         if system_changes:
@@ -1336,7 +1338,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
         "save_findings": save_findings,
     }
     workflow = DiagnosisWorkflow(model, state, test_tools, tool_factory)
-    workflow._apply_from_recommendations = apply_saved_recommendations_impl
+    workflow._apply_from_recommendations = apply_saved_recommendations_impl  # type: ignore[attr-defined]
     return workflow
 
 

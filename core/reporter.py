@@ -295,7 +295,9 @@ def _md_report(
         for entry in rca_entries:
             data = _clean_rca_entry(entry)
             evidence = data.get("evidence", [])
-            evidence_text = "; ".join(str(item) for item in evidence) if evidence else "No evidence recorded."
+            evidence_text = (
+                "; ".join(str(item) for item in evidence) if evidence else "No evidence recorded."
+            )
             lines += [
                 f"### {data.get('symptom', 'Unknown symptom')}",
                 f"- Root cause: {data.get('root_cause', 'Unknown root cause')}",
@@ -403,28 +405,94 @@ def _md_report(
 
 
 REASONING_TEMPLATES = {
-    "worker_connections": "Increased worker_connections to handle more concurrent connections per worker process.",
-    "worker_cpu_affinity": "Set worker CPU affinity to auto for optimal NUMA-aware core binding.",
-    "worker_rlimit_nofile": "Increased file descriptor limit to support higher concurrency on 112-core system.",
-    "open_file_cache": "Enabled open_file_cache to eliminate repeated stat() and open() syscalls on millions of static files.",
-    "access_log": "Disabled access logging to remove per-request disk I/O overhead.",
-    "tcp_nodelay": "Enabled tcp_nodelay to disable Nagle's algorithm, reducing latency for small responses.",
-    "keepalive_requests": "Increased keepalive_requests for better connection reuse under high load.",
-    "keepalive_timeout": "Reduced keepalive_timeout to free idle connections faster under high concurrency.",
-    "reset_timedout_connection": "Enabled reset_timedout_connection to immediately free resources from timed-out connections.",
-    "listen_backlog": "Aligned listen backlog with somaxconn to prevent connection queue drops.",
-    "aio": "Enabled async I/O threads for non-blocking large file serving.",
-    "net.core.somaxconn": "Increased TCP listen backlog to handle burst connections.",
-    "net.ipv4.tcp_max_syn_backlog": "Increased SYN queue to prevent drops under high connection rates.",
-    "net.core.netdev_max_backlog": "Increased NIC packet buffer to prevent kernel-level packet drops.",
-    "net.core.rmem_max": "Increased socket receive buffer maximum for better TCP throughput.",
-    "net.core.wmem_max": "Increased socket send buffer maximum for better TCP throughput.",
-    "net.ipv4.tcp_tw_reuse": "Enabled TIME_WAIT socket reuse for faster connection recycling.",
-    "net.ipv4.tcp_max_tw_buckets": "Increased TIME_WAIT bucket limit to handle high connection churn.",
-    "net.ipv4.ip_local_port_range": "Expanded ephemeral port range for more concurrent outbound connections.",
-    "transparent_hugepage": "Disabled THP to eliminate memory compaction latency spikes.",
-    "selinux": "Set SELinux to permissive to reduce syscall overhead on file access.",
-    "cpu_governor": "Set CPU governor to performance for maximum clock speed on all 112 cores.",
+    "worker_connections": (
+        "Increased worker_connections to handle more concurrent"
+        " connections per worker process."
+    ),
+    "worker_cpu_affinity": (
+        "Set worker CPU affinity to auto for optimal"
+        " NUMA-aware core binding."
+    ),
+    "worker_rlimit_nofile": (
+        "Increased file descriptor limit to support higher"
+        " concurrency on 112-core system."
+    ),
+    "open_file_cache": (
+        "Enabled open_file_cache to eliminate repeated stat()"
+        " and open() syscalls on millions of static files."
+    ),
+    "access_log": (
+        "Disabled access logging to remove per-request"
+        " disk I/O overhead."
+    ),
+    "tcp_nodelay": (
+        "Enabled tcp_nodelay to disable Nagle's algorithm,"
+        " reducing latency for small responses."
+    ),
+    "keepalive_requests": (
+        "Increased keepalive_requests for better connection"
+        " reuse under high load."
+    ),
+    "keepalive_timeout": (
+        "Reduced keepalive_timeout to free idle connections"
+        " faster under high concurrency."
+    ),
+    "reset_timedout_connection": (
+        "Enabled reset_timedout_connection to immediately free"
+        " resources from timed-out connections."
+    ),
+    "listen_backlog": (
+        "Aligned listen backlog with somaxconn to prevent"
+        " connection queue drops."
+    ),
+    "aio": (
+        "Enabled async I/O threads for non-blocking"
+        " large file serving."
+    ),
+    "net.core.somaxconn": (
+        "Increased TCP listen backlog to handle"
+        " burst connections."
+    ),
+    "net.ipv4.tcp_max_syn_backlog": (
+        "Increased SYN queue to prevent drops under"
+        " high connection rates."
+    ),
+    "net.core.netdev_max_backlog": (
+        "Increased NIC packet buffer to prevent"
+        " kernel-level packet drops."
+    ),
+    "net.core.rmem_max": (
+        "Increased socket receive buffer maximum"
+        " for better TCP throughput."
+    ),
+    "net.core.wmem_max": (
+        "Increased socket send buffer maximum"
+        " for better TCP throughput."
+    ),
+    "net.ipv4.tcp_tw_reuse": (
+        "Enabled TIME_WAIT socket reuse for faster"
+        " connection recycling."
+    ),
+    "net.ipv4.tcp_max_tw_buckets": (
+        "Increased TIME_WAIT bucket limit to handle"
+        " high connection churn."
+    ),
+    "net.ipv4.ip_local_port_range": (
+        "Expanded ephemeral port range for more"
+        " concurrent outbound connections."
+    ),
+    "transparent_hugepage": (
+        "Disabled THP to eliminate memory compaction"
+        " latency spikes."
+    ),
+    "selinux": (
+        "Set SELinux to permissive to reduce syscall"
+        " overhead on file access."
+    ),
+    "cpu_governor": (
+        "Set CPU governor to performance for maximum"
+        " clock speed on all 112 cores."
+    ),
 }
 
 

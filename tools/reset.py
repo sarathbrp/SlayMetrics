@@ -110,8 +110,10 @@ def reset_system(client) -> None:
 
     # 5. Reset tuned profile
     print("  [tuned] Resetting to default profile...")
-    client.execute("tuned-adm profile throughput-performance 2>/dev/null || "
-                   "tuned-adm profile virtual-guest 2>/dev/null || true")
+    client.execute(
+        "tuned-adm profile throughput-performance 2>/dev/null || "
+        "tuned-adm profile virtual-guest 2>/dev/null || true"
+    )
 
     # 6. Verify
     print("\n  Verifying...")
@@ -120,7 +122,8 @@ def reset_system(client) -> None:
     nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
     r = client.execute(
         f"{nginx_bin} -T 2>&1 | "
-        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log|worker_connections|open_file_cache|gzip|aio'"
+        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log"
+        "|worker_connections|open_file_cache|gzip|aio'"
     )
     for line in r.stdout.strip().splitlines():
         print(f"  [nginx] {line.strip()}")
@@ -141,12 +144,15 @@ def clear_db(cfg: dict) -> None:
         autocommit=True,
     )
     with conn.cursor() as cur:
+        cur.execute("DELETE FROM validations")
+        cur.execute("DELETE FROM benchmarks")
         cur.execute("DELETE FROM context")
-        cur.execute("DELETE FROM facts WHERE type != 'knowledge'")
         cur.execute("DELETE FROM hypothesis_queue")
-        cur.execute("DELETE FROM profile")
+        cur.execute("DELETE FROM knowledge WHERE type != 'knowledge'")
+        cur.execute("DELETE FROM sessions")
+        # Keep systems — they persist across sessions
     conn.close()
-    print("  [tidb] Cleared all sessions (knowledge base preserved)")
+    print("  [tidb] Cleared all sessions (knowledge base and systems preserved)")
 
 
 def reset_all_db(cfg: dict) -> None:
@@ -162,10 +168,13 @@ def reset_all_db(cfg: dict) -> None:
         autocommit=True,
     )
     with conn.cursor() as cur:
+        cur.execute("DELETE FROM validations")
+        cur.execute("DELETE FROM benchmarks")
         cur.execute("DELETE FROM context")
-        cur.execute("DELETE FROM facts")
         cur.execute("DELETE FROM hypothesis_queue")
-        cur.execute("DELETE FROM profile")
+        cur.execute("DELETE FROM knowledge")
+        cur.execute("DELETE FROM sessions")
+        cur.execute("DELETE FROM systems")
     conn.close()
 
     # Remove knowledge hash so facts/ get reloaded on next run
@@ -200,6 +209,7 @@ def main():
 
     # Resolve ${VAR:-default} in config
     import re
+
     raw = open(args.config).read()
     raw = re.sub(r"\$\{(\w+):-([^}]*)\}", lambda m: os.environ.get(m.group(1), m.group(2)), raw)
     raw = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), raw)

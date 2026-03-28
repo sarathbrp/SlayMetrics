@@ -84,7 +84,7 @@ def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
 
     if clear:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM facts WHERE type = 'knowledge'")
+            cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
             print("Cleared existing knowledge entries.")
 
     # Find all .md files
@@ -111,13 +111,14 @@ def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO facts
-                        (id, session_id, type, parameter, reasoning, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO knowledge
+                        (id, discovered_by, scope, type, parameter, reasoning, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                     (
                         fid,
                         "__knowledge__",
+                        "universal",
                         "knowledge",
                         chunk["title"],
                         chunk["body"][:10000],
@@ -143,7 +144,10 @@ def main():
 
     cfg = load_config(args.config)
     total = load_facts(args.dir, cfg, clear=args.clear)
-    print(f"\nLoaded {total} chunks into TiDB facts table (type='knowledge').")
+    print(
+        f"\nLoaded {total} chunks into TiDB knowledge table"
+        " (type='knowledge', scope='universal')."
+    )
     print("Agent can now query these via semantic search during diagnosis.")
 
 

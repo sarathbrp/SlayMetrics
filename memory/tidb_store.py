@@ -5,12 +5,12 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 import pymysql
 import pymysql.cursors
 
 from memory.embeddings import EmbeddingProvider
-
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
@@ -272,9 +272,7 @@ class TiDBStore:
 
     # ── Sessions ─────────────────────────────────────────────────────────────
 
-    def create_session(
-        self, session_id: str, service: str, host: str, llm_profile: str
-    ) -> str:
+    def create_session(self, session_id: str, service: str, host: str, llm_profile: str) -> str:
         """Create a session, auto-registering the system if needed.
 
         Backward-compatible with old callers that expect (session_id, service, host, llm_profile).
@@ -757,8 +755,12 @@ class TiDBStore:
                     (session_id, size),
                 )
                 rows = cur.fetchall()
-            baseline = next((r for r in rows if r["phase"] == "baseline"), {})
-            final = next((r for r in rows if r["phase"] == "final"), {})
+            baseline: dict[str, Any] = next(
+                (r for r in rows if r["phase"] == "baseline"), {}
+            )
+            final: dict[str, Any] = next(
+                (r for r in rows if r["phase"] == "final"), {}
+            )
             b_rps = baseline.get("rps") or 0
             f_rps = final.get("rps") or 0
             result[size] = {
@@ -850,7 +852,11 @@ class TiDBStore:
             query += " AND source LIKE %s"
             params.append(f"{source_prefix}%")
         if recent_iterations is not None:
-            query += " AND iteration_num >= (SELECT COALESCE(MAX(iteration_num), 0) - %s FROM context WHERE session_id = %s)"
+            query += (
+                " AND iteration_num >= ("
+                "SELECT COALESCE(MAX(iteration_num), 0) - %s"
+                " FROM context WHERE session_id = %s)"
+            )
             params.extend([recent_iterations, session_id])
         query += " ORDER BY created_at DESC"
         if limit is not None:
@@ -864,7 +870,7 @@ class TiDBStore:
             rows = [row for row in rows if str(row.get("source", "")).startswith(prefix)]
             for row in rows:
                 row["type"] = logical_type
-                row["source"] = str(row.get("source", ""))[len(prefix):]
+                row["source"] = str(row.get("source", ""))[len(prefix) :]
         return rows
 
     def cleanup_context(self, session_id: str, keep_last_n: int = 50) -> int:
@@ -910,7 +916,8 @@ class TiDBStore:
                            impact_pct, type, confidence, scope,
                            VEC_COSINE_DISTANCE(embedding, %s) AS score
                     FROM knowledge
-                    WHERE (discovered_by = %s OR type = 'knowledge' OR scope IN ('universal', 'service_type'))
+                    WHERE (discovered_by = %s OR type = 'knowledge'
+                           OR scope IN ('universal', 'service_type'))
                       AND status = 'active'
                       AND embedding IS NOT NULL
                     ORDER BY score ASC
@@ -935,9 +942,7 @@ class TiDBStore:
 
     # ── Hypothesis queue ─────────────────────────────────────────────────────
 
-    def populate_queue(
-        self, session_id: str, hypotheses: list[dict]
-    ) -> None:
+    def populate_queue(self, session_id: str, hypotheses: list[dict]) -> None:
         with self._cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) as cnt FROM hypothesis_queue WHERE session_id=%s",
@@ -977,9 +982,7 @@ class TiDBStore:
             )
             return cur.fetchone()
 
-    def mark_hypothesis(
-        self, session_id: str, name: str, status: str, outcome: str = ""
-    ) -> None:
+    def mark_hypothesis(self, session_id: str, name: str, status: str, outcome: str = "") -> None:
         with self._cursor() as cur:
             cur.execute(
                 """
