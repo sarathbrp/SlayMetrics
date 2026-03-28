@@ -1283,31 +1283,318 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         return {"mismatches": mismatches, "fixed": fixed}
 
-    def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
-        recommendations = list(state.get("recommendations") or [])
+    def _translate_recommendations(
+        raw_recommendations: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Extract nginx and system changes from recommendations.
+
+        Uses nginx_targets/system_targets keys as anchors — scans all text
+        fields in each recommendation for known parameter names, extracts
+        values. Falls back to target defaults if value is unclear.
+        No format-specific parsing. Works with ANY LLM output shape.
+        """
         nginx_changes: dict[str, str] = {}
         system_changes: dict[str, str] = {}
-        recommendation_by_param: dict[tuple[str, str], dict[str, Any]] = {}
 
+        # Build a blob of all recommendation text for scanning
+        all_text = json.dumps(raw_recommendations, ensure_ascii=False)
+
+        # For each known target, check if any recommendation mentions it
+        for param, default_value in nginx_targets.items():
+            if param not in all_text:
+                continue
+            # Find the recommendation that mentions this param
+            value = _extract_value_for_param(param, raw_recommendations)
+            nginx_changes[param] = value or default_value
+
+        for param, default_value in system_targets.items():
+            if param not in all_text:
+                continue
+            value = _extract_value_for_param(param, raw_recommendations)
+            system_changes[param] = value or default_value
+
+        return nginx_changes, system_changes
+
+    def _extract_value_for_param(param: str, recommendations: list[dict[str, Any]]) -> str | None:
+        """Extract the value for a parameter from recommendation fields.
+
+        Checks structured fields first (setting/value, changes, directive),
+        then falls back to regex extraction from text fields.
+        """
+        for rec in recommendations:
+            # 1. Direct changes dict
+            changes = rec.get("changes", {})
+            if isinstance(changes, dict) and param in changes:
+                val = str(changes[param]).strip().rstrip(";").strip()
+                # Strip inline comments
+                if "#" in val:
+                    val = val[: val.index("#")].strip().rstrip(";").strip()
+                if val:
+                    return val
+
+            # 2. setting/value pair
+            if str(rec.get("setting", "")).strip() == param:
+                val = str(rec.get("value", "")).strip().rstrip(";").strip()
+                if "#" in val:
+                    val = val[: val.index("#")].strip().rstrip(";").strip()
+                if val:
+                    return val
+
+            # 3. directive field: "param value;" or "param value"
+            directive = rec.get("directive")
+            directives = (
+                directive
+                if isinstance(directive, list)
+                else [directive]
+                if isinstance(directive, str)
+                else []
+            )
+            for d in directives:
+                d_str = str(d).strip().rstrip(";").strip()
+                parts = d_str.split(None, 1)
+                if parts and parts[0] == param and len(parts) == 2:
+                    val = parts[1].strip().rstrip(";").strip()
+                    if "#" in val:
+                        val = val[: val.index("#")].strip()
+                    if val:
+                        return val
+
+            # 4. config_snippet: parse lines for "param value;"
+            snippet = str(rec.get("config_snippet", "")).strip()
+            if snippet and param in snippet:
+                for line in snippet.replace("\\n", "\n").splitlines():
+                    line = line.strip().rstrip(";").strip()
+                    if line.startswith("#"):
+                        continue
+                    # Special: listen ... backlog=N
+                    if param == "listen_backlog" and "backlog=" in line:
+                        m = re.search(r"backlog=(\d+)", line)
+                        if m:
+                            return m.group(1)
+                    parts = line.split(None, 1)
+                    if parts and parts[0] == param and len(parts) == 2:
+                        val = parts[1].strip().rstrip(";").strip()
+                        if "#" in val:
+                            val = val[: val.index("#")].strip()
+                        if val:
+                            return val
+
+            # 5. commands field: extract value from shell commands
+            commands = rec.get("commands") or (
+                [rec["command"]] if isinstance(rec.get("command"), str) else []
+            )
+            for cmd in commands:
+                cmd_str = str(cmd).strip()
+                # sysctl -w param=value
+                m = re.search(rf"{re.escape(param)}=('[^']*'|\"[^\"]*\"|[^\s]+)", cmd_str)
+                if m:
+                    return m.group(1).strip().strip("'\"")
+                # nginx directive in commands: "param value;"
+                parts = cmd_str.rstrip(";").strip().split(None, 1)
+                if parts and parts[0] == param and len(parts) == 2:
+                    return parts[1].strip().rstrip(";").strip()
+
+        return None
+
+    def _batch_apply_nginx(deps: AgentDeps, changes: dict[str, str]) -> dict:
+        """Apply all nginx changes in a single operation."""
+        if not changes:
+            return {"applied": [], "failed": [], "reload": "SKIPPED"}
+
+        tool_call(
+            "apply_nginx",
+            f"batch {len(changes)} directives: {', '.join(changes.keys())}",
+        )
+
+        ssh = deps.ssh
+        config_path = deps.config["service"]["config_path"]
+
+        # Backup
+        ssh.execute(f"cp {config_path} {config_path}.pre_batch")
+
+        # Apply via adapter (it handles upsert + conf.d cleanup)
+        applied = []
+        failed = []
+        for param, value in changes.items():
+            if deps.adapter.apply_config(param, value):
+                applied.append(param)
+            else:
+                failed.append(param)
+
+        # Reload once after all changes
+        if applied:
+            test = ssh.execute("nginx -t 2>&1")
+            if "syntax is ok" in test.stdout or "test is successful" in test.stdout:
+                deps.adapter.reload()
+                reload_status = "OK"
+            else:
+                # Rollback everything
+                ssh.execute(f"cp {config_path}.pre_batch {config_path}")
+                ssh.execute("nginx -s reload 2>&1 || true")
+                reload_status = "FAILED"
+                failed = list(changes.keys())
+                applied = []
+        else:
+            reload_status = "SKIPPED"
+
+        result = {"applied": applied, "failed": failed, "reload": reload_status}
+        tool_result(
+            "apply_nginx",
+            f"applied={applied} failed={failed} reload={reload_status}",
+        )
+
+        deps.token_counter.tool_calls += 1
+        state["nginx_applied"] = state["nginx_applied"] or bool(applied)
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            f"batch_apply_nginx:{','.join(changes.keys())}"[:250],
+            json.dumps(result),
+            f"nginx batch: {len(applied)} applied, {len(failed)} failed",
+        )
+        return result
+
+    def _batch_apply_system(deps: AgentDeps, changes: dict[str, str]) -> dict:
+        """Apply all system changes in a single SSH script."""
+        if not changes:
+            return {"applied": {}, "failed": {}}
+
+        tool_call(
+            "apply_system",
+            f"batch {len(changes)} params: {', '.join(changes.keys())}",
+        )
+
+        ssh = deps.ssh
+        # Build a single script
+        script_lines = ["#!/bin/bash", "set +e", "RESULT=''"]
+
+        for param, value in changes.items():
+            if param == "transparent_hugepage":
+                script_lines.append(
+                    f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param == "selinux":
+                mode = "0" if value.lower() in ("permissive", "0") else "1"
+                script_lines.append(f"setenforce {mode} 2>&1")
+                if value.lower() in ("permissive", "0"):
+                    script_lines.append(
+                        "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
+                        " /etc/selinux/config 2>/dev/null || true"
+                    )
+                script_lines.append(f'RESULT="$RESULT {param}=OK"')
+            elif param == "cpu_governor":
+                script_lines.append(
+                    f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/"
+                    f"scaling_governor >/dev/null 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param == "nofile":
+                script_lines.extend(
+                    [
+                        "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
+                        f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
+                        f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
+                        f"systemctl set-property nginx.service LimitNOFILE={value}"
+                        " 2>/dev/null || true",
+                        f'RESULT="$RESULT {param}=OK"',
+                    ]
+                )
+            elif param == "irqbalance":
+                script_lines.append(
+                    "systemctl enable --now irqbalance 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param == "net.ipv4.ip_local_port_range":
+                script_lines.append(
+                    f"sysctl -w 'net.ipv4.ip_local_port_range={value}' 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param.startswith("net.") or param.startswith("fs."):
+                script_lines.append(
+                    f"sysctl -w {param}={value} 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            else:
+                script_lines.append(f'RESULT="$RESULT {param}=SKIP"')
+
+        # Restart nginx to pick up nofile changes (if any)
+        if "nofile" in changes:
+            script_lines.append("systemctl daemon-reload && systemctl restart nginx 2>&1 || true")
+
+        script_lines.append("echo $RESULT")
+        script = "\n".join(script_lines)
+
+        result = ssh.execute(f"bash -c '{script}'", timeout=30)
+        output = result.stdout.strip()
+
+        # Parse results
+        applied = {}
+        failed = {}
+        for token in output.split():
+            if "=" not in token:
+                continue
+            key, status = token.rsplit("=", 1)
+            if status == "OK":
+                applied[key] = changes.get(key, "")
+            elif status == "FAIL":
+                failed[key] = "command failed"
+
+        # Any param not in output is assumed applied (some don't echo)
+        for param, value in changes.items():
+            if param not in applied and param not in failed:
+                applied[param] = value
+
+        result_dict: dict[str, Any] = {"applied": applied, "failed": failed}
+        tool_result(
+            "apply_system",
+            f"applied={list(applied.keys())} failed={list(failed.keys())}",
+        )
+
+        deps.token_counter.tool_calls += 1
+        state["system_applied"] = state["system_applied"] or bool(applied)
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            f"batch_apply_system:{','.join(changes.keys())}"[:250],
+            json.dumps(result_dict),
+            f"system batch: {len(applied)} applied, {len(failed)} failed",
+        )
+        return result_dict
+
+    def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
+        recommendations = list(state.get("recommendations") or [])
+
+        # Translate: scan recommendations for known target params
+        nginx_changes, system_changes = _translate_recommendations(recommendations)
+        tool_result(
+            "translate",
+            f"nginx={list(nginx_changes.keys())} system={list(system_changes.keys())}",
+        )
+
+        # Also merge any changes that were already parsed by save_recommendations
         for item in recommendations:
-            scope = str(item.get("scope", "nginx")).lower()
             changes = item.get("changes", {})
             if not isinstance(changes, dict):
                 continue
+            scope = str(item.get("scope", "nginx")).lower()
             for param, value in changes.items():
-                if scope == "system":
-                    system_changes[str(param)] = str(value)
-                    recommendation_by_param[("system", str(param))] = item
-                else:
-                    nginx_changes[str(param)] = str(value)
-                    recommendation_by_param[("nginx", str(param))] = item
+                param_s, value_s = str(param), str(value)
+                # Accept params from adapter allowlist too (broader than targets)
+                allowed_nginx: set[str] = getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", set())
+                if scope == "system" and param_s in system_targets:
+                    system_changes.setdefault(param_s, value_s)
+                elif param_s in nginx_targets or param_s in allowed_nginx:
+                    nginx_changes.setdefault(param_s, value_s)
 
-        nginx_result = {"applied": [], "failed": [], "reload": "SKIPPED"}
-        system_result: dict[str, Any] = {"applied": {}, "failed": {}}
-        if nginx_changes:
-            nginx_result = apply_nginx_impl(deps, nginx_changes)
-        if system_changes:
-            system_result = apply_system_impl(deps, system_changes)
+        # Batch apply
+        nginx_result = _batch_apply_nginx(deps, nginx_changes)
+        system_result = _batch_apply_system(deps, system_changes)
 
         # Verify changes actually took effect on DUT
         tool_call("verify", "checking applied changes on DUT")
@@ -1325,27 +1612,21 @@ def build(model, config=None) -> DiagnosisWorkflow:
         system_current = ((state.get("system_inspection") or {}).get("current")) or {}
         findings: list[dict[str, Any]] = []
         for param in nginx_result.get("applied", []):
-            rec = recommendation_by_param.get(("nginx", param), {})
             findings.append(
                 {
                     "parameter": f"nginx.{param}",
                     "before_value": nginx_current.get(param, ""),
                     "after_value": nginx_changes.get(param, ""),
-                    "reasoning": rec.get("rationale")
-                    or rec.get("recommendation")
-                    or "recommended change applied",
+                    "reasoning": "target-driven tuning applied",
                 }
             )
         for param, value in system_result.get("applied", {}).items():
-            rec = recommendation_by_param.get(("system", param), {})
             findings.append(
                 {
                     "parameter": f"system.{param}",
                     "before_value": system_current.get(param, ""),
                     "after_value": value,
-                    "reasoning": rec.get("rationale")
-                    or rec.get("recommendation")
-                    or "recommended change applied",
+                    "reasoning": "target-driven tuning applied",
                 }
             )
 
