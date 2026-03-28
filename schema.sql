@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS systems (
     host            VARCHAR(256)    NOT NULL,
     service         VARCHAR(64)     NOT NULL,
     service_type    VARCHAR(64),                        -- webserver, database, cache
-    rhel_version    VARCHAR(32),
+    rhel_version    VARCHAR(128),
     kernel_version  VARCHAR(64),
     cpu_cores       INT,
     ram_gb          INT,
