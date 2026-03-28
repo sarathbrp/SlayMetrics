@@ -179,14 +179,20 @@ def _parse_summary_md(text: str) -> dict:
                     }
                 )
 
-        # Parse decision
-        if "Decision" in text:
-            decision_section = text.split("## Decision")[-1].strip()
-            result["decision"] = decision_section.split("\n")[1].strip() if decision_section else ""
-
         # Parse regressions
         if line.startswith("- ") and "vs baseline" in line:
             result["regressions"].append(line[2:])
+
+    # Parse decision (outside loop — operates on full text)
+    if "## Decision" in text:
+        decision_lines = text.split("## Decision")[-1].strip().split("\n")
+        result["decision"] = (
+            decision_lines[1].strip()
+            if len(decision_lines) > 1
+            else decision_lines[0].strip()
+            if decision_lines
+            else ""
+        )
 
     # Extract nginx/system applied booleans
     for line in text.splitlines():
