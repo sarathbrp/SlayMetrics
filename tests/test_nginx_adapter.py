@@ -16,18 +16,24 @@ class FakeSSH:
 
     def execute(self, command: str, timeout: int | None = None) -> SSHResult:
         del timeout
-        if command.startswith("cat /etc/nginx/nginx.conf"):
-            return SSHResult(self.files["/etc/nginx/nginx.conf"], "", 0)
+        if command.startswith("cat /etc/nginx/"):
+            path = command.split()[1]
+            return SSHResult(self.files.get(path, ""), "", 0)
 
         if command.startswith("cp "):
-            _, src, dst = command.split()
-            self.files[dst] = self.files.get(src, "")
+            parts = command.split()
+            if len(parts) >= 3:
+                src, dst = parts[1], parts[2]
+                self.files[dst] = self.files.get(src, "")
             return SSHResult("", "", 0)
 
-        if command.startswith("cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n"):
+        if command.startswith("cat > /tmp/nginx_") and "NGINX_CONF_EOF" in command:
+            # Extract target path and content from heredoc
+            first_line = command.split("\n", 1)[0]
+            path = first_line.split("cat > ")[1].split(" <<")[0].strip()
             content = command.split("\n", 1)[1]
             content = content.rsplit("NGINX_CONF_EOF", 1)[0]
-            self.files["/tmp/nginx_new.conf"] = content
+            self.files[path] = content
             return SSHResult("", "", 0)
 
         if command == "nginx -t 2>&1":

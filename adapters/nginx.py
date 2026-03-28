@@ -103,6 +103,10 @@ class NginxAdapter(ServiceAdapter):
         )
         self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
+        # Remove same directive from included conf.d files to prevent overrides
+        if block == "http":
+            self._remove_from_confd(parameter)
+
         # Validate — rollback if broken
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
@@ -111,45 +115,67 @@ class NginxAdapter(ServiceAdapter):
 
         return True
 
-    def _set_listen_backlog(self, backlog: str) -> bool:
-        """Add backlog= to listen directives inside server {} blocks only."""
-        config_path = self._cfg["config_path"]
-        current = self._ssh.execute(f"cat {config_path}").stdout
-        self._ssh.execute(f"cp {config_path} {config_path}.bak")
-
-        lines = current.splitlines()
-        new_lines = []
-        in_server = False
-        brace_depth = 0
-
-        for line in lines:
-            stripped = line.strip()
-
-            # Track server block depth
-            if re.match(r"server\s*\{", stripped):
-                in_server = True
-                brace_depth = 0
-            if in_server:
-                brace_depth += stripped.count("{") - stripped.count("}")
-                if brace_depth <= 0 and "}" in stripped:
-                    in_server = False
-
-            # Only modify listen inside server blocks.
-            if in_server and re.match(r"listen\s+", stripped):
-                line = _rewrite_listen_backlog_line(line, backlog)
-
-            new_lines.append(line)
-
-        new_config = "\n".join(new_lines) + "\n"
+    def _remove_from_confd(self, parameter: str) -> None:
+        """Remove a directive from all conf.d/*.conf files (server block overrides)."""
         self._ssh.execute(
-            f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
+            f"sed -i '/^[[:space:]]*{parameter}[[:space:]]/d'"
+            " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
         )
-        self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
-        # Validate — rollback if broken
+    def _set_listen_backlog(self, backlog: str) -> bool:
+        """Add backlog= to listen directives in main config and conf.d files."""
+        config_path = self._cfg["config_path"]
+        # Process main config and all conf.d files
+        conf_files = [config_path]
+        confd_list = self._ssh.execute("ls /etc/nginx/conf.d/*.conf 2>/dev/null")
+        if confd_list.ok and confd_list.stdout.strip():
+            for f in confd_list.stdout.strip().splitlines():
+                f = f.strip()
+                if f.endswith(".conf") and f not in conf_files:
+                    conf_files.append(f)
+
+        for conf_file in conf_files:
+            current = self._ssh.execute(f"cat {conf_file}").stdout
+            self._ssh.execute(f"cp {conf_file} {conf_file}.bak")
+
+            lines = current.splitlines()
+            new_lines = []
+            modified = False
+            in_server = False
+            brace_depth = 0
+
+            for line in lines:
+                stripped = line.strip()
+
+                # Track server block depth
+                if re.match(r"server\s*\{", stripped):
+                    in_server = True
+                    brace_depth = 0
+                if in_server:
+                    brace_depth += stripped.count("{") - stripped.count("}")
+                    if brace_depth <= 0 and "}" in stripped:
+                        in_server = False
+
+                if in_server and re.match(r"listen\s+", stripped):
+                    rewritten = _rewrite_listen_backlog_line(line, backlog)
+                    if rewritten != line:
+                        modified = True
+                    new_lines.append(rewritten)
+                else:
+                    new_lines.append(line)
+
+            if modified:
+                new_config = "\n".join(new_lines) + "\n"
+                self._ssh.execute(
+                    f"cat > /tmp/nginx_backlog.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
+                )
+                self._ssh.execute(f"cp /tmp/nginx_backlog.conf {conf_file}")
+
+        # Validate — rollback all if broken
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
-            self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            for conf_file in conf_files:
+                self._ssh.execute(f"cp {conf_file}.bak {conf_file} 2>/dev/null || true")
             return False
         return True
 
