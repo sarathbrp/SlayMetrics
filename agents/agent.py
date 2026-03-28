@@ -1806,9 +1806,9 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
         url_results[name] = {"status": status, "size": size, "time": time}
     diag["url_checks"] = url_results
 
-    # Helper: run SSH with 15s timeout to prevent hangs
+    # Helper: run SSH with 5s timeout — all commands finish in <1s normally
     def _q(cmd: str) -> str:
-        return ssh.execute(cmd, timeout=15).stdout.strip()
+        return ssh.execute(cmd, timeout=5).stdout.strip()
 
     # 2. SELinux state and AVC denials
     diag["selinux_mode"] = _q("getenforce 2>/dev/null")
