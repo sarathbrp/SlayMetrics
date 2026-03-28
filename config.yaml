@@ -12,7 +12,7 @@ llm:
       model: /models/gpt-oss-120b
       model_env: GPT_OSS_MODEL
       base_url: ${GPT_OSS_BASE_URL}
-      api_key_env: GPT_OSS_API_KEY
+      api_key_env: GPT_OSS_API_KEY  # pragma: allowlist secret
 
     claude-api:                        # Claude via Anthropic API
       backend: claude
@@ -77,7 +77,7 @@ rhel:
 
 agent:
   improvement_threshold_pct: 5
-  max_iterations: 50
+  max_iterations: 3
   max_phase: 4
   baseline_mode: fresh
   debug_planner_payloads: false
