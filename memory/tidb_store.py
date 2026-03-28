@@ -206,9 +206,15 @@ class TiDBStore:
             return
         sql = schema_path.read_text(encoding="utf-8")
         with self._conn.cursor() as cur:
-            for stmt in sql.split(";"):
-                stmt = stmt.strip()
-                if stmt and not stmt.startswith("--"):
+            for raw_stmt in sql.split(";"):
+                # Strip comment-only lines, keep actual SQL
+                lines = [
+                    ln
+                    for ln in raw_stmt.splitlines()
+                    if ln.strip() and not ln.strip().startswith("--")
+                ]
+                stmt = "\n".join(lines).strip()
+                if stmt:
                     try:
                         cur.execute(stmt)
                     except Exception:
