@@ -1685,6 +1685,15 @@ def _coerce_recommendations(value: Any, deps: AgentDeps | None = None) -> list[d
     return recommendations
 
 
+def _strip_inline_comment(value: str) -> str:
+    """Strip trailing '# comment' and ';' from a directive value."""
+    # Remove inline comments: "auto; # resolves to 112" -> "auto"
+    idx = value.find("#")
+    if idx > 0:
+        value = value[:idx]
+    return value.strip().rstrip(";").strip()
+
+
 def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(item)
     changes = item.get("changes")
@@ -1698,7 +1707,9 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
     setting = item.get("setting")
     value = item.get("value")
     if isinstance(setting, list) and isinstance(value, list) and len(setting) == len(value):
-        normalized["changes"] = {str(k): str(v) for k, v in zip(setting, value)}
+        normalized["changes"] = {
+            str(k): _strip_inline_comment(str(v)) for k, v in zip(setting, value)
+        }
         normalized["title"] = (
             normalized.get("title") or str(item.get("description", "")).strip() or "batch setting"
         )
@@ -1713,7 +1724,7 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
         return normalized
 
     if setting and value not in (None, ""):
-        normalized["changes"] = {str(setting): str(value)}
+        normalized["changes"] = {str(setting): _strip_inline_comment(str(value))}
         normalized["title"] = (
             normalized.get("title") or str(item.get("description", "")).strip() or f"Set {setting}"
         )
@@ -1745,12 +1756,12 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
             continue
         if value not in (None, ""):
             # Explicit value provided separately
-            directive_changes[d_str] = str(value)
+            directive_changes[d_str] = _strip_inline_comment(str(value))
         else:
             # Parse "directive_name value" from the string itself
             parts = d_str.split(None, 1)
             if len(parts) == 2:
-                directive_changes[parts[0]] = parts[1].rstrip(";").strip()
+                directive_changes[parts[0]] = _strip_inline_comment(parts[1].rstrip(";").strip())
             elif len(parts) == 1:
                 # Single word like "on" or "off" — can't determine key/value
                 pass
@@ -1780,9 +1791,15 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
             line = line.strip().rstrip(";").strip()
             if not line or line.startswith("#"):
                 continue
+            # Extract backlog=N from listen lines
+            if line.startswith("listen "):
+                backlog_m = re.search(r"backlog=(\d+)", line)
+                if backlog_m:
+                    snippet_changes["listen_backlog"] = backlog_m.group(1)
+                continue
             parts = line.split(None, 1)
             if len(parts) == 2:
-                snippet_changes[parts[0]] = parts[1].rstrip(";").strip()
+                snippet_changes[parts[0]] = _strip_inline_comment(parts[1].rstrip(";").strip())
         if snippet_changes:
             normalized["scope"] = normalized.get("scope") or "nginx"
             normalized["changes"] = snippet_changes
