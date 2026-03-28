@@ -1764,6 +1764,80 @@ def build(model, config=None) -> DiagnosisWorkflow:
     return workflow
 
 
+def _save_preflight_hypothesis(
+    deps: AgentDeps,
+    diag: dict[str, Any],
+    url_results: dict[str, dict[str, Any]],
+    problems: list[str],
+) -> None:
+    """Save preflight diagnostics to the hypothesis folder."""
+    cfg = getattr(deps, "config", {}) or {}
+    agent_cfg = cfg.get("agent") or {}
+    enabled = bool(agent_cfg.get("persist_hypotheses")) or bool(
+        agent_cfg.get("debug_planner_payloads", False)
+    )
+    if not enabled:
+        return
+
+    path = Path(__file__).resolve().parent.parent / "hypothesis" / str(deps.session_id)
+    path.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# Pre-flight Validation",
+        "",
+        "## HTTP Response Checks",
+        "",
+        "| Workload | Status | Size | Time | Result |",
+        "|----------|--------|------|------|--------|",
+    ]
+    for name, result in url_results.items():
+        status = result.get("status", "?")
+        size = result.get("size", "?")
+        time = result.get("time", "?")
+        ok = "OK" if status == "200" else "FAIL"
+        lines.append(f"| {name} | {status} | {size} | {time}s | {ok} |")
+
+    lines.extend(["", "## System Diagnostics", ""])
+
+    diag_items = [
+        ("SELinux Mode", "selinux_mode"),
+        ("SELinux Denials", "selinux_denials"),
+        ("File Labels", "file_labels"),
+        ("Stress Data Labels", "stress_data_labels"),
+        ("Nginx Config Test", "nginx_test"),
+        ("Nginx Error Log", "nginx_error_log"),
+        ("Iptables Rules", "iptables_rules"),
+        ("Nftables Rules", "nftables_rules"),
+        ("Traffic Control", "tc_rules"),
+        ("Nginx Nice/Priority", "nginx_nice"),
+        ("Nginx Cgroup CPU", "nginx_cgroup_cpu"),
+        ("Nginx Service Limits", "nginx_service_limits"),
+        ("Top CPU Processes", "top_cpu_procs"),
+        ("Swap Usage", "swap_usage"),
+        ("MTU", "mtu"),
+        ("NIC Offload", "nic_offload"),
+        ("CPU Governor", "cpu_governor"),
+        ("Document Root", "document_root"),
+    ]
+    for label, key in diag_items:
+        val = diag.get(key, "")
+        if val:
+            lines.append(f"### {label}")
+            lines.append(f"```\n{val[:500]}\n```")
+            lines.append("")
+
+    if problems:
+        lines.extend(["## Problems Detected", ""])
+        for p in problems:
+            lines.append(f"- {p}")
+        lines.append("")
+    else:
+        lines.extend(["## Result", "", "All workloads return HTTP 200 — no issues found.", ""])
+
+    target = path / "00_preflight.md"
+    target.write_text("\n".join(lines), encoding="utf-8")
+
+
 async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
     """Pre-flight validation agent: verify DUT serves all workloads correctly.
 
@@ -1873,6 +1947,9 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
     for name, result in url_results.items():
         if result["status"] != "200":
             problems.append(f"{name}: HTTP {result['status']} (expected 200)")
+
+    # Save preflight diagnostics to hypothesis folder
+    _save_preflight_hypothesis(deps, diag, url_results, problems)
 
     if not problems:
         tool_result("preflight", "all workloads return HTTP 200 — OK")
