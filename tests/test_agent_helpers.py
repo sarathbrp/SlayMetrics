@@ -992,7 +992,6 @@ def test_apply_from_recommendations_nginx_and_system():
     result = agent._apply_from_recommendations(ctx.deps)
     assert "nginx" in result
     assert "system" in result
-    assert "benchmark" in result
     assert "findings" in result
 
 def test_apply_from_recommendations_skips_non_dict_changes():

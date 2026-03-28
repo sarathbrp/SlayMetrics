@@ -1619,9 +1619,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
             system_applied=system_result.get("applied", {}),
         )
 
-        bench_duration = int(deps.config["service"]["benchmark"].get("duration", 30))
-        benchmark_result = run_benchmark_impl(deps, bench_duration)
-
+        # Save findings (no per-apply benchmark — iteration loop handles that)
         nginx_current = ((state.get("nginx_inspection") or {}).get("current")) or {}
         system_current = ((state.get("system_inspection") or {}).get("current")) or {}
         findings: list[dict[str, Any]] = []
@@ -1644,45 +1642,12 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 }
             )
 
-        guardrail = _evaluate_nginx_guardrails(deps, benchmark_result)
-        deps.memory.save_context(
-            deps.session_id,
-            "metric",
-            "guardrail_validation",
-            json.dumps(guardrail),
-            guardrail["summary"],
-        )
-
-        if findings and guardrail["ok"]:
-            state["guardrail_failure"] = ""
+        if findings:
             save_findings_impl(deps, findings)
-        elif findings:
-            state["guardrail_failure"] = guardrail["summary"]
-            state["nginx_applied"] = False
-            state["system_applied"] = False
-            state["findings"] = []
-            for finding in findings:
-                deps.memory.save_fact(
-                    session_id=deps.session_id,
-                    type="negative",
-                    parameter=finding.get("parameter", "unknown"),
-                    reasoning=guardrail["summary"],
-                    before_value=finding.get("before_value", ""),
-                    after_value=finding.get("after_value", ""),
-                    before_rps=guardrail["baseline_rps"],
-                    after_rps=guardrail["after_rps"],
-                    impact_pct=guardrail["impact_pct"],
-                    status="regressed",
-                )
-                tool_result(
-                    "guardrail",
-                    f"blocked {finding.get('parameter', 'unknown')}: {guardrail['summary']}",
-                )
 
         return {
             "nginx": nginx_result,
             "system": system_result,
-            "benchmark": benchmark_result,
             "findings": findings,
         }
 

@@ -895,29 +895,20 @@ def test_run_applies_saved_recommendations(monkeypatch):
     assert output.recommendations[0]["title"] == "Raise connection limits"
 
 
-def test_recommendation_guardrail_records_negative_on_regression():
+def test_apply_from_recommendations_saves_findings_without_benchmark():
+    """apply_saved_recommendations_impl applies changes and saves findings
+    without running a benchmark — the iteration loop handles benchmarking."""
     ctx = _ctx()
-    ctx.deps.adapter.benchmark = lambda duration=30, url="": BenchmarkResult(
-        90.0, 1.0, 3.0, 0.0, duration, url=url, cpu_pct=10.0, mem_mb=20.0
-    )
     agent = build("model")
-    agent._slaymetrics_state["recommendations"] = [
-        {
-            "title": "Enable sendfile",
-            "recommendation": "Enable sendfile",
-            "rationale": "recommended",
-            "scope": "nginx",
-            "changes": {"sendfile": "on"},
-        }
-    ]
     agent._slaymetrics_state["apply_plan"] = {
         "nginx": {"sendfile": "on"},
         "system": {},
     }
     agent._slaymetrics_state["nginx_inspection"] = {"current": {"sendfile": "off"}}
 
-    agent._apply_from_recommendations(ctx.deps)
+    result = agent._apply_from_recommendations(ctx.deps)
 
-    assert any(fact["type"] == "negative" for fact in ctx.deps.memory.saved_facts)
-    assert not any(fact["type"] == "fix" for fact in ctx.deps.memory.saved_facts)
-    assert "RPS regressed" in agent._slaymetrics_state["guardrail_failure"]
+    assert "nginx" in result
+    assert "findings" in result
+    assert "benchmark" not in result
+    assert any(fact["type"] == "fix" for fact in ctx.deps.memory.saved_facts)
