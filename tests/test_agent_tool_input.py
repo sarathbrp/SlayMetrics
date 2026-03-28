@@ -671,7 +671,7 @@ def test_run_uses_debate_planner_mode(monkeypatch):
     monkeypatch.setattr(
         diagnosis_agent,
         "_run_debate_planner",
-        lambda agent, model, deps, context_prompt: asyncio.sleep(0, result=FakeRunResult()),
+        lambda agent, model, deps, context_prompt, agent_state=None: asyncio.sleep(0, result=FakeRunResult()),
     )
     monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
@@ -910,6 +910,10 @@ def test_recommendation_guardrail_records_negative_on_regression():
             "changes": {"sendfile": "on"},
         }
     ]
+    agent._slaymetrics_state["apply_plan"] = {
+        "nginx": {"sendfile": "on"},
+        "system": {},
+    }
     agent._slaymetrics_state["nginx_inspection"] = {"current": {"sendfile": "off"}}
 
     agent._apply_from_recommendations(ctx.deps)

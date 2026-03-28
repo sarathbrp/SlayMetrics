@@ -1568,29 +1568,37 @@ def build(model, config=None) -> DiagnosisWorkflow:
         return result_dict
 
     def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
-        recommendations = list(state.get("recommendations") or [])
+        # Use apply_plan from apply_planner agent (LLM-grouped)
+        apply_plan = state.get("apply_plan") or {}
+        nginx_changes: dict[str, str] = {}
+        system_changes: dict[str, str] = {}
 
-        # Translate: scan recommendations for known target params
-        nginx_changes, system_changes = _translate_recommendations(recommendations)
+        allowed_nginx: set[str] = set(nginx_targets) | set(
+            getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", set())
+        )
+        raw_nginx = apply_plan.get("nginx", {})
+        if isinstance(raw_nginx, dict):
+            for k, v in raw_nginx.items():
+                k_s = str(k).strip()
+                if k_s in allowed_nginx:
+                    nginx_changes[k_s] = str(v).strip().rstrip(";").strip()
+
+        raw_system = apply_plan.get("system", {})
+        if isinstance(raw_system, dict):
+            for k, v in raw_system.items():
+                k_s = str(k).strip()
+                if k_s in system_targets:
+                    system_changes[k_s] = str(v).strip().rstrip(";").strip()
+
+        # Fallback: if apply_planner didn't produce results, use translation
+        if not nginx_changes and not system_changes:
+            recommendations = list(state.get("recommendations") or [])
+            nginx_changes, system_changes = _translate_recommendations(recommendations)
+
         tool_result(
-            "translate",
+            "apply_plan",
             f"nginx={list(nginx_changes.keys())} system={list(system_changes.keys())}",
         )
-
-        # Also merge any changes that were already parsed by save_recommendations
-        for item in recommendations:
-            changes = item.get("changes", {})
-            if not isinstance(changes, dict):
-                continue
-            scope = str(item.get("scope", "nginx")).lower()
-            for param, value in changes.items():
-                param_s, value_s = str(param), str(value)
-                # Accept params from adapter allowlist too (broader than targets)
-                allowed_nginx: set[str] = getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", set())
-                if scope == "system" and param_s in system_targets:
-                    system_changes.setdefault(param_s, value_s)
-                elif param_s in nginx_targets or param_s in allowed_nginx:
-                    nginx_changes.setdefault(param_s, value_s)
 
         # Batch apply
         nginx_result = _batch_apply_nginx(deps, nginx_changes)
@@ -1793,7 +1801,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     config = getattr(deps, "config", {}) or {}
     planner_mode = str((config.get("agent") or {}).get("planner_mode", "debate")).strip().lower()
     if planner_mode == "debate":
-        result = await _run_debate_planner(agent, model, deps, context_prompt)
+        result = await _run_debate_planner(agent, model, deps, context_prompt, state)
     else:
         result = await agent.run(context_prompt, deps=deps)
     apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
@@ -1846,7 +1854,9 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     )
 
 
-async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str):
+async def _run_debate_planner(
+    agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None
+):
     ctx = SimpleNamespace(deps=deps)
     inspect_nginx = agent._function_toolset.tools["inspect_nginx_config"].function
     inspect_system = agent._function_toolset.tools["inspect_system_tuning"].function
@@ -1915,11 +1925,91 @@ async def _run_debate_planner(agent, model, deps: AgentDeps, context_prompt: str
     if recommendations:
         await save_recommendations(ctx, recommendations)
 
+    # ── 4th agent: apply_planner ─────────────────────────────────────
+    # Ask the LLM to group all recommendations into two clean queues:
+    # nginx config directives and system shell commands.
+    _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
+    _nginx_tgt = {
+        "worker_connections": "65536",
+        "worker_rlimit_nofile": "200000",
+        "worker_cpu_affinity": "auto",
+        "open_file_cache": "max=200000 inactive=60s",
+        "open_file_cache_valid": "30s",
+        "open_file_cache_min_uses": "2",
+        "access_log": "off",
+        "tcp_nodelay": "on",
+        "keepalive_requests": "10000",
+        "keepalive_timeout": "30",
+        "reset_timedout_connection": "on",
+        "listen_backlog": "65535",
+        "aio": "threads",
+        **{str(k): str(v) for k, v in (_tuning.get("nginx_targets") or {}).items()},
+    }
+    _sys_tgt = {
+        "net.core.somaxconn": "65535",
+        "net.ipv4.tcp_max_syn_backlog": "65535",
+        "net.core.netdev_max_backlog": "65535",
+        "net.core.rmem_max": "16777216",
+        "net.core.wmem_max": "16777216",
+        "net.ipv4.tcp_tw_reuse": "1",
+        "net.ipv4.tcp_max_tw_buckets": "2000000",
+        "net.ipv4.ip_local_port_range": "1024 65535",
+        "transparent_hugepage": "never",
+        "selinux": "permissive",
+        "cpu_governor": "performance",
+        "nofile": "65536",
+        "irqbalance": "active",
+        **{str(k): str(v) for k, v in (_tuning.get("system_targets") or {}).items()},
+    }
+    apply_prompt = (
+        "You are a performance tuning executor. "
+        "Given the synthesizer's recommendations below, produce a JSON object "
+        "with exactly two keys:\n\n"
+        '1. "nginx" — a flat dictionary of nginx config directives to apply. '
+        f"Only use these allowed directive names: {', '.join(sorted(_nginx_tgt))}. "
+        "Each key is the directive name, each value is the directive value "
+        "(no semicolons, no comments, just the value). Example: "
+        '{"worker_connections": "65536", "access_log": "off"}\n\n'
+        '2. "system" — a flat dictionary of system parameters to apply. '
+        f"Only use these allowed parameter names: {', '.join(sorted(_sys_tgt))}. "
+        "Each key is the parameter name, each value is the target value. Example: "
+        '{"net.core.somaxconn": "65535", "transparent_hugepage": "never", '
+        '"selinux": "permissive"}\n\n'
+        "Rules:\n"
+        "- Include ONLY parameters that the synthesizer recommends changing\n"
+        "- Values must be clean (no comments, no semicolons, no explanations)\n"
+        "- If the synthesizer mentions a parameter but doesn't give a value, "
+        "use these defaults:\n"
+        f"  nginx defaults: {json.dumps(_nginx_tgt)}\n"
+        f"  system defaults: {json.dumps(_sys_tgt)}\n\n"
+        "Synthesizer recommendations:\n"
+        f"{json.dumps(synthesis.get('recommendations', []), ensure_ascii=True)}"
+    )
+    apply_plan, apply_usage = _invoke_json_planner(
+        model, "planner.apply_planner", apply_prompt, deps
+    )
+    if _planner_debug_enabled(deps):
+        tool_result(
+            "debug",
+            f"apply_planner raw: {json.dumps(apply_plan, ensure_ascii=False)}",
+        )
+    _save_planner_artifact(deps, "apply_planner", apply_plan)
+
+    # Store the grouped changes for apply_saved_recommendations_impl
+    if agent_state is not None:
+        agent_state["apply_plan"] = apply_plan
+
     total_in = (
-        nginx_usage["input_tokens"] + rhel_usage["input_tokens"] + synth_usage["input_tokens"]
+        nginx_usage["input_tokens"]
+        + rhel_usage["input_tokens"]
+        + synth_usage["input_tokens"]
+        + apply_usage["input_tokens"]
     )
     total_out = (
-        nginx_usage["output_tokens"] + rhel_usage["output_tokens"] + synth_usage["output_tokens"]
+        nginx_usage["output_tokens"]
+        + rhel_usage["output_tokens"]
+        + synth_usage["output_tokens"]
+        + apply_usage["output_tokens"]
     )
     return SimpleNamespace(
         output=str(synthesis.get("summary") or "Debate planning completed.").strip(),
