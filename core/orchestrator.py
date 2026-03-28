@@ -235,36 +235,112 @@ async def run(model, deps: AgentDeps) -> str:
     logger.status("evidence", "Benchmark and telemetry evidence assembled for RCA")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5: RCA + recommendations
+    # STEP 5: RCA + recommendations (ITERATION LOOP)
     # ══════════════════════════════════════════════════════════════════════════
-    logger.step("Step 5: Running RCA and recommendation planning...")
+    max_iterations = int((cfg.get("agent") or {}).get("max_iterations", 3))
+    iteration_feedback = ""
+    diagnosis = None
+    iteration_finals: dict[str, Any] = {}
 
-    context_prompt = _build_context_prompt(
-        rhel_ver=rhel_ver,
-        kernel_ver=kernel_ver,
-        cpu_cores=cpu_cores,
-        ram_gb=ram_gb,
-        checks_summary=checks_summary,
-        benchmark_evidence_text=benchmark_evidence_text,
-        prior_fixes=prior_fixes,
-        telemetry_summary=telemetry_summary,
-    )
-
-    logger.log("orchestrator", f"Context prompt: {len(context_prompt)} chars", "info")
-
-    with (
-        langfuse.span(
-            "diagnosis_planning",
-            input={
-                "context_prompt_length": len(context_prompt),
-                "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "single"),
-            },
-            metadata={"session_id": session_id},
+    for iteration in range(1, max_iterations + 1):
+        logger.step(
+            f"Step 5: Iteration {iteration}/{max_iterations} — RCA and recommendation planning..."
         )
-        if langfuse
-        else nullcontext()
-    ):
-        diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
+
+        context_prompt = _build_context_prompt(
+            rhel_ver=rhel_ver,
+            kernel_ver=kernel_ver,
+            cpu_cores=cpu_cores,
+            ram_gb=ram_gb,
+            checks_summary=checks_summary,
+            benchmark_evidence_text=benchmark_evidence_text,
+            prior_fixes=prior_fixes,
+            telemetry_summary=telemetry_summary,
+        )
+        if iteration_feedback:
+            context_prompt += f"\n{iteration_feedback}\n"
+
+        logger.log(
+            "orchestrator",
+            f"Context prompt: {len(context_prompt)} chars (iteration {iteration})",
+            "info",
+        )
+
+        with (
+            langfuse.span(
+                "diagnosis_planning",
+                input={
+                    "context_prompt_length": len(context_prompt),
+                    "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "debate"),
+                    "iteration": iteration,
+                },
+                metadata={"session_id": session_id},
+            )
+            if langfuse
+            else nullcontext()
+        ):
+            diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
+
+        # Check if any changes were applied
+        nginx_applied = getattr(diagnosis, "nginx_applied", False)
+        system_applied = getattr(diagnosis, "system_applied", False)
+        if not nginx_applied and not system_applied:
+            logger.status(
+                "iteration",
+                f"Iteration {iteration}: no changes applied — stopping",
+            )
+            break
+
+        # Benchmark ALL workloads to check for regressions
+        if bench_tool == "hackathon":
+            logger.step(f"Step 5.{iteration}: Running post-iteration benchmark (all workloads)...")
+            iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
+            for workload in HACKATHON_WORKLOADS:
+                data = iteration_finals.get(workload, {})
+                if data:
+                    logger.benchmark(
+                        f"iter{iteration} ({workload})",
+                        data.get("rps", 0),
+                        data.get("p99", 0),
+                        0,
+                        0,
+                    )
+
+        # Check exit criteria: all workloads within 1% of baseline
+        should_stop, regressions = _check_iteration_exit(baselines, iteration_finals)
+
+        if should_stop:
+            logger.status(
+                "iteration",
+                f"Iteration {iteration}: all workloads OK — stopping",
+            )
+            break
+
+        if iteration >= max_iterations:
+            logger.status(
+                "iteration",
+                f"Max iterations ({max_iterations}) reached — stopping",
+            )
+            break
+
+        # Build feedback for next iteration
+        applied_changes = []
+        for finding in getattr(diagnosis, "rca_records", []) or []:
+            param = finding.get("parameter") or finding.get("symptom", "")
+            if param:
+                applied_changes.append(str(param)[:50])
+
+        iteration_feedback = _build_iteration_feedback(
+            iteration=iteration,
+            baselines=baselines,
+            current_results=iteration_finals,
+            regressions=regressions,
+        )
+        logger.status(
+            "iteration",
+            f"Iteration {iteration}: {len(regressions)} regressions"
+            f" — continuing to iteration {iteration + 1}",
+        )
 
     notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
     logger.log("agent", f"Summary: {notes}", "result")
@@ -319,8 +395,14 @@ async def run(model, deps: AgentDeps) -> str:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6: Final benchmarks (direct — no LLM)
+    # Reuse last iteration results if available; otherwise run fresh.
     # ══════════════════════════════════════════════════════════════════════════
-    if bench_tool == "hackathon":
+    if iteration_finals:
+        logger.step("Step 6: Using last iteration benchmark as final results...")
+        finals = iteration_finals
+        # Run telemetry capture for the final state
+        _capture_telemetry(deps, scope="final", source="post")
+    elif bench_tool == "hackathon":
         logger.step("Step 6: Running hackathon final benchmark...")
         with (
             langfuse.span(
@@ -592,6 +674,63 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
             f"rx_drop={summary.get('rx_drop_total', 'unknown')}, "
             f"tx_drop={summary.get('tx_drop_total', 'unknown')}, "
             f"estab={summary.get('tcp_established', 'unknown')}"
+        )
+    return "\n".join(lines)
+
+
+def _check_iteration_exit(
+    baselines: dict[str, Any], current_results: dict[str, Any]
+) -> tuple[bool, list[str]]:
+    """Check if all workloads are within 1% of baseline. Returns (should_stop, regressions)."""
+    regressions: list[str] = []
+    for workload in ("small", "medium", "large"):
+        baseline_rps = float(baselines.get(workload, {}).get("rps", 0) or 0)
+        current_rps = float(current_results.get(workload, {}).get("rps", 0) or 0)
+        if not baseline_rps:
+            continue
+        if current_rps < baseline_rps * 0.99:
+            pct = ((current_rps - baseline_rps) / baseline_rps) * 100
+            regressions.append(
+                f"{workload}: {current_rps:.0f} vs baseline {baseline_rps:.0f} ({pct:+.1f}%)"
+            )
+    return (len(regressions) == 0, regressions)
+
+
+def _build_iteration_feedback(
+    *,
+    iteration: int,
+    baselines: dict[str, Any],
+    current_results: dict[str, Any],
+    regressions: list[str],
+) -> str:
+    """Build feedback for the next iteration's context prompt."""
+    lines = [
+        f"\n--- ITERATION {iteration} RESULTS ---",
+        "Per-workload comparison against baseline:",
+    ]
+    for workload in ("homepage", "small", "medium", "large", "mixed"):
+        b_rps = float(baselines.get(workload, {}).get("rps", 0) or 0)
+        c_rps = float(current_results.get(workload, {}).get("rps", 0) or 0)
+        c_p99 = float(current_results.get(workload, {}).get("p99", 0) or 0)
+        if not b_rps:
+            continue
+        pct = ((c_rps - b_rps) / b_rps) * 100
+        status = "OK" if c_rps >= b_rps * 0.99 else "REGRESSED"
+        lines.append(
+            f"  {workload:10s}: baseline={b_rps:.0f} → now={c_rps:.0f} RPS"
+            f" ({pct:+.1f}%) p99={c_p99:.1f}ms [{status}]"
+        )
+    if regressions:
+        lines.append("")
+        lines.append("REGRESSIONS DETECTED:")
+        for r in regressions:
+            lines.append(f"  - {r}")
+        lines.append("")
+        lines.append(
+            "Diagnose what caused the regressions above. "
+            "Identify which change from the previous iteration hurt "
+            "medium/large workloads and revert or adjust ONLY that change. "
+            "Do NOT revert changes that improved other workloads."
         )
     return "\n".join(lines)
 
