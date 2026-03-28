@@ -139,17 +139,27 @@ def clear_db(cfg: dict) -> None:
         host=m["host"],
         port=int(m.get("port", 4000)),
         user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",
+        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
         database=m["database"],
         autocommit=True,
     )
+    tables = [
+        "validations",
+        "benchmarks",
+        "context",
+        "hypothesis_queue",
+        "sessions",
+    ]
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM validations")
-        cur.execute("DELETE FROM benchmarks")
-        cur.execute("DELETE FROM context")
-        cur.execute("DELETE FROM hypothesis_queue")
-        cur.execute("DELETE FROM knowledge WHERE type != 'knowledge'")
-        cur.execute("DELETE FROM sessions")
+        for table in tables:
+            try:
+                cur.execute(f"DELETE FROM {table}")
+            except pymysql.err.ProgrammingError:
+                pass  # table doesn't exist yet — skip
+        try:
+            cur.execute("DELETE FROM knowledge WHERE type != 'knowledge'")
+        except pymysql.err.ProgrammingError:
+            pass
         # Keep systems — they persist across sessions
     conn.close()
     print("  [tidb] Cleared all sessions (knowledge base and systems preserved)")
@@ -163,18 +173,25 @@ def reset_all_db(cfg: dict) -> None:
         host=m["host"],
         port=int(m.get("port", 4000)),
         user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",
+        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
         database=m["database"],
         autocommit=True,
     )
+    tables = [
+        "validations",
+        "benchmarks",
+        "context",
+        "hypothesis_queue",
+        "knowledge",
+        "sessions",
+        "systems",
+    ]
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM validations")
-        cur.execute("DELETE FROM benchmarks")
-        cur.execute("DELETE FROM context")
-        cur.execute("DELETE FROM hypothesis_queue")
-        cur.execute("DELETE FROM knowledge")
-        cur.execute("DELETE FROM sessions")
-        cur.execute("DELETE FROM systems")
+        for table in tables:
+            try:
+                cur.execute(f"DELETE FROM {table}")
+            except pymysql.err.ProgrammingError:
+                pass  # table doesn't exist yet — skip
     conn.close()
 
     # Remove knowledge hash so facts/ get reloaded on next run

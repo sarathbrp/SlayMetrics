@@ -5,7 +5,6 @@ import re
 import sys
 from pathlib import Path
 
-
 ALLOWED_LITERAL_URL_HOSTS = {"127.0.0.1", "0.0.0.0"}
 PLACEHOLDER_HINTS = (
     "your-",
@@ -59,6 +58,8 @@ def _check_file(path_str: str) -> list[str]:
     path = Path(path_str)
     if not path.exists() or not path.is_file() or not _is_text_file(path):
         return []
+    if path.name == "check_repo_hygiene.py":
+        return []  # don't scan ourselves — regex patterns trigger false positives
 
     try:
         text = path.read_text(encoding="utf-8")
@@ -83,6 +84,8 @@ def _check_file(path_str: str) -> list[str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        if "pragma: allowlist secret" in line:
+            continue
         secret_match = SECRET_VALUE_RE.search(line)
         if not secret_match:
             continue
@@ -92,9 +95,7 @@ def _check_file(path_str: str) -> list[str]:
         value = secret_match.group("value").strip()
         if _should_skip_secret_value(value):
             continue
-        errors.append(
-            f"{path}:{lineno}: secret-like assignment blocked for {key}"
-        )
+        errors.append(f"{path}:{lineno}: secret-like assignment blocked for {key}")
 
     return errors
 
