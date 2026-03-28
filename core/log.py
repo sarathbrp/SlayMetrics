@@ -29,12 +29,16 @@ def _write(line: str) -> None:
     _log_file.flush()
 
 
+_log_path: str = ""
+
+
 def init(session_id: str, verbose: bool = False, log_dir: str = "report") -> str:
-    global _log_file, _verbose
+    global _log_file, _verbose, _log_path
     _verbose = verbose
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(log_dir, f"log_{ts}_{session_id}.md")
+    _log_path = path
     _log_file = open(path, "w")
     _log_file.write(f"# SlayMetricsAgent Log — {session_id}\n")
     _log_file.write(f"Started: {datetime.now().isoformat()}\n\n")
@@ -42,6 +46,10 @@ def init(session_id: str, verbose: bool = False, log_dir: str = "report") -> str
     _console.print(f"[dim]Log file:[/dim] {path}")
     _console.print(f"[dim]Report will be saved to:[/dim] {log_dir}/report_*_{session_id}.md")
     return path
+
+
+def get_log_path() -> str:
+    return _log_path
 
 
 def log(agent: str, message: str, level: str = "info") -> None:

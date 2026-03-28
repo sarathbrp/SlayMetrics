@@ -583,15 +583,19 @@ async def run(model, deps: AgentDeps) -> str:
     total_improvement = ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
     nginx_applied = getattr(diagnosis, "nginx_applied", "unknown")
     system_applied = getattr(diagnosis, "system_applied", "unknown")
+    hypothesis_path = f"hypothesis/{session_id}/"
+    log_file_path = logger.get_log_path()
     logger.panel(
         "SlayMetricsAgent Complete",
+        f"Session: {session_id}\n"
         f"Baseline (small): {baseline_rps:.1f} req/sec\n"
         f"Best (small):     {best_rps:.1f} req/sec\n"
         f"Improvement: {total_improvement:+.1f}%\n"
         f"Nginx applied: {nginx_applied}, System applied: {system_applied}\n"
         f"Tokens used: {deps.token_counter.summary()}\n"
         f"Report: {report_path}\n"
-        f"Log: report/log_*_{session_id}.md",
+        f"Log: {log_file_path}\n"
+        f"Hypotheses: {hypothesis_path}",
     )
     if langfuse:
         langfuse.event(
