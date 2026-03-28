@@ -1885,9 +1885,10 @@ async def _run_debate_planner(
     if _planner_debug_enabled(deps):
         tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=False)}")
 
-    _save_planner_artifact(deps, "nginx_expert", nginx_analysis)
-    _save_planner_artifact(deps, "rhel_expert", rhel_analysis)
-    _save_planner_artifact(deps, "synthesizer", synthesis)
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, "nginx_expert", nginx_analysis, iteration=_iter)
+    _save_planner_artifact(deps, "rhel_expert", rhel_analysis, iteration=_iter)
+    _save_planner_artifact(deps, "synthesizer", synthesis, iteration=_iter)
 
     rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
     recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)
@@ -1971,7 +1972,7 @@ async def _run_debate_planner(
             "debug",
             f"apply_planner raw: {json.dumps(apply_plan, ensure_ascii=False)}",
         )
-    _save_planner_artifact(deps, "apply_planner", apply_plan)
+    _save_planner_artifact(deps, "apply_planner", apply_plan, iteration=_iter)
 
     # Store the grouped changes for apply_saved_recommendations_impl
     if agent_state is not None:
@@ -2431,23 +2432,36 @@ def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:
     return extracted
 
 
-def _save_planner_artifact(deps: AgentDeps, source: str, payload: dict[str, Any]) -> None:
+def _save_planner_artifact(
+    deps: AgentDeps,
+    source: str,
+    payload: dict[str, Any],
+    iteration: int = 0,
+) -> None:
+    iter_label = f"iter{iteration}_{source}" if iteration else source
     deps.memory.save_context(
         deps.session_id,
         "command_output",
-        source,
+        iter_label,
         json.dumps(payload, ensure_ascii=True),
-        f"{source} planner output",
+        f"{iter_label} planner output",
     )
     file_map = {
-        "nginx_expert": "01_nginx_expert.md",
-        "rhel_expert": "02_rhel_expert.md",
-        "synthesizer": "03_synthesizer.md",
+        "nginx_expert": "01_nginx_expert",
+        "rhel_expert": "02_rhel_expert",
+        "synthesizer": "03_synthesizer",
+        "apply_planner": "04_apply_planner",
     }
+    base = file_map.get(source, source)
+    if iteration:
+        filename = f"iter{iteration}_{base}.md"
+    else:
+        filename = f"{base}.md"
     _persist_hypothesis_markdown(
         deps,
-        filename=file_map.get(source, f"{source}.md"),
-        title=source.replace("_", " ").title(),
+        filename=filename,
+        title=f"{'Iter ' + str(iteration) + ' — ' if iteration else ''}"
+        f"{source.replace('_', ' ').title()}",
         sections=[
             ("Summary", str(payload.get("summary", "")).strip() or "No summary returned."),
             ("Payload", _markdown_json(payload)),

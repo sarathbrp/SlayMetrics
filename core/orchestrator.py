@@ -246,6 +246,8 @@ async def run(model, deps: AgentDeps) -> str:
         logger.step(
             f"Step 5: Iteration {iteration}/{max_iterations} — RCA and recommendation planning..."
         )
+        # Pass iteration number to agent for per-iteration hypothesis files
+        deps.iteration = iteration  # type: ignore[attr-defined]
 
         context_prompt = _build_context_prompt(
             rhel_ver=rhel_ver,
