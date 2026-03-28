@@ -1570,6 +1570,12 @@ def build(model, config=None) -> DiagnosisWorkflow:
     def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
         # Use apply_plan from apply_planner agent (LLM-grouped)
         apply_plan = state.get("apply_plan") or {}
+        tool_call(
+            "apply",
+            f"apply_plan keys={list(apply_plan.keys())} "
+            f"nginx={list((apply_plan.get('nginx') or {}).keys())} "
+            f"system={list((apply_plan.get('system') or {}).keys())}",
+        )
         nginx_changes: dict[str, str] = {}
         system_changes: dict[str, str] = {}
 
@@ -1987,6 +1993,13 @@ async def _run_debate_planner(
     )
     apply_plan, apply_usage = _invoke_json_planner(
         model, "planner.apply_planner", apply_prompt, deps
+    )
+    # Always log apply_planner output — this is the critical translation step
+    nginx_keys = list((apply_plan.get("nginx") or {}).keys())
+    system_keys = list((apply_plan.get("system") or {}).keys())
+    tool_call(
+        "apply_planner",
+        f"nginx={nginx_keys} system={system_keys}",
     )
     if _planner_debug_enabled(deps):
         tool_result(
