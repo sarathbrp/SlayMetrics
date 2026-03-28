@@ -664,8 +664,21 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     failed[param] = result.stderr.strip()
             elif param == "selinux":
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
-                ssh.execute(f"setenforce {mode} 2>&1")
-                applied[param] = value
+                result = ssh.execute(f"setenforce {mode} 2>&1")
+                # Persist across reboots
+                if value.lower() in ("permissive", "0"):
+                    ssh.execute(
+                        "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
+                        " /etc/selinux/config 2>/dev/null || true"
+                    )
+                # Verify it actually changed
+                verify = ssh.execute("getenforce 2>/dev/null")
+                actual = verify.stdout.strip().lower()
+                expected = "permissive" if mode == "0" else "enforcing"
+                if actual == expected:
+                    applied[param] = value
+                else:
+                    failed[param] = f"setenforce ran but getenforce={actual}"
             elif param == "cpu_governor":
                 result = ssh.execute(
                     f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>&1"
@@ -686,7 +699,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
                     f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
                     f"systemctl set-property nginx.service LimitNOFILE={value} 2>/dev/null || true",
-                    "systemctl daemon-reload && systemctl reload nginx 2>&1 || true",
+                    "systemctl daemon-reload && systemctl restart nginx 2>&1 || true",
                 ]
                 for cmd in cmds:
                     ssh.execute(cmd)

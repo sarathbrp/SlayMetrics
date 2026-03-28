@@ -717,6 +717,7 @@ def test_apply_system_transparent_hugepage():
 
 def test_apply_system_selinux():
     ctx = _ctx()
+    ctx.deps.ssh._outputs["getenforce"] = SSHResult("Permissive\n", "", 0)
     agent = build("model")
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"selinux": "permissive"}))
@@ -752,6 +753,7 @@ def test_apply_system_irqbalance():
 
 def test_apply_system_multiple():
     ctx = _ctx()
+    ctx.deps.ssh._outputs["getenforce"] = SSHResult("Permissive\n", "", 0)
     agent = build("model")
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {
