@@ -80,8 +80,8 @@ agent:
   max_iterations: 3
   max_phase: 4
   baseline_mode: fresh
-  debug_planner_payloads: false
-  persist_hypotheses: false
+  debug_planner_payloads: true
+  persist_hypotheses: true
   benchmark_after_every_fix: true
   stability:
     enabled: false
