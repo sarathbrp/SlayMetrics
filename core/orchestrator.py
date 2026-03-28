@@ -237,8 +237,11 @@ async def run(model, deps: AgentDeps) -> str:
 
     if prior_fixes:
         for pf in prior_fixes:
+            impact = pf.get("impact")
+            impact_str = f"{impact:+.1f}%" if impact is not None else "n/a"
             logger.status(
-                "context", f"  Prior fix: {pf['parameter']} = {pf['value']} ({pf['impact']:+.1f}%)"
+                "context",
+                f"  Prior fix: {pf.get('parameter', '?')} = {pf.get('value', '?')} ({impact_str})",
             )
     else:
         logger.status("context", "No prior fixes found — fresh diagnosis")
