@@ -1714,19 +1714,75 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
         )
         return normalized
 
-    directive = str(item.get("directive", "")).strip()
+    directive_raw = item.get("directive")
     value = item.get("value")
-    if directive and value not in (None, ""):
-        normalized["scope"] = "nginx"
-        normalized["changes"] = {directive: str(value)}
-        normalized["title"] = normalized.get("title") or f"Set {directive}"
+
+    # Parse directive(s) into changes — handles both string and list forms
+    directive_changes: dict[str, str] = {}
+    directives = (
+        directive_raw
+        if isinstance(directive_raw, list)
+        else [directive_raw]
+        if isinstance(directive_raw, str) and directive_raw.strip()
+        else []
+    )
+    for d in directives:
+        d_str = str(d).strip().rstrip(";").strip()
+        if not d_str:
+            continue
+        if value not in (None, ""):
+            # Explicit value provided separately
+            directive_changes[d_str] = str(value)
+        else:
+            # Parse "directive_name value" from the string itself
+            parts = d_str.split(None, 1)
+            if len(parts) == 2:
+                directive_changes[parts[0]] = parts[1].rstrip(";").strip()
+            elif len(parts) == 1:
+                # Single word like "on" or "off" — can't determine key/value
+                pass
+    if directive_changes:
+        normalized["scope"] = normalized.get("scope") or "nginx"
+        normalized["changes"] = directive_changes
+        normalized["title"] = (
+            normalized.get("title")
+            or str(item.get("action", "")).strip()
+            or f"Set {', '.join(directive_changes)}"
+        )
         normalized["recommendation"] = (
-            normalized.get("recommendation") or f"Set {directive} to {value}"
+            normalized.get("recommendation")
+            or str(item.get("action", "")).strip()
+            or f"Apply directives: {', '.join(directive_changes)}"
         )
         normalized["rationale"] = (
             normalized.get("rationale") or normalized.get("justification") or ""
         )
         return normalized
+
+    # Try config_snippet — synthesizer sometimes puts nginx directives here
+    snippet = str(item.get("config_snippet", "")).strip()
+    if snippet:
+        snippet_changes: dict[str, str] = {}
+        for line in snippet.replace("\\n", "\n").splitlines():
+            line = line.strip().rstrip(";").strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                snippet_changes[parts[0]] = parts[1].rstrip(";").strip()
+        if snippet_changes:
+            normalized["scope"] = normalized.get("scope") or "nginx"
+            normalized["changes"] = snippet_changes
+            normalized["title"] = (
+                normalized.get("title") or str(item.get("action", "")).strip() or "apply config"
+            )
+            normalized["recommendation"] = (
+                normalized.get("recommendation") or str(item.get("action", "")).strip() or snippet
+            )
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
 
     action = str(item.get("action", "")).strip().rstrip(";")
     if action:
