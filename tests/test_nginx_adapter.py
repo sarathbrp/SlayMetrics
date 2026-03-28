@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from adapters.nginx import NginxAdapter, _rewrite_listen_backlog_line
@@ -133,7 +131,7 @@ def test_apply_config_supports_open_file_cache_related_http_directives():
     assert "    open_file_cache_min_uses 2;" in final
 
 
-def test_apply_config_only_rewrites_http_level_directive_and_preserves_server_override():
+def test_apply_config_removes_server_block_duplicates_for_http_directives():
     initial = (
         "http {\n"
         "    sendfile on;\n"
@@ -148,9 +146,9 @@ def test_apply_config_only_rewrites_http_level_directive_and_preserves_server_ov
     assert adapter.apply_config("sendfile", "off") is True
 
     final = ssh.files["/etc/nginx/nginx.conf"]
-    assert final.count("sendfile off;") == 2
+    # Server-block duplicate removed; only http-level directive remains
+    assert final.count("sendfile off;") == 1
     assert "    sendfile off;" in final
-    assert "        sendfile off;" in final
 
 
 def test_apply_config_returns_false_when_target_context_block_is_missing():
@@ -162,7 +160,7 @@ def test_apply_config_returns_false_when_target_context_block_is_missing():
 
 
 def test_benchmark_uses_hackathon_runner_when_configured(monkeypatch):
-    monkeypatch.setenv("DUT_HOST", "172.21.90.178")
+    monkeypatch.setenv("DUT_HOST", "127.0.0.1")
     payload = (
         '{"results":{"requests":{"per_sec":431193.8},'
         '"latency":{"percentiles":{"p50":"1.2ms","p99":"9.2ms"}},"duration":60}}'
@@ -177,7 +175,7 @@ def test_benchmark_uses_hackathon_runner_when_configured(monkeypatch):
                     "script": "/root/hackathon-tools/benchmark.sh",
                     "contestant_name": "slaymetrics",
                     "target_host_env": "DUT_HOST",
-                    "small_file_url": "http://172.21.90.178/1kb.html",
+                    "small_file_url": "http://127.0.0.1/1kb.html",
                 },
             }
         },
@@ -185,7 +183,7 @@ def test_benchmark_uses_hackathon_runner_when_configured(monkeypatch):
         bench=bench,
     )
 
-    result = adapter.benchmark(url="http://172.21.90.178/1kb.html")
+    result = adapter.benchmark(url="http://127.0.0.1/1kb.html")
 
     assert result.requests_per_sec == 431193.8
     assert result.latency_p99_ms == 9.2

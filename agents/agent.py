@@ -1864,12 +1864,13 @@ def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:
         if not command:
             continue
 
-        sysctl_match = re.search(r"sysctl\s+-w\s+([A-Za-z0-9_.]+)=(.+)$", command)
-        if sysctl_match:
-            key = sysctl_match.group(1).strip()
-            value = sysctl_match.group(2).strip().strip('"').strip("'")
-            extracted[key] = value
-            continue
+        if "sysctl" in command and "-w" in command:
+            # Extract all key=value pairs from multi-param sysctl commands
+            sysctl_pairs = re.findall(r"([A-Za-z0-9_.]+)=('[^']*'|\"[^\"]*\"|[^\s]+)", command)
+            if sysctl_pairs:
+                for key, value in sysctl_pairs:
+                    extracted[key] = value.strip().strip('"').strip("'")
+                continue
 
         if "transparent_hugepage/enabled" in command and "echo never" in command:
             extracted["transparent_hugepage"] = "never"

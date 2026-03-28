@@ -353,6 +353,10 @@ def _upsert_directive_in_context(
     block_open_idx: int | None = None
     seen = False
 
+    # For http-level directives, also remove duplicates from server blocks
+    # so the http-level value isn't overridden by a more specific scope.
+    remove_from_children = context == "http"
+
     for line in lines:
         stripped = line.strip()
         current_scope = _scope_name(stack)
@@ -361,6 +365,10 @@ def _upsert_directive_in_context(
             if not seen:
                 new_lines.append(new_directive)
                 seen = True
+            continue
+
+        # Remove same directive from child scopes (e.g. server block)
+        if remove_from_children and current_scope not in ("main", context) and pattern.match(line):
             continue
 
         new_lines.append(line)
