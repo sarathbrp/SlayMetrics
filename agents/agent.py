@@ -1144,6 +1144,145 @@ def build(model, config=None) -> DiagnosisWorkflow:
             "impact_pct": impact_pct,
         }
 
+    def _verify_applied_changes(
+        deps: AgentDeps,
+        nginx_applied: list[str] | Any,
+        nginx_changes: dict[str, str],
+        system_applied: dict[str, str],
+    ) -> dict[str, Any]:
+        """Re-read DUT state and verify changes actually took effect."""
+        ssh = deps.ssh
+        mismatches: list[dict[str, str]] = []
+        fixed: list[str] = []
+
+        # ── Verify nginx directives via nginx -T ────────────────────────
+        if nginx_applied:
+            raw = ssh.execute("nginx -T 2>/dev/null").stdout
+            for param in nginx_applied:
+                expected = nginx_changes.get(param, "")
+                if param == "listen_backlog":
+                    match = re.search(r"listen\s+.*backlog=(\d+)", raw)
+                    actual = match.group(1) if match else "not set"
+                else:
+                    match = re.search(rf"^\s*{param}\s+(.+?);", raw, re.MULTILINE)
+                    actual = match.group(1).strip() if match else "not set"
+                if actual != expected and actual != "not set":
+                    # Check if the value is functionally equivalent
+                    if actual.replace(" ", "") == expected.replace(" ", ""):
+                        continue
+                if actual == "not set" or actual != expected:
+                    mismatches.append(
+                        {
+                            "scope": "nginx",
+                            "param": param,
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+                    # Try to fix: remove from conf.d and retry
+                    ssh.execute(
+                        f"sed -i '/^[[:space:]]*{param}[[:space:]]/d'"
+                        " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
+                    )
+                    fixed.append(param)
+
+            if fixed:
+                # Reload nginx after conf.d cleanup
+                ssh.execute("nginx -t 2>&1 && nginx -s reload 2>&1")
+                tool_result(
+                    "verify",
+                    f"fixed {len(fixed)} conf.d overrides: {', '.join(fixed)}",
+                )
+
+        # ── Verify system parameters ────────────────────────────────────
+        sysctl_params = [p for p in system_applied if p.startswith("net.") or p.startswith("fs.")]
+        for param in sysctl_params:
+            expected = system_applied[param]
+            result = ssh.execute(f"sysctl -n {param} 2>/dev/null")
+            actual = result.stdout.strip()
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": param,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
+                # Retry the sysctl
+                ssh.execute(f"sysctl -w {param}={expected} 2>&1")
+
+        if "transparent_hugepage" in system_applied:
+            result = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
+            match = re.search(r"\[(\w+)\]", result.stdout)
+            actual = match.group(1) if match else "unknown"
+            if actual != system_applied["transparent_hugepage"]:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": "transparent_hugepage",
+                        "expected": system_applied["transparent_hugepage"],
+                        "actual": actual,
+                    }
+                )
+
+        if "selinux" in system_applied:
+            result = ssh.execute("getenforce 2>/dev/null")
+            actual = result.stdout.strip().lower()
+            if actual != system_applied["selinux"]:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": "selinux",
+                        "expected": system_applied["selinux"],
+                        "actual": actual,
+                    }
+                )
+
+        if "nofile" in system_applied:
+            result = ssh.execute(
+                "cat /proc/$(pgrep -o nginx)/limits 2>/dev/null | grep 'Max open files'"
+            )
+            actual_line = result.stdout.strip()
+            nofile_match = re.search(r"(\d+)\s+(\d+)", actual_line)
+            actual_soft = nofile_match.group(1) if nofile_match else "unknown"
+            if actual_soft != system_applied["nofile"]:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": "nofile",
+                        "expected": system_applied["nofile"],
+                        "actual": actual_soft,
+                    }
+                )
+                # Force restart nginx to pick up new limits
+                ssh.execute("systemctl restart nginx 2>&1 || true")
+
+        # Log results
+        if mismatches:
+            summary = "; ".join(
+                f"{m['param']}={m['actual']} (expected {m['expected']})" for m in mismatches
+            )
+            tool_result("verify", f"mismatches found: {summary}")
+            deps.memory.save_context(
+                deps.session_id,
+                "command_output",
+                "post_apply_verification",
+                json.dumps({"mismatches": mismatches, "fixed": fixed}),
+                f"verification: {len(mismatches)} mismatches, {len(fixed)} conf.d fixes",
+            )
+        else:
+            tool_result("verify", "all changes verified on DUT")
+            deps.memory.save_context(
+                deps.session_id,
+                "command_output",
+                "post_apply_verification",
+                json.dumps({"status": "all_verified"}),
+                "verification: all changes confirmed on DUT",
+            )
+
+        return {"mismatches": mismatches, "fixed": fixed}
+
     def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
         recommendations = list(state.get("recommendations") or [])
         nginx_changes: dict[str, str] = {}
@@ -1169,6 +1308,15 @@ def build(model, config=None) -> DiagnosisWorkflow:
             nginx_result = apply_nginx_impl(deps, nginx_changes)
         if system_changes:
             system_result = apply_system_impl(deps, system_changes)
+
+        # Verify changes actually took effect on DUT
+        tool_call("verify", "checking applied changes on DUT")
+        _verify_applied_changes(
+            deps,
+            nginx_applied=nginx_result.get("applied", []),
+            nginx_changes=nginx_changes,
+            system_applied=system_result.get("applied", {}),
+        )
 
         bench_duration = int(deps.config["service"]["benchmark"].get("duration", 30))
         benchmark_result = run_benchmark_impl(deps, bench_duration)
