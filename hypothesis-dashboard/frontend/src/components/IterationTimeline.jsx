@@ -1,19 +1,17 @@
 import React, { useState } from 'react'
 
 function StatusBadge({ status }) {
-  if (status === 'OK') return <span className="text-emerald-400 font-medium">✓ OK</span>
-  if (status === 'REGRESSED') return <span className="text-red-400 font-medium">✗ REGRESSED</span>
-  return <span className="text-gray-400">{status}</span>
+  if (status === 'OK') return <span className="pill-badge pill-ok text-xs">✓ OK</span>
+  if (status === 'REGRESSED') return <span className="pill-badge pill-regressed text-xs">✗ REGRESSED</span>
+  return <span className="pill-badge pill-neutral text-xs">{status}</span>
 }
 
 function DecisionBadge({ decision }) {
   if (!decision) return null
   const isOk = decision.includes('OK') || decision.includes('stopping')
   const isMax = decision.includes('Max iterations')
-  const color = isOk && !isMax ? 'bg-emerald-900 text-emerald-300 border-emerald-700'
-    : isMax ? 'bg-yellow-900 text-yellow-300 border-yellow-700'
-    : 'bg-red-900 text-red-300 border-red-700'
-  return <span className={`px-3 py-1 rounded-full text-xs font-medium border ${color}`}>{decision}</span>
+  const cls = isOk && !isMax ? 'pill-ok' : isMax ? 'pill-warn' : 'pill-regressed'
+  return <span className={`pill-badge ${cls}`}>{decision}</span>
 }
 
 function AgentSection({ title, data }) {
@@ -21,19 +19,29 @@ function AgentSection({ title, data }) {
   if (!data || (!data.summary && !data.payload)) return null
 
   return (
-    <div className="border-t border-gray-700 mt-2 pt-2">
+    <div className="mt-3 pt-3" style={{ borderTop: '1px solid var(--table-border)' }}>
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 transition"
+        className="flex items-center gap-2 text-sm font-medium transition-all duration-200 hover:opacity-80 group"
+        style={{ color: 'var(--text-secondary)' }}
       >
-        <span className={`transform transition ${open ? 'rotate-90' : ''}`}>▶</span>
-        {title}
+        <span className={`transform transition-transform duration-200 text-xs ${open ? 'rotate-90' : ''}`}>
+          ▶
+        </span>
+        <span className="font-mono text-xs px-2 py-0.5 rounded-md" style={{ background: 'var(--progress-bg)' }}>
+          {title}
+        </span>
       </button>
       {open && (
-        <div className="mt-2 pl-4">
-          {data.summary && <p className="text-sm text-gray-300 mb-2">{data.summary}</p>}
+        <div className="mt-3 pl-5 animate-fade-in">
+          {data.summary && (
+            <p className="text-sm mb-2" style={{ color: 'var(--text-secondary)' }}>{data.summary}</p>
+          )}
           {data.payload && Object.keys(data.payload).length > 0 && (
-            <pre className="text-xs text-gray-400 bg-gray-800 p-3 rounded overflow-x-auto max-h-64 overflow-y-auto">
+            <pre
+              className="text-xs font-mono p-4 rounded-xl overflow-x-auto max-h-64 overflow-y-auto"
+              style={{ background: 'var(--code-bg)', color: 'var(--text-secondary)' }}
+            >
               {JSON.stringify(data.payload, null, 2)}
             </pre>
           )}
@@ -54,49 +62,73 @@ export default function IterationTimeline({ iterations }) {
 
   return (
     <div className="space-y-4">
-      <h3 className="text-lg font-semibold text-gray-200">Iteration Timeline</h3>
-      {iterations.map((iter) => {
+      <h3 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>
+        Iteration Timeline
+      </h3>
+      {iterations.map((iter, idx) => {
         const summary = iter.summary || {}
         const benchmarks = summary.benchmarks || []
         const decision = summary.decision || ''
 
         return (
-          <div key={iter.iteration} className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h4 className="font-semibold text-gray-200">Iteration {iter.iteration}</h4>
+          <div
+            key={iter.iteration}
+            className="glass-card p-5 stagger-item"
+            style={{ animationDelay: `${idx * 80}ms` }}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div
+                  className="w-8 h-8 rounded-lg flex items-center justify-center text-white text-sm font-bold"
+                  style={{ background: 'var(--accent-gradient)' }}
+                >
+                  {iter.iteration}
+                </div>
+                <h4 className="font-semibold" style={{ color: 'var(--text-primary)' }}>
+                  Iteration {iter.iteration}
+                </h4>
+              </div>
               <DecisionBadge decision={decision} />
             </div>
 
             {/* Benchmark table */}
             {benchmarks.length > 0 && (
-              <table className="w-full text-sm mb-3">
-                <thead>
-                  <tr className="text-gray-400 border-b border-gray-700">
-                    <th className="text-left py-1">Workload</th>
-                    <th className="text-right py-1">Baseline</th>
-                    <th className="text-right py-1">Current</th>
-                    <th className="text-right py-1">Change</th>
-                    <th className="text-right py-1">p99</th>
-                    <th className="text-right py-1">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {benchmarks.map((b) => (
-                    <tr key={b.workload} className="border-b border-gray-800">
-                      <td className="py-1 text-gray-300">{b.workload}</td>
-                      <td className="py-1 text-right text-gray-400">{fmtRps(b.baseline_rps)}</td>
-                      <td className="py-1 text-right text-gray-200 font-medium">{fmtRps(b.current_rps)}</td>
-                      <td className="py-1 text-right">
-                        <span className={b.change?.includes('-') && !b.change?.includes('-0') ? 'text-red-400' : 'text-emerald-400'}>
-                          {b.change}
-                        </span>
-                      </td>
-                      <td className="py-1 text-right text-gray-400">{b.p99_ms?.toFixed(1)}ms</td>
-                      <td className="py-1 text-right"><StatusBadge status={b.status} /></td>
+              <div className="overflow-x-auto mb-3">
+                <table className="w-full text-sm styled-table">
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid var(--table-border)' }}>
+                      <th className="text-left py-2 px-2">Workload</th>
+                      <th className="text-right py-2 px-2">Baseline</th>
+                      <th className="text-right py-2 px-2">Current</th>
+                      <th className="text-right py-2 px-2">Change</th>
+                      <th className="text-right py-2 px-2">p99</th>
+                      <th className="text-right py-2 px-2">Status</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {benchmarks.map((b) => (
+                      <tr key={b.workload}>
+                        <td className="py-2 px-2" style={{ color: 'var(--text-secondary)' }}>{b.workload}</td>
+                        <td className="py-2 px-2 text-right font-mono text-xs" style={{ color: 'var(--text-muted)' }}>
+                          {fmtRps(b.baseline_rps)}
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+                          {fmtRps(b.current_rps)}
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono text-xs">
+                          <span className={b.change?.includes('-') && !b.change?.includes('-0') ? 'text-red-400' : 'text-emerald-400'}>
+                            {b.change}
+                          </span>
+                        </td>
+                        <td className="py-2 px-2 text-right font-mono text-xs" style={{ color: 'var(--text-muted)' }}>
+                          {b.p99_ms?.toFixed(1)}ms
+                        </td>
+                        <td className="py-2 px-2 text-right"><StatusBadge status={b.status} /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
 
             {/* Agent analyses */}
@@ -107,11 +139,19 @@ export default function IterationTimeline({ iterations }) {
 
             {/* Applied changes */}
             {summary.applied_changes?.length > 0 && (
-              <div className="mt-3 pt-2 border-t border-gray-700">
-                <p className="text-xs text-gray-400 mb-1">Applied:</p>
-                <div className="flex flex-wrap gap-1">
+              <div className="mt-3 pt-3" style={{ borderTop: '1px solid var(--table-border)' }}>
+                <p className="text-xs font-medium mb-2" style={{ color: 'var(--text-muted)' }}>Applied:</p>
+                <div className="flex flex-wrap gap-2">
                   {summary.applied_changes.map((c, i) => (
-                    <span key={i} className="px-2 py-0.5 bg-gray-800 text-xs text-gray-300 rounded">
+                    <span
+                      key={i}
+                      className="px-3 py-1 text-xs font-medium rounded-lg transition-all duration-200 hover:scale-105"
+                      style={{
+                        background: 'var(--progress-bg)',
+                        color: 'var(--text-secondary)',
+                        border: '1px solid var(--border-card)',
+                      }}
+                    >
                       {c.title}
                     </span>
                   ))}

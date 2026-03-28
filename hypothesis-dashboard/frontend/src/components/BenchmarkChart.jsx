@@ -22,21 +22,40 @@ export default function BenchmarkChart({ baselines, finals, title }) {
     }))
 
   return (
-    <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
-      <h3 className="text-lg font-semibold text-gray-200 mb-4">{title || 'Benchmark Results'}</h3>
+    <div className="glass-card p-5">
+      <h3 className="text-lg font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>
+        {title || 'Benchmark Results'}
+      </h3>
       <ResponsiveContainer width="100%" height={320}>
         <BarChart data={data} barGap={4}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-          <XAxis dataKey="workload" stroke="#9CA3AF" />
-          <YAxis tickFormatter={fmt} stroke="#9CA3AF" />
+          <defs>
+            <linearGradient id="gradBaseline" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#64748b" stopOpacity={0.8} />
+              <stop offset="100%" stopColor="#64748b" stopOpacity={0.3} />
+            </linearGradient>
+            <linearGradient id="gradAfter" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#10b981" stopOpacity={1} />
+              <stop offset="100%" stopColor="#06b6d4" stopOpacity={0.7} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--chart-grid)" />
+          <XAxis dataKey="workload" stroke="var(--text-muted)" tick={{ fontSize: 12 }} />
+          <YAxis tickFormatter={fmt} stroke="var(--text-muted)" tick={{ fontSize: 12 }} />
           <Tooltip
-            contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }}
-            labelStyle={{ color: '#E5E7EB' }}
+            contentStyle={{
+              background: 'var(--tooltip-bg)',
+              border: '1px solid var(--tooltip-border)',
+              borderRadius: '12px',
+              backdropFilter: 'blur(12px)',
+              boxShadow: '0 8px 32px rgba(0,0,0,0.12)',
+              color: 'var(--tooltip-text)',
+            }}
+            labelStyle={{ color: 'var(--text-primary)', fontWeight: 600 }}
             formatter={(v) => [fmt(v) + ' RPS', '']}
           />
-          <Legend />
-          <Bar dataKey="baseline" fill="#6B7280" name="Baseline" radius={[4, 4, 0, 0]} />
-          <Bar dataKey="after" fill="#10B981" name="After Tuning" radius={[4, 4, 0, 0]} />
+          <Legend wrapperStyle={{ fontSize: '12px', color: 'var(--text-secondary)' }} />
+          <Bar dataKey="baseline" fill="url(#gradBaseline)" name="Baseline" radius={[6, 6, 0, 0]} />
+          <Bar dataKey="after" fill="url(#gradAfter)" name="After Tuning" radius={[6, 6, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
     </div>
