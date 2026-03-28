@@ -1806,67 +1806,67 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
         url_results[name] = {"status": status, "size": size, "time": time}
     diag["url_checks"] = url_results
 
+    # Helper: run SSH with 15s timeout to prevent hangs
+    def _q(cmd: str) -> str:
+        return ssh.execute(cmd, timeout=15).stdout.strip()
+
     # 2. SELinux state and AVC denials
-    diag["selinux_mode"] = ssh.execute("getenforce 2>/dev/null").stdout.strip()
-    diag["selinux_denials"] = ssh.execute(
-        "ausearch -m avc -ts recent 2>/dev/null | tail -20"
-    ).stdout.strip()[:2000]
+    diag["selinux_mode"] = _q("getenforce 2>/dev/null")
+    diag["selinux_denials"] = _q("timeout 5 ausearch -m avc -ts recent 2>/dev/null | tail -20")[
+        :2000
+    ]
 
     # 3. File permissions and SELinux labels
-    diag["file_labels"] = ssh.execute(f"ls -laZ {docroot}/ 2>/dev/null | head -10").stdout.strip()
-    if "stress_test_data" in ssh.execute(f"ls {docroot}/").stdout:
-        diag["stress_data_labels"] = ssh.execute(
+    diag["file_labels"] = _q(f"ls -laZ {docroot}/ 2>/dev/null | head -10")
+    if "stress_test_data" in _q(f"ls {docroot}/ 2>/dev/null"):
+        diag["stress_data_labels"] = _q(
             f"ls -laZ {docroot}/stress_test_data/small/000/000/ 2>/dev/null | head -5"
-        ).stdout.strip()
+        )
 
     # 4. Nginx config validation
-    diag["nginx_test"] = ssh.execute("nginx -t 2>&1").stdout.strip()
-    diag["nginx_error_log"] = ssh.execute(
-        "tail -20 /var/log/nginx/error.log 2>/dev/null"
-    ).stdout.strip()[:1000]
+    diag["nginx_test"] = _q("nginx -t 2>&1")
+    diag["nginx_error_log"] = _q("tail -20 /var/log/nginx/error.log 2>/dev/null")[:1000]
 
     # 5. Firewall / traffic control rules
-    diag["iptables_rules"] = ssh.execute(
-        "iptables -L -n 2>/dev/null | grep -v '^Chain\\|^target\\|^$' | head -20"
-    ).stdout.strip()
-    diag["nftables_rules"] = ssh.execute(
-        "nft list ruleset 2>/dev/null | grep -E 'drop|reject|limit' | head -10"
-    ).stdout.strip()
-    diag["tc_rules"] = ssh.execute(
-        "tc qdisc show 2>/dev/null | grep -v 'noqueue\\|pfifo_fast' | head -10"
-    ).stdout.strip()
+    diag["iptables_rules"] = _q(
+        "timeout 5 iptables -L -n 2>/dev/null | grep -v '^Chain\\|^target\\|^$' | head -20"
+    )
+    diag["nftables_rules"] = _q(
+        "timeout 5 nft list ruleset 2>/dev/null | grep -E 'drop|reject|limit' | head -10"
+    )
+    diag["tc_rules"] = _q("tc qdisc show 2>/dev/null | grep -v 'noqueue\\|pfifo_fast' | head -10")
 
     # 6. Process-level throttling
-    diag["nginx_nice"] = ssh.execute(
-        "ps -o pid,ni,cls,rtprio,comm -C nginx | head -5"
-    ).stdout.strip()
-    diag["nginx_cgroup_cpu"] = ssh.execute(
+    diag["nginx_nice"] = _q("ps -o pid,ni,cls,rtprio,comm -C nginx | head -5")
+    diag["nginx_cgroup_cpu"] = _q(
         "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null"
-        " || cat /sys/fs/cgroup/cpu/system.slice/nginx.service/cpu.cfs_quota_us"
-        " 2>/dev/null || echo 'no cgroup throttle'"
-    ).stdout.strip()
-    diag["nginx_service_limits"] = ssh.execute(
+        " || cat /sys/fs/cgroup/cpu/system.slice/nginx.service/"
+        "cpu.cfs_quota_us 2>/dev/null || echo 'no cgroup throttle'"
+    )
+    diag["nginx_service_limits"] = _q(
         "systemctl show nginx.service 2>/dev/null"
         " | grep -E 'LimitNOFILE|LimitMEMLOCK|CPUQuota|MemoryLimit'"
-    ).stdout.strip()
+    )
 
     # 7. Background resource hogs
-    diag["top_cpu_procs"] = ssh.execute("ps aux --sort=-%cpu | head -10").stdout.strip()
-    diag["swap_usage"] = ssh.execute("free -m | grep Swap").stdout.strip()
+    diag["top_cpu_procs"] = _q("ps aux --sort=-%cpu | head -10")
+    diag["swap_usage"] = _q("free -m | grep Swap")
 
     # 8. Network interface checks
-    diag["mtu"] = ssh.execute(
+    diag["mtu"] = _q(
         "ip link show $(ip route get 1 | awk '{print $5; exit}') 2>/dev/null | grep mtu"
-    ).stdout.strip()
-    diag["nic_offload"] = ssh.execute(
-        "ethtool -k $(ip route get 1 | awk '{print $5; exit}') 2>/dev/null"
-        " | grep -E 'tcp-segmentation|generic-segmentation|generic-receive'"
-    ).stdout.strip()
+    )
+    diag["nic_offload"] = _q(
+        "ethtool -k $(ip route get 1 | awk '{print $5; exit}')"
+        " 2>/dev/null"
+        " | grep -E 'tcp-segmentation|generic-segmentation"
+        "|generic-receive'"
+    )
 
     # 9. CPU governor
-    diag["cpu_governor"] = ssh.execute(
+    diag["cpu_governor"] = _q(
         "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
-    ).stdout.strip()
+    )
 
     # ── Check if there are problems ─────────────────────────────────
     problems = []
