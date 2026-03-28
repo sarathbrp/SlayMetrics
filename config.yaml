@@ -89,6 +89,37 @@ agent:
     sample_interval_sec: 60
     url_key: small_file_url
 
+tuning:
+  nginx_targets:
+    worker_connections: "65536"
+    worker_rlimit_nofile: "200000"
+    worker_cpu_affinity: "auto"
+    open_file_cache: "max=200000 inactive=60s"
+    open_file_cache_valid: "30s"
+    open_file_cache_min_uses: "2"
+    access_log: "off"
+    tcp_nodelay: "on"
+    keepalive_requests: "10000"
+    keepalive_timeout: "30"
+    reset_timedout_connection: "on"
+    listen_backlog: "65535"
+    aio: "threads"
+
+  system_targets:
+    net.core.somaxconn: "65535"
+    net.ipv4.tcp_max_syn_backlog: "65535"
+    net.core.netdev_max_backlog: "65535"
+    net.core.rmem_max: "16777216"
+    net.core.wmem_max: "16777216"
+    net.ipv4.tcp_tw_reuse: "1"
+    net.ipv4.tcp_max_tw_buckets: "2000000"
+    net.ipv4.ip_local_port_range: "1024 65535"
+    transparent_hugepage: "never"
+    selinux: "permissive"
+    cpu_governor: "performance"
+    nofile: "65536"
+    irqbalance: "active"
+
 telemetry:
   langfuse:
     enabled: true

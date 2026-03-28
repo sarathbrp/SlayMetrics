@@ -586,7 +586,7 @@ def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
         async def run(self, prompt, deps):
             return FakeRunResult()
 
-    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model, config=None: FakeAgent())
     monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
@@ -627,7 +627,7 @@ def test_run_does_not_double_count_usage(monkeypatch):
         async def run(self, prompt, deps):
             return FakeRunResult()
 
-    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model, config=None: FakeAgent())
     monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
@@ -665,7 +665,7 @@ def test_run_uses_debate_planner_mode(monkeypatch):
         def all_messages(self):
             return []
 
-    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model, config=None: FakeAgent())
     monkeypatch.setattr(
         diagnosis_agent,
         "_run_debate_planner",
@@ -887,7 +887,7 @@ def test_run_applies_saved_recommendations(monkeypatch):
             self._slaymetrics_state["recommendations"] = [{"title": "Raise connection limits"}]
             return {}
 
-    monkeypatch.setattr(diagnosis_agent, "build", lambda model: FakeAgent())
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model, config=None: FakeAgent())
     monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
     monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)

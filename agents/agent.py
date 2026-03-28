@@ -181,7 +181,7 @@ class DiagnosisWorkflow:
         )
 
 
-def build(model) -> DiagnosisWorkflow:
+def build(model, config=None) -> DiagnosisWorkflow:
     state: dict[str, Any] = {
         "nginx_applied": False,
         "system_applied": False,
@@ -280,7 +280,8 @@ def build(model) -> DiagnosisWorkflow:
                 merged[key_str] = str(value)
         return merged, None
 
-    nginx_targets = {
+    _tuning_cfg = (config or {}).get("tuning") or {}
+    nginx_targets: dict[str, str] = {
         "worker_connections": "65536",
         "worker_rlimit_nofile": "200000",
         "worker_cpu_affinity": "auto",
@@ -294,9 +295,9 @@ def build(model) -> DiagnosisWorkflow:
         "reset_timedout_connection": "on",
         "listen_backlog": "65535",
         "aio": "threads",
+        **{str(k): str(v) for k, v in (_tuning_cfg.get("nginx_targets") or {}).items()},
     }
-
-    system_targets = {
+    system_targets: dict[str, str] = {
         "net.core.somaxconn": "65535",
         "net.ipv4.tcp_max_syn_backlog": "65535",
         "net.core.netdev_max_backlog": "65535",
@@ -308,6 +309,9 @@ def build(model) -> DiagnosisWorkflow:
         "transparent_hugepage": "never",
         "selinux": "permissive",
         "cpu_governor": "performance",
+        "nofile": "65536",
+        "irqbalance": "active",
+        **{str(k): str(v) for k, v in (_tuning_cfg.get("system_targets") or {}).items()},
     }
 
     def inspect_irq_impl(deps: AgentDeps) -> dict:
@@ -461,6 +465,10 @@ def build(model) -> DiagnosisWorkflow:
             "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
         )
         current["cpu_governor"] = governor.stdout.strip() or "not available"
+        nofile_r = ssh.execute("ulimit -Sn 2>/dev/null || echo unknown")
+        current["nofile"] = nofile_r.stdout.strip()
+        irq_r = ssh.execute("systemctl is-active irqbalance 2>/dev/null || echo inactive")
+        current["irqbalance"] = irq_r.stdout.strip()
 
         needs_fixing = {}
         already_ok = []
@@ -670,6 +678,22 @@ def build(model) -> DiagnosisWorkflow:
                     applied[param] = value
                 else:
                     failed[param] = result.stderr.strip()
+            elif param == "nofile":
+                cmds = [
+                    f"sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
+                    f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
+                    f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
+                    f"systemctl set-property nginx.service LimitNOFILE={value} 2>/dev/null || true",
+                    "systemctl daemon-reload && systemctl reload nginx 2>&1 || true",
+                ]
+                ok = all(ssh.execute(cmd).ok or True for cmd in cmds)
+                applied[param] = value
+            elif param == "irqbalance":
+                result = ssh.execute("systemctl enable --now irqbalance 2>&1")
+                if result.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = result.stderr.strip() or "irqbalance enable failed"
             else:
                 result = ssh.execute(f"sysctl -w {param}={value} 2>&1")
                 if result.ok:
@@ -1319,7 +1343,7 @@ def build(model) -> DiagnosisWorkflow:
 async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     """Run the diagnosis workflow and derive the final structured result in Python."""
     llm_call("agent", "Starting diagnosis — sending context to LLM...")
-    agent = build(model)
+    agent = build(model, config=getattr(deps, "config", None))
     state = getattr(agent, "_slaymetrics_state", {})
     config = getattr(deps, "config", {}) or {}
     planner_mode = str((config.get("agent") or {}).get("planner_mode", "single")).strip().lower()
@@ -1803,6 +1827,22 @@ def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:
             tw_match = re.search(r"tcp_tw_reuse=(.+)$", command)
             if tw_match:
                 extracted["net.ipv4.tcp_tw_reuse"] = tw_match.group(1).strip().strip('"').strip("'")
+            continue
+
+        ulimit_match = re.search(r"ulimit\s+-n\s+(\d+)", command)
+        if ulimit_match:
+            extracted["nofile"] = ulimit_match.group(1)
+            continue
+
+        nofile_match = re.search(r"nofile\s+(\d+)", command)
+        if nofile_match and "limits.conf" in command and "soft" in command:
+            extracted["nofile"] = nofile_match.group(1)
+            continue
+
+        if "irqbalance" in command and any(v in command for v in ("enable", "start")):
+            extracted["irqbalance"] = "enabled"
+            continue
+
     return extracted
 
 
