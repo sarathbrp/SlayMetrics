@@ -2469,6 +2469,98 @@ def _save_planner_artifact(
     )
 
 
+def save_iteration_summary(
+    deps: AgentDeps,
+    *,
+    iteration: int,
+    baselines: dict[str, Any],
+    results: dict[str, Any],
+    regressions: list[str],
+    decision: str,
+    diagnosis: Any = None,
+) -> None:
+    """Save a complete iteration summary to the hypothesis folder."""
+    cfg = getattr(deps, "config", {}) or {}
+    agent_cfg = cfg.get("agent") or {}
+    enabled = bool(agent_cfg.get("persist_hypotheses")) or bool(
+        agent_cfg.get("debug_planner_payloads", False)
+    )
+    if not enabled:
+        return
+
+    path = Path(__file__).resolve().parent.parent / "hypothesis" / str(deps.session_id)
+    path.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        f"# Iteration {iteration} Summary",
+        "",
+        "## Benchmark Results",
+        "",
+        "| Workload | Baseline RPS | Current RPS | Change | p99 (ms) | Status |",
+        "|----------|-------------|-------------|--------|----------|--------|",
+    ]
+    for workload in ("homepage", "small", "medium", "large", "mixed"):
+        b_rps = float(baselines.get(workload, {}).get("rps", 0) or 0)
+        c_rps = float(results.get(workload, {}).get("rps", 0) or 0)
+        c_p99 = float(results.get(workload, {}).get("p99", 0) or 0)
+        if not b_rps and not c_rps:
+            continue
+        pct = ((c_rps - b_rps) / b_rps * 100) if b_rps else 0
+        status = "OK" if c_rps >= b_rps * 0.99 else "REGRESSED"
+        lines.append(
+            f"| {workload} | {b_rps:.0f} | {c_rps:.0f} | {pct:+.1f}% | {c_p99:.1f} | {status} |"
+        )
+
+    # Applied changes
+    lines.extend(["", "## Applied Changes", ""])
+    if diagnosis:
+        nginx_applied = getattr(diagnosis, "nginx_applied", False)
+        system_applied = getattr(diagnosis, "system_applied", False)
+        lines.append(f"- Nginx applied: {nginx_applied}")
+        lines.append(f"- System applied: {system_applied}")
+        recs = getattr(diagnosis, "recommendations", []) or []
+        if recs:
+            lines.append(f"- Recommendations count: {len(recs)}")
+            for r in recs[:20]:
+                title = r.get("title", r.get("action", "?"))
+                scope = r.get("scope", "?")
+                changes = r.get("changes", {})
+                lines.append(f"  - [{scope}] {title}: {changes}")
+
+    # Regressions
+    if regressions:
+        lines.extend(["", "## Regressions Detected", ""])
+        for r in regressions:
+            lines.append(f"- {r}")
+
+    # Decision
+    lines.extend(["", "## Decision", "", decision, ""])
+
+    target = path / f"iter{iteration}_00_summary.md"
+    target.write_text("\n".join(lines), encoding="utf-8")
+
+    # Also save to TiDB
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        f"iter{iteration}_summary",
+        json.dumps(
+            {
+                "iteration": iteration,
+                "baselines": {
+                    w: baselines.get(w, {}).get("rps", 0) for w in ("small", "medium", "large")
+                },
+                "results": {
+                    w: results.get(w, {}).get("rps", 0) for w in ("small", "medium", "large")
+                },
+                "regressions": regressions,
+                "decision": decision,
+            }
+        ),
+        f"iteration {iteration}: {decision}",
+    )
+
+
 def _hypothesis_enabled(deps: AgentDeps) -> bool:
     cfg = getattr(deps, "config", {}) or {}
     agent_cfg = cfg.get("agent") or {}

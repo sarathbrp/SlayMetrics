@@ -287,9 +287,16 @@ async def run(model, deps: AgentDeps) -> str:
         nginx_applied = getattr(diagnosis, "nginx_applied", False)
         system_applied = getattr(diagnosis, "system_applied", False)
         if not nginx_applied and not system_applied:
-            logger.status(
-                "iteration",
-                f"Iteration {iteration}: no changes applied — stopping",
+            decision = "No changes applied — stopping"
+            logger.status("iteration", f"Iteration {iteration}: {decision}")
+            diagnosis_agent.save_iteration_summary(
+                deps,
+                iteration=iteration,
+                baselines=baselines,
+                results=iteration_finals or baselines,
+                regressions=[],
+                decision=decision,
+                diagnosis=diagnosis,
             )
             break
 
@@ -312,36 +319,51 @@ async def run(model, deps: AgentDeps) -> str:
         should_stop, regressions = _check_iteration_exit(baselines, iteration_finals)
 
         if should_stop:
-            logger.status(
-                "iteration",
-                f"Iteration {iteration}: all workloads OK — stopping",
+            decision = f"All workloads OK — stopping after iteration {iteration}"
+            logger.status("iteration", f"Iteration {iteration}: {decision}")
+            diagnosis_agent.save_iteration_summary(
+                deps,
+                iteration=iteration,
+                baselines=baselines,
+                results=iteration_finals,
+                regressions=regressions,
+                decision=decision,
+                diagnosis=diagnosis,
             )
             break
 
         if iteration >= max_iterations:
-            logger.status(
-                "iteration",
-                f"Max iterations ({max_iterations}) reached — stopping",
+            decision = f"Max iterations ({max_iterations}) reached — stopping"
+            logger.status("iteration", f"Iteration {iteration}: {decision}")
+            diagnosis_agent.save_iteration_summary(
+                deps,
+                iteration=iteration,
+                baselines=baselines,
+                results=iteration_finals,
+                regressions=regressions,
+                decision=decision,
+                diagnosis=diagnosis,
             )
             break
 
-        # Build feedback for next iteration
-        applied_changes = []
-        for finding in getattr(diagnosis, "rca_records", []) or []:
-            param = finding.get("parameter") or finding.get("symptom", "")
-            if param:
-                applied_changes.append(str(param)[:50])
+        # Continuing to next iteration
+        decision = f"{len(regressions)} regressions — continuing to iteration {iteration + 1}"
+        logger.status("iteration", f"Iteration {iteration}: {decision}")
+        diagnosis_agent.save_iteration_summary(
+            deps,
+            iteration=iteration,
+            baselines=baselines,
+            results=iteration_finals,
+            regressions=regressions,
+            decision=decision,
+            diagnosis=diagnosis,
+        )
 
         iteration_feedback = _build_iteration_feedback(
             iteration=iteration,
             baselines=baselines,
             current_results=iteration_finals,
             regressions=regressions,
-        )
-        logger.status(
-            "iteration",
-            f"Iteration {iteration}: {len(regressions)} regressions"
-            f" — continuing to iteration {iteration + 1}",
         )
 
     notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
