@@ -55,8 +55,8 @@ def inspect_webserver(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> 
     return {
         "category": "webserver",
         "needs_fixing": needs_fixing,
-        "already_ok": already_ok,
-        "current": current,
+        "ok_count": len(already_ok),
+        "current": current,  # kept for before_value in findings, not sent to LLM
     }
 
 
@@ -116,8 +116,8 @@ def inspect_kernel(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> dic
     return {
         "category": "kernel",
         "needs_fixing": needs_fixing,
-        "already_ok": already_ok,
-        "current": current,
+        "ok_count": len(already_ok),
+        "current": current,  # kept for before_value in findings, not sent to LLM
     }
 
 
@@ -127,14 +127,13 @@ def inspect_resource_limits(
     """Category 3: Inspect cgroups, systemd limits, ulimits, background hogs."""
     findings: dict[str, Any] = {}
 
-    # Systemd service limits
+    # Systemd service limits (parse only, don't store raw output)
     svc_limits = ssh.execute(
         "systemctl show nginx.service 2>/dev/null"
         " | grep -E 'LimitNOFILE|LimitNPROC|CPUQuota|MemoryMax|MemoryLimit"
         "|IOWeight|CPUWeight'",
         timeout=5,
     ).stdout.strip()
-    findings["systemd_limits"] = svc_limits
 
     # Parse LimitNOFILE
     nofile_match = re.search(r"LimitNOFILE=(\d+)", svc_limits)
@@ -143,13 +142,11 @@ def inspect_resource_limits(
     nproc_match = re.search(r"LimitNPROC=(\d+|infinity)", svc_limits)
     findings["systemd_nproc"] = nproc_match.group(1) if nproc_match else "unknown"
 
-    # Cgroup CPU
+    # Cgroup CPU (parse percentage only)
     cgroup_cpu = ssh.execute(
         "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null || echo 'max 100000'",
         timeout=5,
     ).stdout.strip()
-    findings["cgroup_cpu"] = cgroup_cpu
-    # Parse: "150000 1000000" means 15% CPU cap
     cpu_parts = cgroup_cpu.split()
     if cpu_parts and cpu_parts[0] != "max" and len(cpu_parts) >= 2:
         try:
@@ -158,12 +155,16 @@ def inspect_resource_limits(
         except (ValueError, ZeroDivisionError):
             pass
 
-    # Cgroup memory
+    # Cgroup memory (parse to MB)
     cgroup_mem = ssh.execute(
         "cat /sys/fs/cgroup/system.slice/nginx.service/memory.max 2>/dev/null || echo 'max'",
         timeout=5,
     ).stdout.strip()
-    findings["cgroup_memory"] = cgroup_mem
+    if cgroup_mem != "max":
+        try:
+            findings["cgroup_memory_mb"] = int(cgroup_mem) // (1024 * 1024)
+        except ValueError:
+            pass
 
     # IO and CPU weight
     io_weight_match = re.search(r"IOWeight=(\d+)", svc_limits)
@@ -178,27 +179,21 @@ def inspect_resource_limits(
     ).stdout.strip()
     findings["numa_policy"] = "interleave" if "interleave" in numa_dropin else "default"
 
-    # Background hogs
-    top_procs = ssh.execute("ps aux --sort=-%cpu 2>/dev/null | head -8", timeout=5).stdout.strip()
-    findings["top_cpu_procs"] = top_procs
-
-    # Detect specific hogs (dd, fio, stress-ng)
+    # Detect specific hogs (dd, fio, stress-ng) — bool + summary only
     hog_procs = ssh.execute(
         "pgrep -la 'dd |fio|stress|sysbench|iperf|io_pressure' 2>/dev/null | head -5",
         timeout=5,
     ).stdout.strip()
-    findings["hog_processes"] = hog_procs
+    findings["hog_detected"] = bool(hog_procs)
+    if hog_procs:
+        findings["hog_summary"] = hog_procs[:80]
 
     # Determine what needs fixing
     problems: list[str] = []
     if findings.get("cgroup_cpu_pct"):
         problems.append(f"cgroup CPU capped at {findings['cgroup_cpu_pct']}")
-    if cgroup_mem != "max":
-        try:
-            mem_mb = int(cgroup_mem) // (1024 * 1024)
-            problems.append(f"cgroup memory capped at {mem_mb}MB")
-        except ValueError:
-            pass
+    if findings.get("cgroup_memory_mb"):
+        problems.append(f"cgroup memory capped at {findings['cgroup_memory_mb']}MB")
     nofile_val = findings.get("systemd_nofile", "unknown")
     if nofile_val not in ("unknown", "infinity"):
         try:
@@ -214,8 +209,8 @@ def inspect_resource_limits(
         problems.append(f"cgroup CPUWeight={cpu_w} (below default 100)")
     if findings.get("numa_policy") == "interleave":
         problems.append("NUMA interleave policy active (worst for locality)")
-    if hog_procs:
-        problems.append(f"background hogs detected: {hog_procs[:100]}")
+    if findings.get("hog_detected"):
+        problems.append(f"background hogs detected: {findings.get('hog_summary', '')}")
 
     return {
         "category": "resource_limits",
@@ -228,12 +223,14 @@ def inspect_network(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
     """Category 4: Inspect firewall, conntrack, traffic control."""
     findings: dict[str, Any] = {}
 
-    # iptables DROP/REJECT/connlimit rules
+    # iptables DROP/REJECT/connlimit rules (bool + summary)
     iptables = ssh.execute(
         "timeout 5 iptables -L -n 2>/dev/null | grep -iE 'DROP|REJECT|connlimit|limit' | head -10",
         timeout=10,
     ).stdout.strip()
-    findings["iptables_drop_rules"] = iptables
+    findings["iptables_has_drops"] = bool(iptables)
+    if iptables:
+        findings["iptables_summary"] = iptables[:80]
 
     # conntrack max
     conntrack = ssh.execute(
@@ -244,23 +241,25 @@ def inspect_network(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
     ).stdout.strip()
     findings["conntrack_max"] = conntrack
 
-    # tc rules
+    # tc rules (bool + summary)
     tc = ssh.execute(
         "tc qdisc show 2>/dev/null | grep -v 'noqueue\\|pfifo_fast\\|fq_codel' | head -5",
         timeout=5,
     ).stdout.strip()
-    findings["tc_rules"] = tc
+    findings["tc_has_shaping"] = bool(tc)
+    if tc:
+        findings["tc_summary"] = tc[:80]
 
-    # nftables
+    # nftables (bool only)
     nft = ssh.execute(
         "timeout 5 nft list ruleset 2>/dev/null | grep -iE 'drop|reject|limit' | head -5",
         timeout=10,
     ).stdout.strip()
-    findings["nftables_drop_rules"] = nft
+    findings["nftables_has_drops"] = bool(nft)
 
     problems: list[str] = []
     if iptables:
-        problems.append(f"iptables DROP/limit rules found: {iptables[:100]}")
+        problems.append(f"iptables DROP/limit rules found: {iptables[:80]}")
     if conntrack and conntrack != "unknown":
         target_ct = targets.get("conntrack_max", "1048576")
         try:
@@ -269,7 +268,7 @@ def inspect_network(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
         except ValueError:
             pass
     if tc:
-        problems.append(f"tc qdisc rules found: {tc[:100]}")
+        problems.append(f"tc qdisc rules found: {tc[:80]}")
 
     return {
         "category": "network",
@@ -299,19 +298,12 @@ def inspect_storage(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
     ).stdout.strip()
     findings["readahead"] = readahead
 
-    # Background I/O hogs
+    # Background I/O hogs (bool only)
     io_hogs = ssh.execute(
         "pgrep -la 'dd |fio|stress|sysbench|iperf|io_pressure' 2>/dev/null | head -5",
         timeout=5,
     ).stdout.strip()
-    findings["io_hog_processes"] = io_hogs
-
-    # Disk utilization
-    iostat = ssh.execute(
-        "iostat -x 1 1 2>/dev/null | tail -5 || echo 'iostat not available'",
-        timeout=10,
-    ).stdout.strip()
-    findings["iostat"] = iostat
+    findings["io_hog_detected"] = bool(io_hogs)
 
     problems: list[str] = []
     target_sched = targets.get("io_scheduler", "none")
@@ -325,7 +317,7 @@ def inspect_storage(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
         except ValueError:
             pass
     if io_hogs:
-        problems.append(f"I/O hog processes: {io_hogs[:100]}")
+        problems.append(f"I/O hog processes: {io_hogs[:80]}")
 
     return {
         "category": "storage",

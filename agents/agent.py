@@ -2225,19 +2225,24 @@ async def _run_debate_planner(
     network_data = all_inspection.get("network", {})
     storage_data = all_inspection.get("storage", {})
 
+    # Strip 'current' dicts from inspection data before sending to LLM (saves tokens)
+    _web_llm = {k: v for k, v in webserver_data.items() if k != "current"}
+    _kern_llm = {k: v for k, v in kernel_data.items() if k != "current"}
+
+    _sys_line = getattr(deps, "system_fingerprint", "") or ""
     nginx_prompt = (
         "You are an NGINX/webserver performance expert. "
         "Review the webserver inspection evidence. "
-        "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
-        f"Shared Context:\n{context_prompt}\n\n"
-        f"Webserver Inspection:\n{json.dumps(webserver_data, ensure_ascii=True)}"
+        "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
+        f"System: {_sys_line}\n"
+        f"Webserver Inspection:\n{json.dumps(_web_llm, ensure_ascii=True)}"
     )
     rhel_prompt = (
         "You are a RHEL Linux performance expert. "
         "Review kernel, resource limits, network, and storage evidence. "
-        "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
-        f"Shared Context:\n{context_prompt}\n\n"
-        f"Kernel Inspection:\n{json.dumps(kernel_data, ensure_ascii=True)}\n\n"
+        "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
+        f"System: {_sys_line}\n"
+        f"Kernel Inspection:\n{json.dumps(_kern_llm, ensure_ascii=True)}\n\n"
         f"Resource Limits:\n{json.dumps(resource_data, ensure_ascii=True)}\n\n"
         f"Network:\n{json.dumps(network_data, ensure_ascii=True)}\n\n"
         f"Storage:\n{json.dumps(storage_data, ensure_ascii=True)}"
@@ -2264,6 +2269,7 @@ async def _run_debate_planner(
         "Keep only grounded recommendations supported by evidence. "
         "Prefer nginx fixes first, system fixes second, IRQ fixes only if clearly justified. "
         "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
+        f"Benchmark Context:\n{context_prompt}\n\n"
         f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
@@ -2297,20 +2303,15 @@ async def _run_debate_planner(
         "with exactly 5 keys — one per category. "
         "Only use allowed parameter names listed below.\n\n"
         '1. "webserver" — nginx config directives.\n'
-        f"   Allowed: {', '.join(sorted(_web_tgt))}\n"
-        f"   Defaults: {json.dumps(_web_tgt)}\n\n"
+        f"   Allowed: {', '.join(sorted(_web_tgt))}\n\n"
         '2. "kernel" — sysctl, THP, SELinux, CPU governor, IRQ.\n'
-        f"   Allowed: {', '.join(sorted(_kern_tgt))}\n"
-        f"   Defaults: {json.dumps(_kern_tgt)}\n\n"
+        f"   Allowed: {', '.join(sorted(_kern_tgt))}\n\n"
         '3. "resource_limits" — cgroup, systemd limits, background processes.\n'
-        f"   Allowed: {', '.join(sorted(_res_tgt))}\n"
-        f"   Defaults: {json.dumps(_res_tgt)}\n\n"
+        f"   Allowed: {', '.join(sorted(_res_tgt))}\n\n"
         '4. "network" — iptables, conntrack, tc rules.\n'
-        f"   Allowed: {', '.join(sorted(_net_tgt))}\n"
-        f"   Defaults: {json.dumps(_net_tgt)}\n\n"
+        f"   Allowed: {', '.join(sorted(_net_tgt))}\n\n"
         '5. "storage" — I/O scheduler, readahead, I/O hogs.\n'
-        f"   Allowed: {', '.join(sorted(_stor_tgt))}\n"
-        f"   Defaults: {json.dumps(_stor_tgt)}\n\n"
+        f"   Allowed: {', '.join(sorted(_stor_tgt))}\n\n"
         "Rules:\n"
         "- Include parameters the synthesizer recommends AND any "
         "problems detected in the inspection below\n"

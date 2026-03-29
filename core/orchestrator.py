@@ -86,10 +86,10 @@ async def run(model, deps: AgentDeps) -> str:
         cpu_cores=cpu_cores,
         ram_gb=ram_gb,
     )
-    logger.status(
-        "system",
-        f"RHEL: {rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB",
+    deps.system_fingerprint = (
+        f"{rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB"
     )
+    logger.status("system", f"RHEL: {deps.system_fingerprint}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1.7: Pre-flight validation (LLM-assisted)
@@ -250,7 +250,6 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 4b: Assemble diagnosis evidence bundle
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 4b: Assembling diagnosis evidence...")
-    telemetry_summary = _build_telemetry_summary(telemetry_entries)
     benchmark_evidence_text = _build_benchmark_evidence_text(
         benchmark_evidence,
         nic_speed_mbps=nic_speed_mbps,
@@ -281,7 +280,6 @@ async def run(model, deps: AgentDeps) -> str:
             checks_summary=checks_summary,
             benchmark_evidence_text=benchmark_evidence_text,
             prior_fixes=prior_fixes,
-            telemetry_summary=telemetry_summary,
         )
         if iteration_feedback:
             context_prompt += f"\n{iteration_feedback}\n"
@@ -642,7 +640,6 @@ def _build_context_prompt(
     checks_summary,
     benchmark_evidence_text,
     prior_fixes=None,
-    telemetry_summary: str = "",
 ) -> str:
     checks_text = "\n".join(checks_summary)
 
@@ -652,14 +649,11 @@ def _build_context_prompt(
         prior_text += ", ".join(f"{pf['parameter']}" for pf in prior_fixes)
         prior_text += "\n"
 
-    telemetry_text = f"Telemetry:\n{telemetry_summary}\n" if telemetry_summary else ""
-
     return f"""{rhel_ver} | {kernel_ver} | {cpu_cores} CPU | {ram_gb}GB
 Checks: {checks_text}
 Benchmark Evidence:
 {benchmark_evidence_text}
 {prior_text}
-{telemetry_text}
 Inspect, apply proven fixes, benchmark after, save_findings.
 """
 

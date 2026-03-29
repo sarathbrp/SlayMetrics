@@ -95,6 +95,7 @@ class AgentDeps:
     bench: LocalClient | SSHClient | None = None
     token_counter: TokenCounter = field(default_factory=TokenCounter)
     langfuse: Any | None = None
+    system_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if self.bench is None:
