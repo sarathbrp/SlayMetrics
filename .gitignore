@@ -50,3 +50,7 @@ source_env
 facts/default_nginx.conf
 scripts/
 trace-*.json
+hackathon-judge/
+architecture.html
+CLAUDE.md
+AGENTS.md
