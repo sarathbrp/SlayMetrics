@@ -2159,7 +2159,16 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     state = getattr(agent, "_slaymetrics_state", {})
     config = getattr(deps, "config", {}) or {}
     planner_mode = str((config.get("agent") or {}).get("planner_mode", "debate")).strip().lower()
-    if planner_mode == "debate":
+    if planner_mode in ("deterministic", "hybrid"):
+        result = await _run_rules_engine(
+            agent,
+            model,
+            deps,
+            context_prompt,
+            state,
+            hybrid=(planner_mode == "hybrid"),
+        )
+    elif planner_mode == "debate":
         result = await _run_debate_planner(agent, model, deps, context_prompt, state)
     else:
         result = await agent.run(context_prompt, deps=deps)
@@ -2213,6 +2222,212 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     )
 
 
+async def _run_rules_engine(
+    agent,
+    model,
+    deps: AgentDeps,
+    context_prompt: str,
+    agent_state: dict | None = None,
+    *,
+    hybrid: bool = False,
+):
+    """Deterministic/hybrid planner — builds apply plan without (or with minimal) LLM tokens."""
+    from agents.rules_engine import (
+        apply_validation_result,
+        build_apply_plan,
+        build_rca_records,
+        build_recommendations,
+        build_summary,
+        build_validation_prompt,
+    )
+    from agents.tools_inspect import inspect_all
+
+    ctx = SimpleNamespace(deps=deps)
+    save_rca = agent._function_toolset.tools["save_rca"].function
+    save_recommendations = agent._function_toolset.tools["save_recommendations"].function
+
+    # ── 1. Compound inspection (same as debate planner) ──────────────
+    tool_call("inspect", "compound inspect — all 5 categories")
+    all_inspection = inspect_all(deps.ssh, deps.config)
+    tool_result(
+        "inspect",
+        f"issues: {all_inspection.get('summary', {}).get('total_issues', 0)} "
+        f"({json.dumps(all_inspection.get('summary', {}).get('by_category', {}))}) ",
+    )
+    deps.token_counter.tool_calls += 1
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        "compound_inspection",
+        json.dumps(all_inspection, ensure_ascii=True)[:8000],
+        f"compound inspect: {all_inspection.get('summary', {}).get('total_issues', 0)} issues",
+    )
+    if agent_state is not None:
+        agent_state["inspection"] = all_inspection
+
+    # ── 2. Deterministic plan + RCA + recommendations ────────────────
+    tool_call("rules_engine", "building deterministic apply plan")
+    apply_plan = build_apply_plan(all_inspection, deps.config)
+    rca_records = build_rca_records(all_inspection)
+    recommendations = build_recommendations(all_inspection, deps.config)
+    plan_summary_parts = {
+        cat: list(changes.keys()) for cat, changes in apply_plan.items() if changes
+    }
+    tool_result(
+        "rules_engine",
+        " | ".join(f"{c}={len(v)}" for c, v in plan_summary_parts.items()),
+    )
+
+    # ── 3. Optional hybrid LLM validation ────────────────────────────
+    total_in = 0
+    total_out = 0
+    validation_reasoning = ""
+
+    if hybrid:
+        _sys_fp = getattr(deps, "system_fingerprint", "") or ""
+        parts = _sys_fp.split(",") if _sys_fp else []
+        cpu_cores = "unknown"
+        ram_gb = "unknown"
+        for part in parts:
+            part = part.strip()
+            if "core" in part.lower():
+                cpu_cores = part.split(":")[1].strip() if ":" in part else part
+            elif "ram" in part.lower() or "gb" in part.lower():
+                ram_gb = part.split(":")[1].strip() if ":" in part else part
+
+        validate_prompt = build_validation_prompt(
+            apply_plan,
+            cpu_cores=cpu_cores,
+            ram_gb=ram_gb,
+            baseline_summary=context_prompt[:300] if context_prompt else "",
+        )
+        tool_call("validator", "LLM validation of deterministic plan")
+        validation, val_usage = _invoke_json_planner(
+            model,
+            "planner.validator",
+            validate_prompt,
+            deps,
+        )
+        total_in = val_usage.get("input_tokens", 0)
+        total_out = val_usage.get("output_tokens", 0)
+        validation_reasoning = str(validation.get("reasoning", "")).strip()
+        if validation_reasoning:
+            tool_result("validator", f"reasoning: {validation_reasoning[:200]}")
+
+        # Apply validator feedback
+        apply_plan = apply_validation_result(apply_plan, validation, deps.config)
+
+    # ── 4. Persist RCA + recommendations ─────────────────────────────
+    _iter = getattr(deps, "iteration", 0)
+    _coerced_rca = _coerce_records(rca_records, deps=deps)
+    _coerced_recs = _coerce_recommendations(recommendations, deps=deps)
+    if _coerced_rca:
+        await save_rca(ctx, _coerced_rca)
+    if _coerced_recs:
+        await save_recommendations(ctx, _coerced_recs)
+
+    _save_planner_artifact(deps, "rules_engine", apply_plan, iteration=_iter)
+
+    # ── 5. Apply safety-net defaults (same as debate planner) ────────
+    _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
+    _defaults_by_cat = {
+        "webserver": _tuning.get("webserver_targets") or {},
+        "kernel": _tuning.get("kernel_targets") or {},
+        "resource_limits": _tuning.get("resource_limits_targets") or {},
+        "network": _tuning.get("network_targets") or {},
+        "storage": _tuning.get("storage_targets") or {},
+    }
+    _cfg = getattr(deps, "config", None) or {}
+    for _cat, _defaults in _defaults_by_cat.items():
+        plan_cat = apply_plan.get(_cat)
+        if not isinstance(plan_cat, dict):
+            plan_cat = {}
+            apply_plan[_cat] = plan_cat
+        for _param, _default_val in _defaults.items():
+            if _param not in plan_cat and not _is_blocked(_param, str(_default_val), _cfg):
+                plan_cat[_param] = str(_default_val)
+
+    # ── 6. Store apply plan for apply_saved_recommendations_impl ─────
+    if agent_state is not None:
+        agent_state["apply_plan"] = apply_plan
+
+    summary = build_summary(all_inspection, apply_plan)
+    if validation_reasoning:
+        summary += f" Validator: {validation_reasoning}"
+
+    return SimpleNamespace(
+        output=summary,
+        usage=lambda: SimpleNamespace(input_tokens=total_in, output_tokens=total_out),
+        all_messages=lambda: [],
+    )
+
+
+# High-impact params that deserve LLM reasoning; the rest are applied
+# deterministically from config targets without wasting tokens.
+_HIGH_IMPACT_PARAMS: set[str] = {
+    # Webserver — these have outsized throughput effects
+    "worker_processes",
+    "worker_connections",
+    "worker_rlimit_nofile",
+    "listen_backlog",
+    "limit_rate",
+    "limit_rate_after",
+    "limit_req",
+    "limit_conn",
+    "access_log",
+    "tcp_nodelay",
+    "keepalive_requests",
+    "keepalive_timeout",
+    "accept_mutex",
+    # Kernel — these cause connection drops and swapping
+    "net.core.somaxconn",
+    "net.ipv4.tcp_max_syn_backlog",
+    "net.core.netdev_max_backlog",
+    "vm.swappiness",
+    "vm.vfs_cache_pressure",
+    "vm.dirty_ratio",
+    "vm.dirty_background_ratio",
+    "net.ipv4.tcp_tw_reuse",
+    "net.ipv4.ip_local_port_range",
+    "transparent_hugepage",
+    "selinux",
+    "irqbalance",
+}
+
+
+def _filter_inspection_for_llm(
+    category_data: dict[str, Any],
+    *,
+    max_items: int = 20,
+) -> dict[str, Any]:
+    """Strip ``current`` dict and limit ``needs_fixing`` to high-impact params.
+
+    Low-impact params (sendfile, tcp_nopush, gzip_comp_level, etc.) are still
+    applied by the safety-net defaults in the apply step — they just don't need
+    LLM reasoning.
+    """
+    filtered: dict[str, Any] = {}
+    trimmed_count = 0
+    for key, value in category_data.items():
+        if key == "current":
+            continue  # never send to LLM
+        if key == "needs_fixing" and isinstance(value, dict):
+            # Partition into high/low impact
+            high = {k: v for k, v in value.items() if k in _HIGH_IMPACT_PARAMS}
+            low = {k: v for k, v in value.items() if k not in _HIGH_IMPACT_PARAMS}
+            # Always include high-impact; fill remaining slots with low-impact
+            remaining = max(0, max_items - len(high))
+            merged = {**high, **dict(list(low.items())[:remaining])}
+            filtered[key] = merged
+            trimmed_count = len(low) - min(len(low), remaining)
+        else:
+            filtered[key] = value
+    # Adjust ok_count to reflect trimmed low-impact params
+    if trimmed_count > 0:
+        filtered["ok_count"] = filtered.get("ok_count", 0) + trimmed_count
+    return filtered
+
+
 async def _run_debate_planner(
     agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None
 ):
@@ -2250,9 +2465,9 @@ async def _run_debate_planner(
     network_data = all_inspection.get("network", {})
     storage_data = all_inspection.get("storage", {})
 
-    # Strip 'current' dicts from inspection data before sending to LLM (saves tokens)
-    _web_llm = {k: v for k, v in webserver_data.items() if k != "current"}
-    _kern_llm = {k: v for k, v in kernel_data.items() if k != "current"}
+    # Strip 'current' dicts and pre-filter to high-impact params (saves tokens)
+    _web_llm = _filter_inspection_for_llm(webserver_data)
+    _kern_llm = _filter_inspection_for_llm(kernel_data)
 
     _sys_line = getattr(deps, "system_fingerprint", "") or ""
     nginx_prompt = (
@@ -2319,7 +2534,7 @@ async def _run_debate_planner(
         "- changes must be a dict of {param_name: value}, NOT a command string\n"
         "- values must be clean (no semicolons, no 'reload nginx')\n"
         "- one param per recommendation for nginx, may batch sysctls\n\n"
-        f"Benchmark Context:\n{context_prompt}\n\n"
+        f"System: {getattr(deps, 'system_fingerprint', '') or 'unknown'}\n\n"
         f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
