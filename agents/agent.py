@@ -1591,6 +1591,27 @@ def build(model, config=None) -> DiagnosisWorkflow:
                         str(v).strip().rstrip(";").strip()
                     )
 
+        # Auto-apply resource_limits/network/storage from inspection problems
+        # even if the apply_planner didn't include them (safe: removes throttling)
+        inspection = state.get("inspection") or {}
+        for cat, targets_key in (
+            ("resource_limits", "resource_limits_targets"),
+            ("network", "network_targets"),
+            ("storage", "storage_targets"),
+        ):
+            cat_inspection = inspection.get(cat, {})
+            if cat_inspection.get("problems") and cat not in changes_by_cat:
+                # Inspection found problems but LLM didn't recommend fixes
+                # Auto-apply all defaults from config
+                defaults = _tuning.get(targets_key) or {}
+                if defaults:
+                    changes_by_cat[cat] = dict(defaults)
+                    n_problems = len(cat_inspection["problems"])
+                    tool_result(
+                        "auto_fix",
+                        f"{cat}: applying defaults due to {n_problems} problems",
+                    )
+
         tool_call(
             "apply",
             " | ".join(f"{c}={len(v)}" for c, v in changes_by_cat.items() if v) or "no changes",
