@@ -21,12 +21,21 @@ HTTP_DIRECTIVES = {
     "gzip",
     "gzip_comp_level",
     "gzip_types",
+    "gzip_min_length",
     "reset_timedout_connection",
     "lingering_close",
     "lingering_timeout",
     "aio",
+    "directio",
+    "limit_rate",
+    "limit_rate_after",
+    "output_buffers",
+    "postpone_output",
     "client_body_buffer_size",
     "client_max_body_size",
+    "client_body_timeout",
+    "client_header_timeout",
+    "send_timeout",
 }
 
 
@@ -56,6 +65,7 @@ class NginxAdapter(ServiceAdapter):
         "worker_connections",
         "use",
         "multi_accept",
+        "accept_mutex",
     }
     # Directives that belong in server {} block
     SERVER_DIRECTIVES = {
@@ -77,6 +87,12 @@ class NginxAdapter(ServiceAdapter):
         # Handle listen_backlog specially — modifies existing listen directives
         if parameter == "listen_backlog":
             return self._set_listen_backlog(value)
+        # Handle error_log_level — changes the level arg of existing error_log
+        if parameter == "error_log_level":
+            return self._set_error_log_level(value)
+        # Handle limit_req/limit_conn removal — remove from conf.d + main config
+        if parameter in ("limit_req", "limit_conn") and value == "remove":
+            return self._remove_rate_limiting(parameter)
         spec = self.DIRECTIVE_SPECS.get(parameter)
         if spec is None or spec["context"] == "special":
             return False
@@ -121,6 +137,47 @@ class NginxAdapter(ServiceAdapter):
             f"sed -i '/^[[:space:]]*{parameter}[[:space:]]/d'"
             " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
         )
+
+    def _set_error_log_level(self, level: str) -> bool:
+        """Change the error_log level without changing the file path."""
+        config_path = self._cfg["config_path"]
+        self._ssh.execute(f"cp {config_path} {config_path}.bak")
+        # Replace error_log line: keep path, change level
+        self._ssh.execute(
+            f"sed -i -E 's|^(error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|' {config_path}"
+        )
+        # Also fix in conf.d
+        self._ssh.execute(
+            f"sed -i -E 's|^(\\s*error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|'"
+            " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
+        )
+        test = self._ssh.execute("nginx -t 2>&1")
+        if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            return False
+        return True
+
+    def _remove_rate_limiting(self, directive: str) -> bool:
+        """Remove limit_req/limit_conn zones and directives from all configs."""
+        config_path = self._cfg["config_path"]
+        self._ssh.execute(f"cp {config_path} {config_path}.bak")
+        # Remove zone definitions and directive usage from main config
+        for pattern in (
+            f"{directive}_zone",
+            f"{directive} ",
+        ):
+            self._ssh.execute(f"sed -i '/{pattern}/d' {config_path} 2>/dev/null || true")
+        # Also remove from conf.d files
+        for pattern in (
+            f"{directive}_zone",
+            f"{directive} ",
+        ):
+            self._ssh.execute(f"sed -i '/{pattern}/d' /etc/nginx/conf.d/*.conf 2>/dev/null || true")
+        test = self._ssh.execute("nginx -t 2>&1")
+        if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            return False
+        return True
 
     def _set_listen_backlog(self, backlog: str) -> bool:
         """Add backlog= to listen directives in main config and conf.d files."""
