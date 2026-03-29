@@ -283,37 +283,19 @@ def build(model, config=None) -> DiagnosisWorkflow:
         return merged, None
 
     _tuning_cfg = (config or {}).get("tuning") or {}
+    # Build allowlists from new config categories (webserver_targets, kernel_targets)
+    # with backward compat for old nginx_targets/system_targets
     nginx_targets: dict[str, str] = {
-        "worker_connections": "65536",
-        "worker_rlimit_nofile": "200000",
-        "worker_cpu_affinity": "auto",
-        "open_file_cache": "max=200000 inactive=60s",
-        "open_file_cache_valid": "30s",
-        "open_file_cache_min_uses": "2",
-        "access_log": "off",
-        "tcp_nodelay": "on",
-        "keepalive_requests": "10000",
-        "keepalive_timeout": "30",
-        "reset_timedout_connection": "on",
-        "listen_backlog": "65535",
-        "aio": "threads",
-        **{str(k): str(v) for k, v in (_tuning_cfg.get("nginx_targets") or {}).items()},
+        str(k): str(v)
+        for k, v in (
+            _tuning_cfg.get("webserver_targets") or _tuning_cfg.get("nginx_targets") or {}
+        ).items()
     }
     system_targets: dict[str, str] = {
-        "net.core.somaxconn": "65535",
-        "net.ipv4.tcp_max_syn_backlog": "65535",
-        "net.core.netdev_max_backlog": "65535",
-        "net.core.rmem_max": "16777216",
-        "net.core.wmem_max": "16777216",
-        "net.ipv4.tcp_tw_reuse": "1",
-        "net.ipv4.tcp_max_tw_buckets": "2000000",
-        "net.ipv4.ip_local_port_range": "1024 65535",
-        "transparent_hugepage": "never",
-        "selinux": "permissive",
-        "cpu_governor": "performance",
-        "nofile": "65536",
-        "irqbalance": "active",
-        **{str(k): str(v) for k, v in (_tuning_cfg.get("system_targets") or {}).items()},
+        str(k): str(v)
+        for k, v in (
+            _tuning_cfg.get("kernel_targets") or _tuning_cfg.get("system_targets") or {}
+        ).items()
     }
 
     def inspect_irq_impl(deps: AgentDeps) -> dict:

@@ -17,6 +17,25 @@ from agents.agent import (
 )
 from tools.ssh import SSHResult
 
+_TEST_CONFIG = {
+    "tuning": {
+        "webserver_targets": {
+            "worker_processes": "auto", "worker_connections": "65536",
+            "worker_rlimit_nofile": "200000", "sendfile": "on",
+            "tcp_nopush": "on", "tcp_nodelay": "on", "access_log": "off",
+            "open_file_cache": "max=200000 inactive=60s",
+            "open_file_cache_valid": "30s", "open_file_cache_min_uses": "2",
+            "keepalive_requests": "10000", "keepalive_timeout": "30",
+            "reset_timedout_connection": "on", "listen_backlog": "65535",
+            "aio": "off",
+        },
+        "kernel_targets": {
+            "net.core.somaxconn": "65535", "transparent_hugepage": "never",
+            "selinux": "permissive",
+        },
+    },
+}
+
 
 class FakeMemory:
     def __init__(self):
@@ -123,7 +142,7 @@ def _ctx():
 
 
 def test_apply_nginx_tuning_accepts_json_string_changes():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -141,7 +160,7 @@ def test_apply_nginx_tuning_accepts_json_string_changes():
 
 
 def test_inspect_irq_distribution_uses_telemetry_window_summary():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["inspect_irq_distribution"].function
     ctx = _ctx()
 
@@ -153,7 +172,7 @@ def test_inspect_irq_distribution_uses_telemetry_window_summary():
 
 
 def test_apply_nginx_tuning_invalid_json_returns_structured_error():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -166,7 +185,7 @@ def test_apply_nginx_tuning_invalid_json_returns_structured_error():
 
 
 def test_apply_system_tuning_invalid_json_returns_structured_error():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     ctx = _ctx()
 
@@ -178,7 +197,7 @@ def test_apply_system_tuning_invalid_json_returns_structured_error():
 
 
 def test_apply_nginx_tuning_rejects_unsupported_directives():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -192,7 +211,7 @@ def test_apply_nginx_tuning_rejects_unsupported_directives():
 
 
 def test_apply_nginx_tuning_accepts_top_level_kwargs_shape():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -204,7 +223,7 @@ def test_apply_nginx_tuning_accepts_top_level_kwargs_shape():
 
 
 def test_apply_system_tuning_accepts_top_level_kwargs_shape():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     ctx = _ctx()
 
@@ -214,7 +233,7 @@ def test_apply_system_tuning_accepts_top_level_kwargs_shape():
 
 
 def test_apply_nginx_tuning_strips_leading_dot_from_keys():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -225,7 +244,7 @@ def test_apply_nginx_tuning_strips_leading_dot_from_keys():
 
 
 def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     ctx = _ctx()
 
@@ -265,7 +284,7 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
 
     ctx = _ctx()
     ctx.deps.adapter = FailingAdapter(ctx.deps.ssh)
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
 
     result = asyncio.run(tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}))
@@ -278,7 +297,7 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
 
 
 def test_save_findings_coerces_non_numeric_impact_pct():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_findings"].function
     ctx = _ctx()
 
@@ -305,7 +324,7 @@ def test_save_findings_coerces_non_numeric_impact_pct():
 
 
 def test_save_findings_derives_run_level_delta_when_model_omits_it():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_findings"].function
     ctx = _ctx()
     agent._slaymetrics_state["after_rps"] = 150.0
@@ -347,7 +366,7 @@ def test_diagnosis_output_coerces_granite_friendly_shapes():
 
 
 def test_save_rca_persists_structured_records():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_rca"].function
     ctx = _ctx()
 
@@ -373,7 +392,7 @@ def test_save_rca_persists_structured_records():
 
 
 def test_save_recommendations_persists_human_readable_items():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_recommendations"].function
     ctx = _ctx()
 
@@ -402,7 +421,7 @@ def test_save_recommendations_persists_human_readable_items():
 
 
 def test_save_recommendations_skips_non_nginx_performance_changes():
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_recommendations"].function
     ctx = _ctx()
 
@@ -432,7 +451,7 @@ def test_save_recommendations_skips_non_nginx_performance_changes():
 
 
 def test_save_recommendations_debug_mode_keeps_same_filtering(monkeypatch):
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_recommendations"].function
     ctx = _ctx()
     ctx.deps.config["agent"]["debug_planner_payloads"] = True
@@ -537,7 +556,7 @@ def test_save_planner_artifact_writes_hypothesis_markdown(tmp_path, monkeypatch)
 
 
 def test_rejected_recommendations_are_written_to_hypothesis_markdown(tmp_path, monkeypatch):
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_recommendations"].function
     ctx = _ctx()
     ctx.deps.config["agent"]["persist_hypotheses"] = True
@@ -906,7 +925,7 @@ def test_apply_from_recommendations_saves_findings_without_benchmark():
     """apply_saved_recommendations_impl applies changes and saves findings
     without running a benchmark — the iteration loop handles benchmarking."""
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     agent._slaymetrics_state["apply_plan"] = {
         "webserver": {"sendfile": "on"},
         "kernel": {},

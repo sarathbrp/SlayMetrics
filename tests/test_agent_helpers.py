@@ -193,6 +193,27 @@ def _ctx():
     return SimpleNamespace(deps=deps)
 
 
+_TEST_CONFIG = {
+    "tuning": {
+        "webserver_targets": {
+            "worker_processes": "auto", "worker_connections": "65536",
+            "worker_rlimit_nofile": "200000", "worker_cpu_affinity": "auto",
+            "sendfile": "on", "tcp_nopush": "on", "tcp_nodelay": "on",
+            "access_log": "off", "open_file_cache": "max=200000 inactive=60s",
+            "open_file_cache_valid": "30s", "open_file_cache_min_uses": "2",
+            "keepalive_requests": "10000", "keepalive_timeout": "30",
+            "reset_timedout_connection": "on", "listen_backlog": "65535",
+            "aio": "off",
+        },
+        "kernel_targets": {
+            "net.core.somaxconn": "65535", "transparent_hugepage": "never",
+            "selinux": "permissive", "cpu_governor": "performance",
+            "irqbalance": "active", "nofile": "65536",
+        },
+    },
+}
+
+
 # ===========================================================================
 # _coerce_float
 # ===========================================================================
@@ -665,7 +686,7 @@ def test_save_planner_artifact_unknown_source(tmp_path, monkeypatch):
 
 def test_inspect_nginx_impl():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["inspect_nginx_config"].function
     result = asyncio.run(tool(ctx))
 
@@ -688,7 +709,7 @@ def test_inspect_nginx_impl():
 
 def test_inspect_system_impl():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["inspect_system_tuning"].function
     result = asyncio.run(tool(ctx))
 
@@ -709,7 +730,7 @@ def test_inspect_system_impl():
 
 def test_apply_system_sysctl():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"net.core.somaxconn": "65535"}))
     assert result["applied"]["net.core.somaxconn"] == "65535"
@@ -717,7 +738,7 @@ def test_apply_system_sysctl():
 
 def test_apply_system_transparent_hugepage():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"transparent_hugepage": "never"}))
     assert result["applied"]["transparent_hugepage"] == "never"
@@ -725,35 +746,35 @@ def test_apply_system_transparent_hugepage():
 def test_apply_system_selinux():
     ctx = _ctx()
     ctx.deps.ssh._outputs["getenforce"] = SSHResult("Permissive\n", "", 0)
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"selinux": "permissive"}))
     assert result["applied"]["selinux"] == "permissive"
 
 def test_apply_system_cpu_governor():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"cpu_governor": "performance"}))
     assert result["applied"]["cpu_governor"] == "performance"
 
 def test_apply_system_ip_local_port_range():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"net.ipv4.ip_local_port_range": "1024 65535"}))
     assert result["applied"]["net.ipv4.ip_local_port_range"] == "1024 65535"
 
 def test_apply_system_nofile():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"nofile": "65536"}))
     assert result["applied"]["nofile"] == "65536"
 
 def test_apply_system_irqbalance():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"irqbalance": "active"}))
     assert result["applied"]["irqbalance"] == "active"
@@ -761,7 +782,7 @@ def test_apply_system_irqbalance():
 def test_apply_system_multiple():
     ctx = _ctx()
     ctx.deps.ssh._outputs["getenforce"] = SSHResult("Permissive\n", "", 0)
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {
         "net.core.somaxconn": "65535",
@@ -776,7 +797,7 @@ def test_apply_system_failure():
     ctx.deps.ssh = FakeSSH(outputs={
         "sysctl -w net.core.somaxconn": SSHResult("", "error", 1),
     })
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"net.core.somaxconn": "65535"}))
     assert "net.core.somaxconn" in result["failed"]
@@ -786,7 +807,7 @@ def test_apply_system_thp_failure():
     ssh._outputs["transparent_hugepage/enabled"] = SSHResult("", "readonly fs", 1)
     ctx = _ctx()
     ctx.deps.ssh = ssh
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"transparent_hugepage": "never"}))
     assert "transparent_hugepage" in result["failed"]
@@ -796,7 +817,7 @@ def test_apply_system_irqbalance_failure():
     ssh._outputs["systemctl enable --now irqbalance"] = SSHResult("", "failed", 1)
     ctx = _ctx()
     ctx.deps.ssh = ssh
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_system_tuning"].function
     result = asyncio.run(tool(ctx, {"irqbalance": "active"}))
     assert "irqbalance" in result["failed"]
@@ -808,7 +829,7 @@ def test_apply_system_irqbalance_failure():
 
 def test_save_rca_normalizes_evidence_string():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_rca"].function
     asyncio.run(tool(ctx, [
         {
@@ -824,7 +845,7 @@ def test_save_rca_normalizes_evidence_string():
 
 def test_save_rca_normalizes_evidence_non_list():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_rca"].function
     asyncio.run(tool(ctx, [
         {
@@ -839,7 +860,7 @@ def test_save_rca_normalizes_evidence_non_list():
 
 def test_save_rca_defaults_for_missing_fields():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_rca"].function
     asyncio.run(tool(ctx, [{}]))
     state = agent._slaymetrics_state
@@ -851,7 +872,7 @@ def test_save_rca_defaults_for_missing_fields():
 
 def test_save_rca_truncates_evidence():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_rca"].function
     asyncio.run(tool(ctx, [
         {
@@ -870,7 +891,7 @@ def test_save_rca_truncates_evidence():
 
 def test_save_recommendations_rejects_invalid_scope():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_recommendations"].function
     asyncio.run(tool(ctx, [
         {
@@ -889,7 +910,7 @@ def test_save_recommendations_rejects_invalid_scope_with_debug(monkeypatch):
     ctx.deps.config["agent"]["debug_planner_payloads"] = True
     debug_lines = []
     monkeypatch.setattr(diagnosis_agent, "tool_result", lambda t, m: debug_lines.append((t, m)))
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["save_recommendations"].function
     asyncio.run(tool(ctx, [
         {
@@ -981,7 +1002,7 @@ def test_coerce_recommendations_drops_empty_changes_with_debug(monkeypatch):
 
 def test_apply_from_recommendations_nginx_and_system():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     agent._slaymetrics_state["apply_plan"] = {
         "webserver": {"sendfile": "on"},
         "kernel": {"net.core.somaxconn": "65535"},
@@ -992,14 +1013,14 @@ def test_apply_from_recommendations_nginx_and_system():
 
 def test_apply_from_recommendations_skips_non_dict_changes():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     agent._slaymetrics_state["apply_plan"] = {"webserver": "not a dict"}
     result = agent._apply_from_recommendations(ctx.deps)
     assert result["findings"] == []
 
 def test_apply_from_recommendations_empty_list():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     agent._slaymetrics_state["apply_plan"] = {}
     result = agent._apply_from_recommendations(ctx.deps)
     assert result["findings"] == []
@@ -1174,7 +1195,7 @@ def test_run_handles_get_profile_exception(monkeypatch):
 
 def test_apply_nginx_all_unsupported():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     result = asyncio.run(tool(ctx, {"totally_fake": "1", "another_fake": "2"}))
     assert result["reload"] == "FAILED"
@@ -1185,7 +1206,7 @@ def test_apply_nginx_syntax_check_fails():
     ctx.deps.ssh = FakeSSH(outputs={
         "nginx -t 2>&1": SSHResult("nginx: configuration file test failed", "", 1),
     })
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     result = asyncio.run(tool(ctx, {"sendfile": "on"}))
     assert result["reload"] == "FAILED"
@@ -1193,7 +1214,7 @@ def test_apply_nginx_syntax_check_fails():
 
 def test_apply_nginx_non_dict_payload():
     ctx = _ctx()
-    agent = build("model")
+    agent = build("model", config=_TEST_CONFIG)
     tool = agent._function_toolset.tools["apply_nginx_tuning"].function
     result = asyncio.run(tool(ctx, [1, 2, 3]))
     assert result["reload"] == "FAILED"
