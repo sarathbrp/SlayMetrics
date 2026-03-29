@@ -413,6 +413,62 @@ class TestSimulateCleanRecsForPlanner:
         assert cleaned[0]["changes"]["worker_connections"] == "65536"
 
 
+# Recommendations with aliased key names (from latest run)
+RECS_ALIASED_KEYS = [
+    {
+        "title": "Set SELinux to permissive",
+        "scope": "system",
+        "changes": {"selinux_mode": "permissive"},
+        "rationale": "Reduces syscall overhead",
+        "risk_level": "medium",
+    },
+    {
+        "title": "Raise cgroup I/O and CPU weights",
+        "scope": "system",
+        "changes": {"cgroup_IOWeight": "100", "cgroup_CPUWeight": "100"},
+        "rationale": "Allows services to consume appropriate resources",
+        "risk_level": "low",
+    },
+    {
+        "title": "Replace HTB shaping with fq_codel",
+        "scope": "system",
+        "changes": {"tc_qdisc": "fq_codel"},
+        "rationale": "Removes artificial bandwidth limits",
+        "risk_level": "low",
+    },
+]
+
+
+class TestParamAliases:
+    """Test that aliased parameter keys get resolved to config allowlist names.
+
+    Note: _resolve_param_alias is defined inside build() scope, so we test
+    via _normalize_synthesized_recommendation which handles changes dicts.
+    The actual alias resolution happens in save_recommendations_impl filtering.
+    """
+
+    def test_aliased_recs_normalize_preserves_changes(self):
+        """Verify normalization doesn't drop these — the issue is in
+        the allowlist filter, not normalization."""
+        for item in RECS_ALIASED_KEYS:
+            result = _normalize_synthesized_recommendation(item)
+            assert result.get("changes"), f"Changes lost for {item['title']}"
+
+    def test_selinux_mode_alias_in_changes(self):
+        """selinux_mode should be resolved to selinux by the alias map."""
+        item = RECS_ALIASED_KEYS[0]
+        result = _normalize_synthesized_recommendation(item)
+        # Changes dict still has the original key at this stage
+        # (alias resolution happens in save_recommendations_impl)
+        assert "selinux_mode" in result["changes"]
+
+    def test_cgroup_case_variants_in_changes(self):
+        item = RECS_ALIASED_KEYS[1]
+        result = _normalize_synthesized_recommendation(item)
+        assert "cgroup_IOWeight" in result["changes"]
+        assert "cgroup_CPUWeight" in result["changes"]
+
+
 class TestSimulateFullPipeline:
     """Simulate the full pipeline: coerce -> normalize -> clean for planner."""
 

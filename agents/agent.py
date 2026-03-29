@@ -298,6 +298,23 @@ def build(model, config=None) -> DiagnosisWorkflow:
         ).items()
     }
 
+    # Alias map: LLMs use variant key names → normalize to config allowlist keys
+    _param_aliases: dict[str, str] = {
+        "selinux_mode": "selinux",
+        "cgroup_IOWeight": "cgroup_io_weight",
+        "cgroup_CPUWeight": "cgroup_cpu_weight",
+        "cgroup_ioweight": "cgroup_io_weight",
+        "cgroup_cpuweight": "cgroup_cpu_weight",
+        "IOWeight": "cgroup_io_weight",
+        "CPUWeight": "cgroup_cpu_weight",
+        "tc_qdisc": "tc_rules",
+        "keepalive_timeout": "keepalive_timeout",
+    }
+
+    def _resolve_param_alias(key: str) -> str:
+        """Normalize a parameter key using the alias map."""
+        return _param_aliases.get(key, key)
+
     def inspect_irq_impl(deps: AgentDeps) -> dict:
         tool_call("inspect", "irq distribution — checking for IRQ lock and CPU spread")
         ssh = deps.ssh
@@ -971,7 +988,9 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 changes = {}
             allowed_params = set(nginx_targets) if scope == "nginx" else set(system_targets)
             filtered_changes = {
-                key: value for key, value in (changes or {}).items() if key in allowed_params
+                _resolve_param_alias(key): value
+                for key, value in (changes or {}).items()
+                if _resolve_param_alias(key) in allowed_params
             }
             if not filtered_changes:
                 if _debug_enabled(deps):
@@ -1581,10 +1600,14 @@ def build(model, config=None) -> DiagnosisWorkflow:
             _cfg = getattr(deps, "config", None) or {}
             if isinstance(raw, dict):
                 filtered = {
-                    str(k).strip(): str(v).strip().split(";")[0].strip()
+                    _resolve_param_alias(str(k).strip()): str(v).strip().split(";")[0].strip()
                     for k, v in raw.items()
-                    if str(k).strip() in allowed
-                    and not _is_blocked(str(k).strip(), str(v).strip().split(";")[0].strip(), _cfg)
+                    if _resolve_param_alias(str(k).strip()) in allowed
+                    and not _is_blocked(
+                        _resolve_param_alias(str(k).strip()),
+                        str(v).strip().split(";")[0].strip(),
+                        _cfg,
+                    )
                 }
                 if filtered:
                     changes_by_cat[cat] = filtered
