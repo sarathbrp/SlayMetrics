@@ -53,6 +53,13 @@ service:
     contestant_name_env: CONTESTANT_NAME
     contestant_name: slaymetrics
     target_host_env: DUT_HOST
+    # Healthy baseline floor — if post-fix RPS meets these, don't flag as
+    # regression even if below the (possibly inflated) degraded baseline.
+    healthy_floor_rps:
+      small: 300000
+      medium: 1300
+      large: 180
+      mixed: 2200
     # Fallback wrk2 config (used if benchmark.sh not available)
     duration: 30
     threads: 16

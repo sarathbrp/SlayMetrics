@@ -1161,7 +1161,19 @@ def build(model, config=None) -> DiagnosisWorkflow:
             raw = ssh.execute("nginx -T 2>/dev/null").stdout
             for param in nginx_applied:
                 expected = nginx_changes.get(param, "")
-                if param == "listen_backlog":
+
+                # Skip verify for params where "remove" means absence is correct
+                if expected == "remove" and param in ("limit_req", "limit_conn"):
+                    match = re.search(rf"^\s*{param}\s+", raw, re.MULTILINE)
+                    if not match:
+                        continue  # absent = success
+                    actual = "still present"
+                elif param == "error_log_level":
+                    match = re.search(r"error_log\s+\S+\s+(\w+)\s*;", raw)
+                    actual = match.group(1) if match else "warn"
+                    if actual == expected:
+                        continue
+                elif param == "listen_backlog":
                     match = re.search(r"listen\s+.*backlog=(\d+)", raw)
                     actual = match.group(1) if match else "not set"
                 else:

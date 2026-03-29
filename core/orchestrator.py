@@ -328,7 +328,8 @@ async def run(model, deps: AgentDeps) -> str:
             iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
 
         # Check exit criteria: all workloads within 1% of baseline
-        should_stop, regressions = _check_iteration_exit(baselines, iteration_finals)
+        healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
+        should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
 
         if should_stop:
             decision = f"All workloads OK — stopping after iteration {iteration}"
@@ -715,14 +716,26 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
 
 
 def _check_iteration_exit(
-    baselines: dict[str, Any], current_results: dict[str, Any]
+    baselines: dict[str, Any],
+    current_results: dict[str, Any],
+    healthy_floor: dict[str, float] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Check if all workloads are within 1% of baseline. Returns (should_stop, regressions)."""
+    """Check if all workloads are within 1% of baseline. Returns (should_stop, regressions).
+
+    If healthy_floor is provided, a workload that meets the floor RPS is never
+    flagged as a regression — this handles cases where the degraded baseline is
+    artificially inflated (e.g. limit_rate only kicks in after 1MB).
+    """
     regressions: list[str] = []
+    floor = healthy_floor or {}
     for workload in ("small", "medium", "large"):
         baseline_rps = float(baselines.get(workload, {}).get("rps", 0) or 0)
         current_rps = float(current_results.get(workload, {}).get("rps", 0) or 0)
         if not baseline_rps:
+            continue
+        # If current RPS meets the healthy floor, it's not a regression
+        floor_rps = float(floor.get(workload, 0) or 0)
+        if floor_rps and current_rps >= floor_rps:
             continue
         if current_rps < baseline_rps * 0.99:
             pct = ((current_rps - baseline_rps) / baseline_rps) * 100
@@ -969,6 +982,12 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
     target_host = os.environ.get(target_env, cfg["target"]["host"])
 
     contestant = f"{name}-{label}"
+    results_dir = "/root/hackathon-results"
+
+    # Remove stale JSON files to prevent reading cached results from prior runs
+    for wl in HACKATHON_WORKLOADS:
+        deps.bench.execute(f"rm -f {results_dir}/{contestant}_{wl}.json")
+
     cmd = f"TARGET_HOST={target_host} {script} {contestant}"
 
     logger.status("benchmark", f"Running: {cmd}")
@@ -979,7 +998,6 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
 
     # Parse results from JSON files
     results = {}
-    results_dir = "/root/hackathon-results"
     for workload in HACKATHON_WORKLOADS:
         json_path = f"{results_dir}/{contestant}_{workload}.json"
         r = deps.bench.execute(f"cat {json_path} 2>/dev/null")
