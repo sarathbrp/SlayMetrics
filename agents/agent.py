@@ -1568,88 +1568,147 @@ def build(model, config=None) -> DiagnosisWorkflow:
         return result_dict
 
     def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
-        # Use apply_plan from apply_planner agent (LLM-grouped)
+        from agents.tools_apply import (
+            apply_kernel,
+            apply_network,
+            apply_resource_limits,
+            apply_storage,
+        )
+
         apply_plan = state.get("apply_plan") or {}
+        _tuning = deps.config.get("tuning") or {}
+
+        # Extract changes per category, filtered by config allowlist
+        category_configs = {
+            "webserver": _tuning.get("webserver_targets") or {},
+            "kernel": _tuning.get("kernel_targets") or {},
+            "resource_limits": _tuning.get("resource_limits_targets") or {},
+            "network": _tuning.get("network_targets") or {},
+            "storage": _tuning.get("storage_targets") or {},
+        }
+        changes_by_cat: dict[str, dict[str, str]] = {}
+        for cat, allowed in category_configs.items():
+            raw = apply_plan.get(cat, {})
+            if isinstance(raw, dict):
+                filtered = {
+                    str(k).strip(): str(v).strip().rstrip(";").strip()
+                    for k, v in raw.items()
+                    if str(k).strip() in allowed
+                }
+                if filtered:
+                    changes_by_cat[cat] = filtered
+
+        # Also accept webserver params from adapter allowlist
+        adapter_allowed: set[str] = set(getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", set()))
+        raw_web = apply_plan.get("webserver", {})
+        if isinstance(raw_web, dict):
+            for k, v in raw_web.items():
+                k_s = str(k).strip()
+                if k_s in adapter_allowed and k_s not in changes_by_cat.get("webserver", {}):
+                    changes_by_cat.setdefault("webserver", {})[k_s] = (
+                        str(v).strip().rstrip(";").strip()
+                    )
+
         tool_call(
             "apply",
-            f"apply_plan keys={list(apply_plan.keys())} "
-            f"nginx={list((apply_plan.get('nginx') or {}).keys())} "
-            f"system={list((apply_plan.get('system') or {}).keys())}",
-        )
-        nginx_changes: dict[str, str] = {}
-        system_changes: dict[str, str] = {}
-
-        allowed_nginx: set[str] = set(nginx_targets) | set(
-            getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", set())
-        )
-        raw_nginx = apply_plan.get("nginx", {})
-        if isinstance(raw_nginx, dict):
-            for k, v in raw_nginx.items():
-                k_s = str(k).strip()
-                if k_s in allowed_nginx:
-                    nginx_changes[k_s] = str(v).strip().rstrip(";").strip()
-
-        raw_system = apply_plan.get("system", {})
-        if isinstance(raw_system, dict):
-            for k, v in raw_system.items():
-                k_s = str(k).strip()
-                if k_s in system_targets:
-                    system_changes[k_s] = str(v).strip().rstrip(";").strip()
-
-        # Fallback: if apply_planner didn't produce results, use translation
-        if not nginx_changes and not system_changes:
-            recommendations = list(state.get("recommendations") or [])
-            nginx_changes, system_changes = _translate_recommendations(recommendations)
-
-        tool_result(
-            "apply_plan",
-            f"nginx={list(nginx_changes.keys())} system={list(system_changes.keys())}",
+            " | ".join(f"{c}={len(v)}" for c, v in changes_by_cat.items() if v) or "no changes",
         )
 
-        # Batch apply
-        nginx_result = _batch_apply_nginx(deps, nginx_changes)
-        system_result = _batch_apply_system(deps, system_changes)
+        results: dict[str, Any] = {}
+        ssh = deps.ssh
 
-        # Verify changes actually took effect on DUT
+        # Apply webserver (nginx) changes
+        web_changes = changes_by_cat.get("webserver", {})
+        if web_changes:
+            results["webserver"] = _batch_apply_nginx(deps, web_changes)
+            state["nginx_applied"] = True
+
+        # Apply kernel changes
+        kern_changes = changes_by_cat.get("kernel", {})
+        if kern_changes:
+            results["kernel"] = apply_kernel(ssh, kern_changes)
+            state["system_applied"] = True
+
+        # Apply resource limits
+        res_changes = changes_by_cat.get("resource_limits", {})
+        if res_changes:
+            results["resource_limits"] = apply_resource_limits(ssh, res_changes)
+            state["system_applied"] = True
+
+        # Apply network fixes
+        net_changes = changes_by_cat.get("network", {})
+        if net_changes:
+            results["network"] = apply_network(ssh, net_changes)
+            state["system_applied"] = True
+
+        # Apply storage fixes
+        stor_changes = changes_by_cat.get("storage", {})
+        if stor_changes:
+            results["storage"] = apply_storage(ssh, stor_changes)
+            state["system_applied"] = True
+
+        # Log results per category
+        for cat, result in results.items():
+            applied = result.get("applied", {})
+            failed = result.get("failed", {})
+            actions = result.get("actions", [])
+            detail = (
+                f"applied={list(applied.keys()) if isinstance(applied, dict) else applied}"
+                f" failed={list(failed.keys()) if isinstance(failed, dict) else failed}"
+            )
+            if actions:
+                detail += f" actions={actions}"
+            tool_result(f"apply_{cat}", detail)
+
+        # Verify changes on DUT
         tool_call("verify", "checking applied changes on DUT")
+        web_applied = results.get("webserver", {}).get("applied", [])
+        kern_applied = results.get("kernel", {}).get("applied", {})
         _verify_applied_changes(
             deps,
-            nginx_applied=nginx_result.get("applied", []),
-            nginx_changes=nginx_changes,
-            system_applied=system_result.get("applied", {}),
+            nginx_applied=web_applied,
+            nginx_changes=web_changes,
+            system_applied=kern_applied,
         )
 
-        # Save findings (no per-apply benchmark — iteration loop handles that)
-        nginx_current = ((state.get("nginx_inspection") or {}).get("current")) or {}
-        system_current = ((state.get("system_inspection") or {}).get("current")) or {}
+        # Build findings from all categories
+        inspection = state.get("inspection") or {}
+        web_current = inspection.get("webserver", {}).get("current") or {}
+        kern_current = inspection.get("kernel", {}).get("current") or {}
         findings: list[dict[str, Any]] = []
-        for param in nginx_result.get("applied", []):
+        for param in web_applied if isinstance(web_applied, list) else web_applied.keys():
             findings.append(
                 {
-                    "parameter": f"nginx.{param}",
-                    "before_value": nginx_current.get(param, ""),
-                    "after_value": nginx_changes.get(param, ""),
-                    "reasoning": "target-driven tuning applied",
+                    "parameter": f"webserver.{param}",
+                    "before_value": web_current.get(param, ""),
+                    "after_value": web_changes.get(param, ""),
+                    "reasoning": "config-driven tuning",
                 }
             )
-        for param, value in system_result.get("applied", {}).items():
+        for param, value in kern_applied.items():
             findings.append(
                 {
-                    "parameter": f"system.{param}",
-                    "before_value": system_current.get(param, ""),
+                    "parameter": f"kernel.{param}",
+                    "before_value": kern_current.get(param, ""),
                     "after_value": value,
-                    "reasoning": "target-driven tuning applied",
+                    "reasoning": "config-driven tuning",
                 }
             )
+        for cat in ("resource_limits", "network", "storage"):
+            for action in results.get(cat, {}).get("actions", []):
+                findings.append(
+                    {
+                        "parameter": f"{cat}",
+                        "before_value": "",
+                        "after_value": action,
+                        "reasoning": "config-driven fix",
+                    }
+                )
 
         if findings:
             save_findings_impl(deps, findings)
 
-        return {
-            "nginx": nginx_result,
-            "system": system_result,
-            "findings": findings,
-        }
+        return {"results": results, "findings": findings}
 
     async def inspect_nginx_config(ctx) -> dict:
         return inspect_nginx_impl(ctx.deps)
@@ -2123,32 +2182,55 @@ async def _run_debate_planner(
     agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None
 ):
     ctx = SimpleNamespace(deps=deps)
-    inspect_nginx = agent._function_toolset.tools["inspect_nginx_config"].function
-    inspect_system = agent._function_toolset.tools["inspect_system_tuning"].function
-    inspect_irq = agent._function_toolset.tools["inspect_irq_distribution"].function
     save_rca = agent._function_toolset.tools["save_rca"].function
     save_recommendations = agent._function_toolset.tools["save_recommendations"].function
 
-    nginx_inspection = await inspect_nginx(ctx)
-    system_inspection = await inspect_system(ctx)
-    irq_inspection = await inspect_irq(ctx)
+    # Compound inspect: all 5 categories in one call
+    from agents.tools_inspect import inspect_all
+
+    tool_call("inspect", "compound inspect — all 5 categories")
+    all_inspection = inspect_all(deps.ssh, deps.config)
+    tool_result(
+        "inspect",
+        f"issues: {all_inspection.get('summary', {}).get('total_issues', 0)} "
+        f"({json.dumps(all_inspection.get('summary', {}).get('by_category', {}))}) ",
+    )
+    deps.token_counter.tool_calls += 1
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        "compound_inspection",
+        json.dumps(all_inspection, ensure_ascii=True)[:8000],
+        f"compound inspect: {all_inspection.get('summary', {}).get('total_issues', 0)} issues",
+    )
+
+    # Save to state for later use
+    if agent_state is not None:
+        agent_state["inspection"] = all_inspection
+
+    # Split inspection data for the two experts
+    webserver_data = all_inspection.get("webserver", {})
+    kernel_data = all_inspection.get("kernel", {})
+    resource_data = all_inspection.get("resource_limits", {})
+    network_data = all_inspection.get("network", {})
+    storage_data = all_inspection.get("storage", {})
 
     nginx_prompt = (
-        "You are an NGINX performance expert. Review only nginx config evidence. "
-        "Do not recommend kernel or IRQ changes. Return strict JSON with keys "
-        "summary, rca_records, recommendations, counterpoints.\n\n"
+        "You are an NGINX/webserver performance expert. "
+        "Review the webserver inspection evidence. "
+        "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
         f"Shared Context:\n{context_prompt}\n\n"
-        f"NGINX Inspection:\n{json.dumps(nginx_inspection, ensure_ascii=True)}"
+        f"Webserver Inspection:\n{json.dumps(webserver_data, ensure_ascii=True)}"
     )
     rhel_prompt = (
         "You are a RHEL Linux performance expert. "
-        "Review only kernel/system/IRQ evidence. "
-        "Do not recommend nginx-only config changes "
-        "unless they directly depend on system evidence. "
+        "Review kernel, resource limits, network, and storage evidence. "
         "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
         f"Shared Context:\n{context_prompt}\n\n"
-        f"System Inspection:\n{json.dumps(system_inspection, ensure_ascii=True)}\n\n"
-        f"IRQ Inspection:\n{json.dumps(irq_inspection, ensure_ascii=True)}"
+        f"Kernel Inspection:\n{json.dumps(kernel_data, ensure_ascii=True)}\n\n"
+        f"Resource Limits:\n{json.dumps(resource_data, ensure_ascii=True)}\n\n"
+        f"Network:\n{json.dumps(network_data, ensure_ascii=True)}\n\n"
+        f"Storage:\n{json.dumps(storage_data, ensure_ascii=True)}"
     )
 
     (nginx_analysis, nginx_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
@@ -2192,62 +2274,38 @@ async def _run_debate_planner(
         await save_recommendations(ctx, recommendations)
 
     # ── 4th agent: apply_planner ─────────────────────────────────────
-    # Ask the LLM to group all recommendations into two clean queues:
-    # nginx config directives and system shell commands.
+    # Group all recommendations into 5 categories matching our tools.
     _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
-    _nginx_tgt = {
-        "worker_connections": "65536",
-        "worker_rlimit_nofile": "200000",
-        "worker_cpu_affinity": "auto",
-        "open_file_cache": "max=200000 inactive=60s",
-        "open_file_cache_valid": "30s",
-        "open_file_cache_min_uses": "2",
-        "access_log": "off",
-        "tcp_nodelay": "on",
-        "keepalive_requests": "10000",
-        "keepalive_timeout": "30",
-        "reset_timedout_connection": "on",
-        "listen_backlog": "65535",
-        "aio": "threads",
-        **{str(k): str(v) for k, v in (_tuning.get("nginx_targets") or {}).items()},
-    }
-    _sys_tgt = {
-        "net.core.somaxconn": "65535",
-        "net.ipv4.tcp_max_syn_backlog": "65535",
-        "net.core.netdev_max_backlog": "65535",
-        "net.core.rmem_max": "16777216",
-        "net.core.wmem_max": "16777216",
-        "net.ipv4.tcp_tw_reuse": "1",
-        "net.ipv4.tcp_max_tw_buckets": "2000000",
-        "net.ipv4.ip_local_port_range": "1024 65535",
-        "transparent_hugepage": "never",
-        "selinux": "permissive",
-        "cpu_governor": "performance",
-        "nofile": "65536",
-        "irqbalance": "active",
-        **{str(k): str(v) for k, v in (_tuning.get("system_targets") or {}).items()},
-    }
+    _web_tgt = _tuning.get("webserver_targets") or {}
+    _kern_tgt = _tuning.get("kernel_targets") or {}
+    _res_tgt = _tuning.get("resource_limits_targets") or {}
+    _net_tgt = _tuning.get("network_targets") or {}
+    _stor_tgt = _tuning.get("storage_targets") or {}
     apply_prompt = (
         "You are a performance tuning executor. "
-        "Given the synthesizer's recommendations below, produce a JSON object "
-        "with exactly two keys:\n\n"
-        '1. "nginx" — a flat dictionary of nginx config directives to apply. '
-        f"Only use these allowed directive names: {', '.join(sorted(_nginx_tgt))}. "
-        "Each key is the directive name, each value is the directive value "
-        "(no semicolons, no comments, just the value). Example: "
-        '{"worker_connections": "65536", "access_log": "off"}\n\n'
-        '2. "system" — a flat dictionary of system parameters to apply. '
-        f"Only use these allowed parameter names: {', '.join(sorted(_sys_tgt))}. "
-        "Each key is the parameter name, each value is the target value. Example: "
-        '{"net.core.somaxconn": "65535", "transparent_hugepage": "never", '
-        '"selinux": "permissive"}\n\n'
+        "Given the synthesizer's recommendations, produce a JSON object "
+        "with exactly 5 keys — one per category. "
+        "Only use allowed parameter names listed below.\n\n"
+        '1. "webserver" — nginx config directives.\n'
+        f"   Allowed: {', '.join(sorted(_web_tgt))}\n"
+        f"   Defaults: {json.dumps(_web_tgt)}\n\n"
+        '2. "kernel" — sysctl, THP, SELinux, CPU governor, IRQ.\n'
+        f"   Allowed: {', '.join(sorted(_kern_tgt))}\n"
+        f"   Defaults: {json.dumps(_kern_tgt)}\n\n"
+        '3. "resource_limits" — cgroup, systemd limits, background processes.\n'
+        f"   Allowed: {', '.join(sorted(_res_tgt))}\n"
+        f"   Defaults: {json.dumps(_res_tgt)}\n\n"
+        '4. "network" — iptables, conntrack, tc rules.\n'
+        f"   Allowed: {', '.join(sorted(_net_tgt))}\n"
+        f"   Defaults: {json.dumps(_net_tgt)}\n\n"
+        '5. "storage" — I/O scheduler, readahead, I/O hogs.\n'
+        f"   Allowed: {', '.join(sorted(_stor_tgt))}\n"
+        f"   Defaults: {json.dumps(_stor_tgt)}\n\n"
         "Rules:\n"
-        "- Include ONLY parameters that the synthesizer recommends changing\n"
-        "- Values must be clean (no comments, no semicolons, no explanations)\n"
-        "- If the synthesizer mentions a parameter but doesn't give a value, "
-        "use these defaults:\n"
-        f"  nginx defaults: {json.dumps(_nginx_tgt)}\n"
-        f"  system defaults: {json.dumps(_sys_tgt)}\n\n"
+        "- Include ONLY parameters the synthesizer recommends changing\n"
+        "- Values must be clean (no comments, no semicolons)\n"
+        "- Use defaults if the synthesizer mentions a param without a value\n"
+        "- Empty categories should be empty dicts {}\n\n"
         "Synthesizer recommendations:\n"
         f"{json.dumps(synthesis.get('recommendations', []), ensure_ascii=True)}"
     )
@@ -2255,11 +2313,11 @@ async def _run_debate_planner(
         model, "planner.apply_planner", apply_prompt, deps
     )
     # Always log apply_planner output — this is the critical translation step
-    nginx_keys = list((apply_plan.get("nginx") or {}).keys())
-    system_keys = list((apply_plan.get("system") or {}).keys())
+    categories = ["webserver", "kernel", "resource_limits", "network", "storage"]
+    plan_summary = {cat: list((apply_plan.get(cat) or {}).keys()) for cat in categories}
     tool_call(
         "apply_planner",
-        f"nginx={nginx_keys} system={system_keys}",
+        " | ".join(f"{c}={len(v)}" for c, v in plan_summary.items() if v),
     )
     if _planner_debug_enabled(deps):
         tool_result(

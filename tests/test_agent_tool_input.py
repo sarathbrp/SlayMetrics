@@ -110,6 +110,13 @@ def _ctx():
         config={
             "agent": {"debug_planner_payloads": False, "persist_hypotheses": False},
             "service": {"benchmark": {}, "config_path": "/etc/nginx/nginx.conf"},
+            "tuning": {
+                "webserver_targets": {"sendfile": "on", "worker_connections": "65536"},
+                "kernel_targets": {"net.core.somaxconn": "65535"},
+                "resource_limits_targets": {},
+                "network_targets": {},
+                "storage_targets": {},
+            },
         },
     )
     return SimpleNamespace(deps=deps)
@@ -901,14 +908,16 @@ def test_apply_from_recommendations_saves_findings_without_benchmark():
     ctx = _ctx()
     agent = build("model")
     agent._slaymetrics_state["apply_plan"] = {
-        "nginx": {"sendfile": "on"},
-        "system": {},
+        "webserver": {"sendfile": "on"},
+        "kernel": {},
     }
-    agent._slaymetrics_state["nginx_inspection"] = {"current": {"sendfile": "off"}}
+    agent._slaymetrics_state["inspection"] = {
+        "webserver": {"current": {"sendfile": "off"}},
+        "kernel": {"current": {}},
+    }
 
     result = agent._apply_from_recommendations(ctx.deps)
 
-    assert "nginx" in result
+    assert "results" in result
     assert "findings" in result
-    assert "benchmark" not in result
     assert any(fact["type"] == "fix" for fact in ctx.deps.memory.saved_facts)

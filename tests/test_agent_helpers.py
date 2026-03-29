@@ -181,6 +181,13 @@ def _ctx():
                 "benchmark": {"duration": 30, "small_file_url": "http://localhost/test"},
                 "config_path": "/etc/nginx/nginx.conf",
             },
+            "tuning": {
+                "webserver_targets": {"sendfile": "on", "worker_connections": "65536"},
+                "kernel_targets": {"net.core.somaxconn": "65535"},
+                "resource_limits_targets": {},
+                "network_targets": {},
+                "storage_targets": {},
+            },
         },
     )
     return SimpleNamespace(deps=deps)
@@ -975,41 +982,27 @@ def test_coerce_recommendations_drops_empty_changes_with_debug(monkeypatch):
 def test_apply_from_recommendations_nginx_and_system():
     ctx = _ctx()
     agent = build("model")
-    agent._slaymetrics_state["recommendations"] = [
-        {
-            "title": "Enable sendfile",
-            "scope": "nginx",
-            "changes": {"sendfile": "on"},
-            "rationale": "faster I/O",
-        },
-        {
-            "title": "Tune kernel",
-            "scope": "system",
-            "changes": {"net.core.somaxconn": "65535"},
-            "rationale": "raise limit",
-        },
-    ]
+    agent._slaymetrics_state["apply_plan"] = {
+        "webserver": {"sendfile": "on"},
+        "kernel": {"net.core.somaxconn": "65535"},
+    }
     result = agent._apply_from_recommendations(ctx.deps)
-    assert "nginx" in result
-    assert "system" in result
+    assert "results" in result
     assert "findings" in result
 
 def test_apply_from_recommendations_skips_non_dict_changes():
     ctx = _ctx()
     agent = build("model")
-    agent._slaymetrics_state["recommendations"] = [
-        {"title": "bad", "scope": "nginx", "changes": "not a dict"},
-    ]
+    agent._slaymetrics_state["apply_plan"] = {"webserver": "not a dict"}
     result = agent._apply_from_recommendations(ctx.deps)
-    # Should produce no nginx changes
-    assert result["nginx"]["reload"] == "SKIPPED"
+    assert result["findings"] == []
 
 def test_apply_from_recommendations_empty_list():
     ctx = _ctx()
     agent = build("model")
-    agent._slaymetrics_state["recommendations"] = []
+    agent._slaymetrics_state["apply_plan"] = {}
     result = agent._apply_from_recommendations(ctx.deps)
-    assert result["nginx"]["reload"] == "SKIPPED"
+    assert result["findings"] == []
 
 
 # ===========================================================================
