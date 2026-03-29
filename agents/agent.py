@@ -1580,7 +1580,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
             raw = apply_plan.get(cat, {})
             if isinstance(raw, dict):
                 filtered = {
-                    str(k).strip(): str(v).strip().rstrip(";").strip()
+                    str(k).strip(): str(v).strip().split(";")[0].strip()
                     for k, v in raw.items()
                     if str(k).strip() in allowed
                 }
@@ -1595,7 +1595,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 k_s = str(k).strip()
                 if k_s in adapter_allowed and k_s not in changes_by_cat.get("webserver", {}):
                     changes_by_cat.setdefault("webserver", {})[k_s] = (
-                        str(v).strip().rstrip(";").strip()
+                        str(v).strip().split(";")[0].strip()
                     )
 
         # Auto-apply resource_limits/network/storage from inspection problems
@@ -2321,7 +2321,11 @@ async def _run_debate_planner(
         "- CRITICAL: if inspection shows cgroup CPU/memory caps or "
         "systemd LimitNOFILE too low, include resource_limits fixes\n\n"
         "Synthesizer recommendations:\n"
-        f"{json.dumps(synthesis.get('recommendations', []), ensure_ascii=True)}\n\n"
+        + json.dumps(
+            _clean_recs_for_planner(synthesis.get("recommendations", [])),
+            ensure_ascii=True,
+        )
+        + "\n\n"
         "Inspection problems detected (also fix these):\n"
         f"resource_limits: {json.dumps(resource_data.get('problems', []))}\n"
         f"network: {json.dumps(network_data.get('problems', []))}\n"
@@ -2343,6 +2347,26 @@ async def _run_debate_planner(
             f"apply_planner raw: {json.dumps(apply_plan, ensure_ascii=False)}",
         )
     _save_planner_artifact(deps, "apply_planner", apply_plan, iteration=_iter)
+
+    # Safety net: inject config defaults for any allowlist params the planner
+    # omitted.  The planner sometimes drops params when the synthesizer
+    # feeds it dirty values — ensure critical settings like worker_processes
+    # are never silently lost.
+    _defaults_by_cat = {
+        "webserver": _web_tgt,
+        "kernel": _kern_tgt,
+        "resource_limits": _res_tgt,
+        "network": _net_tgt,
+        "storage": _stor_tgt,
+    }
+    for _cat, _defaults in _defaults_by_cat.items():
+        plan_cat = apply_plan.get(_cat)
+        if not isinstance(plan_cat, dict):
+            plan_cat = {}
+            apply_plan[_cat] = plan_cat
+        for _param, _default_val in _defaults.items():
+            if _param not in plan_cat:
+                plan_cat[_param] = _default_val
 
     # Store the grouped changes for apply_saved_recommendations_impl
     if agent_state is not None:
@@ -2559,7 +2583,26 @@ def _strip_inline_comment(value: str) -> str:
     idx = value.find("#")
     if idx > 0:
         value = value[:idx]
-    return value.strip().rstrip(";").strip()
+    return value.strip().split(";")[0].strip()
+
+
+def _clean_recs_for_planner(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Clean recommendation values before feeding to apply_planner.
+
+    The synthesizer LLM sometimes appends '; reload nginx' or similar
+    command fragments to values in the changes dict. Strip them so the
+    planner sees clean param=value pairs.
+    """
+    cleaned: list[dict[str, Any]] = []
+    for rec in recs if isinstance(recs, list) else []:
+        rec = dict(rec)
+        changes = rec.get("changes")
+        if isinstance(changes, dict):
+            rec["changes"] = {
+                str(k).strip(): str(v).strip().split(";")[0].strip() for k, v in changes.items()
+            }
+        cleaned.append(rec)
+    return cleaned
 
 
 def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any]:
