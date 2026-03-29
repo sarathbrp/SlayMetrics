@@ -2302,12 +2302,19 @@ async def _run_debate_planner(
         f"   Allowed: {', '.join(sorted(_stor_tgt))}\n"
         f"   Defaults: {json.dumps(_stor_tgt)}\n\n"
         "Rules:\n"
-        "- Include ONLY parameters the synthesizer recommends changing\n"
+        "- Include parameters the synthesizer recommends AND any "
+        "problems detected in the inspection below\n"
         "- Values must be clean (no comments, no semicolons)\n"
-        "- Use defaults if the synthesizer mentions a param without a value\n"
-        "- Empty categories should be empty dicts {}\n\n"
+        "- Use defaults if a param is mentioned without a value\n"
+        "- Empty categories should be empty dicts {}\n"
+        "- CRITICAL: if inspection shows cgroup CPU/memory caps or "
+        "systemd LimitNOFILE too low, include resource_limits fixes\n\n"
         "Synthesizer recommendations:\n"
-        f"{json.dumps(synthesis.get('recommendations', []), ensure_ascii=True)}"
+        f"{json.dumps(synthesis.get('recommendations', []), ensure_ascii=True)}\n\n"
+        "Inspection problems detected (also fix these):\n"
+        f"resource_limits: {json.dumps(resource_data.get('problems', []))}\n"
+        f"network: {json.dumps(network_data.get('problems', []))}\n"
+        f"storage: {json.dumps(storage_data.get('problems', []))}"
     )
     apply_plan, apply_usage = _invoke_json_planner(
         model, "planner.apply_planner", apply_prompt, deps

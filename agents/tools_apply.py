@@ -54,8 +54,10 @@ def apply_kernel(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[
                 f' || RESULT="$RESULT {param}=FAIL"'
             )
         elif param.startswith(("net.", "vm.", "fs.")):
+            # Quote values with spaces (e.g. tcp_rmem="4096 87380 16777216")
+            quoted_value = f'"{value}"' if " " in value else value
             lines.append(
-                f"sysctl -w {param}={value} 2>&1"
+                f"sysctl -w {param}={quoted_value} 2>&1"
                 f' && RESULT="$RESULT {param}=OK"'
                 f' || RESULT="$RESULT {param}=FAIL"'
             )
