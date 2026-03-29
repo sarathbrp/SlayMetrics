@@ -2609,6 +2609,8 @@ def _clean_recs_for_planner(
     """
     cleaned: list[dict[str, Any]] = []
     for rec in recs if isinstance(recs, list) else []:
+        if not isinstance(rec, dict):
+            continue
         rec = dict(rec)
         changes = rec.get("changes")
         if isinstance(changes, dict):
