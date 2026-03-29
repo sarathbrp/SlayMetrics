@@ -179,6 +179,11 @@ tuning:
     readahead: "256"
     kill_io_hogs: "true"
 
+  # Guardrails: values that must NEVER be applied, even if the LLM suggests them.
+  # Format: param_name: [list of blocked values]
+  blocked_values:
+    aio: ["threads", "on"]
+
   # Backward compatibility aliases
   nginx_targets: {}
   system_targets: {}

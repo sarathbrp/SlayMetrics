@@ -1578,11 +1578,13 @@ def build(model, config=None) -> DiagnosisWorkflow:
         changes_by_cat: dict[str, dict[str, str]] = {}
         for cat, allowed in category_configs.items():
             raw = apply_plan.get(cat, {})
+            _cfg = getattr(deps, "config", None) or {}
             if isinstance(raw, dict):
                 filtered = {
                     str(k).strip(): str(v).strip().split(";")[0].strip()
                     for k, v in raw.items()
                     if str(k).strip() in allowed
+                    and not _is_blocked(str(k).strip(), str(v).strip().split(";")[0].strip(), _cfg)
                 }
                 if filtered:
                     changes_by_cat[cat] = filtered
@@ -2322,7 +2324,7 @@ async def _run_debate_planner(
         "systemd LimitNOFILE too low, include resource_limits fixes\n\n"
         "Synthesizer recommendations:\n"
         + json.dumps(
-            _clean_recs_for_planner(synthesis.get("recommendations", [])),
+            _clean_recs_for_planner(synthesis.get("recommendations", []), deps.config),
             ensure_ascii=True,
         )
         + "\n\n"
@@ -2364,8 +2366,9 @@ async def _run_debate_planner(
         if not isinstance(plan_cat, dict):
             plan_cat = {}
             apply_plan[_cat] = plan_cat
+        _cfg = getattr(deps, "config", None) or {}
         for _param, _default_val in _defaults.items():
-            if _param not in plan_cat:
+            if _param not in plan_cat and not _is_blocked(_param, _default_val, _cfg):
                 plan_cat[_param] = _default_val
 
     # Store the grouped changes for apply_saved_recommendations_impl
@@ -2586,12 +2589,23 @@ def _strip_inline_comment(value: str) -> str:
     return value.strip().split(";")[0].strip()
 
 
-def _clean_recs_for_planner(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _is_blocked(param: str, value: str, config: dict[str, Any] | None = None) -> bool:
+    """Return True if param=value is blocked by config.yaml guardrails."""
+    blocked = (config or {}).get("tuning", {}).get("blocked_values", {})
+    blocked_vals = blocked.get(param)
+    if not blocked_vals:
+        return False
+    return value.strip().lower() in {str(v).lower() for v in blocked_vals}
+
+
+def _clean_recs_for_planner(
+    recs: list[dict[str, Any]], config: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """Clean recommendation values before feeding to apply_planner.
 
     The synthesizer LLM sometimes appends '; reload nginx' or similar
     command fragments to values in the changes dict. Strip them so the
-    planner sees clean param=value pairs.
+    planner sees clean param=value pairs. Also removes blocked values.
     """
     cleaned: list[dict[str, Any]] = []
     for rec in recs if isinstance(recs, list) else []:
@@ -2599,7 +2613,9 @@ def _clean_recs_for_planner(recs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         changes = rec.get("changes")
         if isinstance(changes, dict):
             rec["changes"] = {
-                str(k).strip(): str(v).strip().split(";")[0].strip() for k, v in changes.items()
+                str(k).strip(): str(v).strip().split(";")[0].strip()
+                for k, v in changes.items()
+                if not _is_blocked(str(k).strip(), str(v).strip().split(";")[0].strip(), config)
             }
         cleaned.append(rec)
     return cleaned
@@ -2783,10 +2799,7 @@ def _extract_changes_from_action(action: str, scope: str) -> dict[str, str]:
         lowered = action.lower()
         if key and remainder:
             value = remainder
-            if key == "aio" and value.lower() == "threads":
-                extracted[key] = "threads"
-            else:
-                extracted[key] = value
+            extracted[key] = value
         elif key and "disable" in lowered:
             extracted[key] = "off"
         elif key and "enable" in lowered:
