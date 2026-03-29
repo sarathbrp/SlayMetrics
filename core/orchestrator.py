@@ -217,13 +217,13 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 4a: Check context — previously applied fixes (TiDB — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 4a: Checking for previously applied fixes...")
+    # Only use current session's fixes — cross-session fixes may be stale
+    # (system could have been reset between runs)
     past_fixes = list(memory.get_facts(session_id, type="fix") or [])
-    # Also check ALL sessions for this host — cross-session learning
-    all_fixes = list(memory.get_all_fixes_for_host(cfg["target"]["host"]) or [])
 
     prior_fixes = []
-    seen_params = set()
-    for f in all_fixes + past_fixes:
+    seen_params: set[str] = set()
+    for f in past_fixes:
         param = f.get("parameter", "")
         if param and param not in seen_params:
             seen_params.add(param)
