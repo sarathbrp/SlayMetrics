@@ -1397,7 +1397,14 @@ def build(model, config=None) -> DiagnosisWorkflow:
         # Apply via adapter (it handles upsert + conf.d cleanup)
         applied = []
         failed = []
-        for param, value in changes.items():
+        # Apply worker_processes first (fundamental directive)
+        priority_order = ["worker_processes", "worker_rlimit_nofile"]
+        ordered_params = sorted(
+            changes.keys(),
+            key=lambda p: priority_order.index(p) if p in priority_order else 99,
+        )
+        for param in ordered_params:
+            value = changes[param]
             if deps.adapter.apply_config(param, value):
                 applied.append(param)
             else:

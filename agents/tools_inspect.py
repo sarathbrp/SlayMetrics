@@ -184,7 +184,8 @@ def inspect_resource_limits(
 
     # Detect specific hogs (dd, fio, stress-ng)
     hog_procs = ssh.execute(
-        "pgrep -la 'dd |fio|stress' 2>/dev/null | head -5", timeout=5
+        "pgrep -la 'dd |fio|stress|sysbench|iperf|io_pressure' 2>/dev/null | head -5",
+        timeout=5,
     ).stdout.strip()
     findings["hog_processes"] = hog_procs
 
@@ -300,7 +301,8 @@ def inspect_storage(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
 
     # Background I/O hogs
     io_hogs = ssh.execute(
-        "pgrep -la 'dd |fio|stress-ng' 2>/dev/null | head -5", timeout=5
+        "pgrep -la 'dd |fio|stress|sysbench|iperf|io_pressure' 2>/dev/null | head -5",
+        timeout=5,
     ).stdout.strip()
     findings["io_hog_processes"] = io_hogs
 

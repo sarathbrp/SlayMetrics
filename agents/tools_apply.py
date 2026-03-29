@@ -115,23 +115,32 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
             timeout=10,
         )
 
-    # Fix cgroup IO weight
-    if changes.get("cgroup_io_weight"):
+    # Fix cgroup IO weight (reset to default 100)
+    io_w = changes.get("cgroup_io_weight")
+    if io_w:
         ssh.execute(
-            f"systemctl set-property nginx.service IOWeight={changes['cgroup_io_weight']}"
-            " 2>/dev/null || true",
+            f"systemctl set-property nginx.service IOWeight={io_w} 2>/dev/null || true",
             timeout=10,
         )
-        actions.append(f"cgroup IOWeight={changes['cgroup_io_weight']}")
+        # Also remove any persistent override
+        ssh.execute(
+            "rm -f /etc/systemd/system/nginx.service.d/50-IOWeight.conf 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"cgroup IOWeight={io_w}")
 
-    # Fix cgroup CPU weight
-    if changes.get("cgroup_cpu_weight"):
+    # Fix cgroup CPU weight (reset to default 100)
+    cpu_w = changes.get("cgroup_cpu_weight")
+    if cpu_w:
         ssh.execute(
-            f"systemctl set-property nginx.service CPUWeight={changes['cgroup_cpu_weight']}"
-            " 2>/dev/null || true",
+            f"systemctl set-property nginx.service CPUWeight={cpu_w} 2>/dev/null || true",
             timeout=10,
         )
-        actions.append(f"cgroup CPUWeight={changes['cgroup_cpu_weight']}")
+        ssh.execute(
+            "rm -f /etc/systemd/system/nginx.service.d/50-CPUWeight.conf 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"cgroup CPUWeight={cpu_w}")
 
     # Remove NUMA interleave policy (numactl drop-in)
     if changes.get("numa_policy") == "remove":
@@ -144,13 +153,17 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     # Kill background hogs (stress-ng, dd, fio, etc.)
     if changes.get("kill_background_hogs") == "true":
         ssh.execute(
-            "pkill -f 'dd if=/dev/zero' 2>/dev/null; "
-            "pkill -f 'dd if=/dev/urandom' 2>/dev/null; "
-            "pkill -f 'dd of=/dev/shm' 2>/dev/null; "
-            "pkill -f 'fio ' 2>/dev/null; "
-            "pkill -f 'stress-ng' 2>/dev/null; "
-            "pkill -f 'stress ' 2>/dev/null; "
-            "umount /dev/shm 2>/dev/null; mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true; "
+            "pkill -9 -f 'dd if=/dev' 2>/dev/null; "
+            "pkill -9 -f 'dd of=' 2>/dev/null; "
+            "pkill -9 -f 'fio' 2>/dev/null; "
+            "pkill -9 -f 'stress-ng' 2>/dev/null; "
+            "pkill -9 -f 'stress ' 2>/dev/null; "
+            "pkill -9 -f 'sysbench' 2>/dev/null; "
+            "pkill -9 -f 'iperf' 2>/dev/null; "
+            "pkill -9 -f 'io_pressure' 2>/dev/null; "
+            "rm -f /tmp/io_pressure* 2>/dev/null; "
+            "umount /dev/shm 2>/dev/null;"
+            " mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true; "
             "echo done",
             timeout=10,
         )
