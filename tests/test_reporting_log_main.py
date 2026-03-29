@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +12,7 @@ import main
 from agents import TokenCounter
 from core import log as logger
 from core.reporter import _clean, generate
-from memory.embeddings import ClaudeEmbeddings
+from memory.embeddings import RemoteEmbeddings
 
 
 class FakeConsole:
@@ -43,6 +44,25 @@ class FakeMemory:
                 "reasoning": "why",
             }
         ]
+
+    def get_contexts(self, session_id, type=None, source_prefix=None, limit=None):
+        del session_id, source_prefix, limit
+        if type == "recommendation":
+            return [
+                {
+                    "content": json.dumps(
+                        {
+                            "title": "Raise connection limits",
+                            "recommendation": "Increase worker_connections and somaxconn",
+                            "rationale": "Current limits are below target",
+                            "expected_benefit": "Higher throughput",
+                            "risk_level": "low",
+                            "validation": "Rerun small workload",
+                        }
+                    )
+                }
+            ]
+        return []
 
     def get_queue(self, session_id):
         return [{"name": "h1", "priority": 1, "status": "done", "outcome": "ok"}]
@@ -86,8 +106,10 @@ def test_reporter_generate_and_clean(tmp_path):
     assert Path(path).exists()
     md = Path(path).read_text()
     assert "Token Attribution by Tool" in md
+    assert "## Recommendations" in md
     report_json = json.loads((tmp_path / "report.json").read_text())
     assert report_json["tokens"]["by_tool"][0]["tool"] == "inspect"
+    assert report_json["recommendations"][0]["title"] == "Raise connection limits"
     assert _clean({"a": 1, "embedding": [1]}) == {"a": 1}
 
     class EmptyMemory(FakeMemory):
@@ -188,28 +210,67 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     cfg = {
         "llm": {
             "active_profile": "v",
-            "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}},
+            "profiles": {"v": {"backend": "ollama", "model": "m", "base_url": "u"}},
         },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
     }
     monkeypatch.setitem(
-        main.sys.modules,
-        "pydantic_ai.models.openai",
-        SimpleNamespace(OpenAIChatModel=lambda model, provider: ("model", model, provider)),
+        sys.modules,
+        "langchain_ollama",
+        SimpleNamespace(ChatOllama=lambda **kwargs: ("ollama", kwargs)),
     )
     monkeypatch.setitem(
-        main.sys.modules,
-        "pydantic_ai.providers.openai",
-        SimpleNamespace(OpenAIProvider=lambda base_url, api_key: ("provider", base_url, api_key)),
+        sys.modules,
+        "langchain_anthropic",
+        SimpleNamespace(ChatAnthropic=lambda **kwargs: ("anthropic", kwargs)),
     )
     monkeypatch.setitem(
-        main.sys.modules,
-        "pydantic_ai.models.anthropic",
-        SimpleNamespace(AnthropicModel=lambda model: ("anthropic", model)),
+        sys.modules,
+        "langchain_openai",
+        SimpleNamespace(ChatOpenAI=lambda **kwargs: ("openai", kwargs)),
     )
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
-    assert main.get_model(cfg)[0] == "model"
+    assert main.get_model(cfg)[0] == "ollama"
+
+    monkeypatch.setenv("GPT_OSS_API_KEY", "token")
+    assert (
+        main.get_model(
+            {
+                "llm": {
+                    "active_profile": "g",
+                    "profiles": {
+                        "g": {
+                            "backend": "openai",
+                            "model": "/models/gpt-oss-120b",
+                            "model_env": "GPT_OSS_MODEL",
+                            "base_url": "http://example-gpt-oss-host:8002/v1",
+                            "api_key_env": "GPT_OSS_API_KEY",  # pragma: allowlist secret  # pragma: allowlist secret
+                        }
+                    },
+                }
+            }
+        )[0]
+        == "openai"
+    )
+    monkeypatch.setenv("GPT_OSS_MODEL", "/models/custom-gpt-oss")
+    resolved = main.get_model(
+        {
+            "llm": {
+                "active_profile": "g",
+                "profiles": {
+                    "g": {
+                        "backend": "openai",
+                        "model": "/models/gpt-oss-120b",
+                        "model_env": "GPT_OSS_MODEL",
+                        "base_url": "http://example-gpt-oss-host:8002/v1",
+                        "api_key_env": "GPT_OSS_API_KEY",  # pragma: allowlist secret
+                    }
+                },
+            }
+        }
+    )
+    assert resolved[1]["model"] == "/models/custom-gpt-oss"
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     try:
@@ -230,10 +291,12 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     cfg_main = {
         "llm": {
             "active_profile": "v",
-            "profiles": {"v": {"backend": "vllm", "model": "m", "base_url": "u"}},
+            "profiles": {"v": {"backend": "ollama", "model": "m", "base_url": "u"}},
         },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
+        "agent": {},
+        "telemetry": {"langfuse": {"enabled": True}},
     }
     monkeypatch.setattr(main, "load_config", lambda p: cfg_main)
     monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
@@ -243,19 +306,59 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: fake_memory)
     monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
     fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
-    monkeypatch.setattr(main, "ssh_from_config", lambda cfg: fake_ssh)
-    monkeypatch.setattr(main, "load_adapter", lambda cfg, ssh: "adapter")
+    monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)
+    monkeypatch.setattr(main, "load_adapter", lambda cfg, ssh, bench=None: "adapter")
     monkeypatch.setattr(main, "get_model", lambda cfg: "model")
     monkeypatch.setattr(main.logger, "status", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
     monkeypatch.setattr(main.logger, "close", lambda: None)
+    langfuse_calls = []
+
+    class FakeLangfuse:
+        enabled = True
+        last_trace_url = "http://langfuse/project/x/traces/y"
+
+        def auth_check(self):
+            langfuse_calls.append(("auth_check",))
+            return True
+
+        def trace(self, *args, **kwargs):
+            langfuse_calls.append(("trace", args, kwargs))
+
+            class Ctx:
+                def __enter__(self_inner):
+                    return None
+
+                def __exit__(self_inner, *exc):
+                    return False
+
+            return Ctx()
+
+        def flush(self):
+            langfuse_calls.append(("flush",))
+
+        def shutdown(self):
+            langfuse_calls.append(("shutdown",))
+
+    monkeypatch.setattr(
+        main.LangfuseClient,
+        "from_env",
+        lambda metadata=None, enabled=True: FakeLangfuse() if enabled else SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
+    )
     monkeypatch.setitem(
-        main.sys.modules,
+        sys.modules,
         "core.orchestrator",
         SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
     )
-    asyncio.run(main.main("cfg.yaml", None, False))
+    asyncio.run(main.main("cfg.yaml", None, False, 3, "debate", "reuse"))
     assert fake_memory.created is True
+    assert cfg_main["agent"]["max_phase"] == 3
+    assert cfg_main["agent"]["planner_mode"] == "debate"
+    assert cfg_main["agent"]["baseline_mode"] == "reuse"
+    assert ("auth_check",) in langfuse_calls
+    assert any(call[0] == "trace" for call in langfuse_calls)
+    assert ("flush",) in langfuse_calls
+    assert ("shutdown",) in langfuse_calls
 
 
 def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):
@@ -274,7 +377,7 @@ def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):
     assert any("unchanged, skipping load" in args[1] for args in calls if len(args) > 1)
 
 
-def test_claude_embeddings(monkeypatch):
+def test_remote_embeddings(monkeypatch):
     class FakeEmbeddingsAPI:
         def create(self, model, input):
             return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0, 2.0])])
@@ -283,6 +386,6 @@ def test_claude_embeddings(monkeypatch):
         def __init__(self, api_key=None):
             self.embeddings = FakeEmbeddingsAPI()
 
-    monkeypatch.setitem(main.sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
-    emb = ClaudeEmbeddings("voyage-3")
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+    emb = RemoteEmbeddings("voyage-3")
     assert emb.embed("hello") == [1.0, 2.0]

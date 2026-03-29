@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import uuid
 
 from adapters.base import BenchmarkResult, ServiceAdapter
 from tools.ssh import LocalClient, SSHClient
@@ -18,9 +21,21 @@ HTTP_DIRECTIVES = {
     "gzip",
     "gzip_comp_level",
     "gzip_types",
+    "gzip_min_length",
     "reset_timedout_connection",
     "lingering_close",
     "lingering_timeout",
+    "aio",
+    "directio",
+    "limit_rate",
+    "limit_rate_after",
+    "output_buffers",
+    "postpone_output",
+    "client_body_buffer_size",
+    "client_max_body_size",
+    "client_body_timeout",
+    "client_header_timeout",
+    "send_timeout",
 }
 
 
@@ -50,6 +65,7 @@ class NginxAdapter(ServiceAdapter):
         "worker_connections",
         "use",
         "multi_accept",
+        "accept_mutex",
     }
     # Directives that belong in server {} block
     SERVER_DIRECTIVES = {
@@ -71,6 +87,12 @@ class NginxAdapter(ServiceAdapter):
         # Handle listen_backlog specially — modifies existing listen directives
         if parameter == "listen_backlog":
             return self._set_listen_backlog(value)
+        # Handle error_log_level — changes the level arg of existing error_log
+        if parameter == "error_log_level":
+            return self._set_error_log_level(value)
+        # Handle limit_req/limit_conn removal — remove from conf.d + main config
+        if parameter in ("limit_req", "limit_conn") and value == "remove":
+            return self._remove_rate_limiting(parameter)
         spec = self.DIRECTIVE_SPECS.get(parameter)
         if spec is None or spec["context"] == "special":
             return False
@@ -97,6 +119,10 @@ class NginxAdapter(ServiceAdapter):
         )
         self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
+        # Remove same directive from included conf.d files to prevent overrides
+        if block == "http":
+            self._remove_from_confd(parameter)
+
         # Validate — rollback if broken
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
@@ -105,50 +131,116 @@ class NginxAdapter(ServiceAdapter):
 
         return True
 
-    def _set_listen_backlog(self, backlog: str) -> bool:
-        """Add backlog= to listen directives inside server {} blocks only."""
-        config_path = self._cfg["config_path"]
-        current = self._ssh.execute(f"cat {config_path}").stdout
-        self._ssh.execute(f"cp {config_path} {config_path}.bak")
-
-        lines = current.splitlines()
-        new_lines = []
-        in_server = False
-        brace_depth = 0
-
-        for line in lines:
-            stripped = line.strip()
-
-            # Track server block depth
-            if re.match(r"server\s*\{", stripped):
-                in_server = True
-                brace_depth = 0
-            if in_server:
-                brace_depth += stripped.count("{") - stripped.count("}")
-                if brace_depth <= 0 and "}" in stripped:
-                    in_server = False
-
-            # Only modify listen inside server blocks.
-            if in_server and re.match(r"listen\s+", stripped):
-                line = _rewrite_listen_backlog_line(line, backlog)
-
-            new_lines.append(line)
-
-        new_config = "\n".join(new_lines) + "\n"
+    def _remove_from_confd(self, parameter: str) -> None:
+        """Remove a directive from all conf.d/*.conf files (server block overrides)."""
         self._ssh.execute(
-            f"cat > /tmp/nginx_new.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
+            f"sed -i '/^[[:space:]]*{parameter}[[:space:]]/d'"
+            " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
         )
-        self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
-        # Validate — rollback if broken
+    def _set_error_log_level(self, level: str) -> bool:
+        """Change the error_log level without changing the file path."""
+        config_path = self._cfg["config_path"]
+        self._ssh.execute(f"cp {config_path} {config_path}.bak")
+        # Replace error_log line: keep path, change level
+        self._ssh.execute(
+            f"sed -i -E 's|^(error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|' {config_path}"
+        )
+        # Also fix in conf.d
+        self._ssh.execute(
+            f"sed -i -E 's|^(\\s*error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|'"
+            " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
+        )
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
             self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            return False
+        return True
+
+    def _remove_rate_limiting(self, directive: str) -> bool:
+        """Remove limit_req/limit_conn zones and directives from all configs."""
+        config_path = self._cfg["config_path"]
+        self._ssh.execute(f"cp {config_path} {config_path}.bak")
+        # Remove zone definitions and directive usage from main config
+        for pattern in (
+            f"{directive}_zone",
+            f"{directive} ",
+        ):
+            self._ssh.execute(f"sed -i '/{pattern}/d' {config_path} 2>/dev/null || true")
+        # Also remove from conf.d files
+        for pattern in (
+            f"{directive}_zone",
+            f"{directive} ",
+        ):
+            self._ssh.execute(f"sed -i '/{pattern}/d' /etc/nginx/conf.d/*.conf 2>/dev/null || true")
+        test = self._ssh.execute("nginx -t 2>&1")
+        if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            self._ssh.execute(f"cp {config_path}.bak {config_path}")
+            return False
+        return True
+
+    def _set_listen_backlog(self, backlog: str) -> bool:
+        """Add backlog= to listen directives in main config and conf.d files."""
+        config_path = self._cfg["config_path"]
+        # Process main config and all conf.d files
+        conf_files = [config_path]
+        confd_list = self._ssh.execute("ls /etc/nginx/conf.d/*.conf 2>/dev/null")
+        if confd_list.ok and confd_list.stdout.strip():
+            for f in confd_list.stdout.strip().splitlines():
+                f = f.strip()
+                if f.endswith(".conf") and f not in conf_files:
+                    conf_files.append(f)
+
+        for conf_file in conf_files:
+            current = self._ssh.execute(f"cat {conf_file}").stdout
+            self._ssh.execute(f"cp {conf_file} {conf_file}.bak")
+
+            lines = current.splitlines()
+            new_lines = []
+            modified = False
+            in_server = False
+            brace_depth = 0
+
+            for line in lines:
+                stripped = line.strip()
+
+                # Track server block depth
+                if re.match(r"server\s*\{", stripped):
+                    in_server = True
+                    brace_depth = 0
+                if in_server:
+                    brace_depth += stripped.count("{") - stripped.count("}")
+                    if brace_depth <= 0 and "}" in stripped:
+                        in_server = False
+
+                if in_server and re.match(r"listen\s+", stripped):
+                    rewritten = _rewrite_listen_backlog_line(line, backlog)
+                    if rewritten != line:
+                        modified = True
+                    new_lines.append(rewritten)
+                else:
+                    new_lines.append(line)
+
+            if modified:
+                new_config = "\n".join(new_lines) + "\n"
+                self._ssh.execute(
+                    f"cat > /tmp/nginx_backlog.conf << 'NGINX_CONF_EOF'\n{new_config}NGINX_CONF_EOF"
+                )
+                self._ssh.execute(f"cp /tmp/nginx_backlog.conf {conf_file}")
+
+        # Validate — rollback all if broken
+        test = self._ssh.execute("nginx -t 2>&1")
+        if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            for conf_file in conf_files:
+                self._ssh.execute(f"cp {conf_file}.bak {conf_file} 2>/dev/null || true")
             return False
         return True
 
     def benchmark(self, duration: int = 30, url: str = "") -> BenchmarkResult:
         target_url = url or self._bench_cfg.get("small_file_url", "http://localhost/")
+        if self._bench_cfg.get("tool") == "hackathon":
+            return self._benchmark_hackathon(target_url)
+
         threads = self._bench_cfg.get("threads", 4)
         connections = self._bench_cfg.get("connections", 400)
         rate = self._bench_cfg.get("rate", 150000)
@@ -159,7 +251,13 @@ class NginxAdapter(ServiceAdapter):
         # Run wrk2 on bench node (may be same machine or separate)
         wrk_cmd = f"wrk2 -t{threads} -c{connections} -d{duration}s -R{rate} --latency {target_url}"
         result = self._bench.execute(wrk_cmd, timeout=duration + 60)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"wrk2 benchmark failed: {detail}")
         bench = _parse_wrk2(result.stdout, duration, target_url)
+        if "Requests/sec:" not in result.stdout:
+            detail = result.stderr.strip() or result.stdout.strip() or "missing Requests/sec output"
+            raise RuntimeError(f"wrk2 benchmark output was not parseable: {detail}")
 
         # Collect resource data from DUT
         sar_result = self._ssh.execute("sleep 2; cat /tmp/slay_sar.log 2>/dev/null")
@@ -169,6 +267,27 @@ class NginxAdapter(ServiceAdapter):
         bench.mem_mb = _parse_free_used(mem_result.stdout)
 
         return bench
+
+    def _benchmark_hackathon(self, target_url: str) -> BenchmarkResult:
+        script = self._bench_cfg.get("script", "/root/hackathon-tools/benchmark.sh")
+        name = self._bench_cfg.get("contestant_name", "slaymetrics")
+        target_env = self._bench_cfg.get("target_host_env", "DUT_HOST")
+        target_host = os.environ.get(target_env, target_url)
+        workload = _workload_from_url(target_url, self._bench_cfg)
+        contestant = f"{name}-agent-{workload}-{uuid.uuid4().hex[:8]}"
+
+        cmd = f"TARGET_HOST={target_host} {script} {contestant}"
+        result = self._bench.execute(cmd, timeout=600)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            raise RuntimeError(f"hackathon benchmark failed: {detail}")
+
+        json_path = f"/root/hackathon-results/{contestant}_{workload}.json"
+        payload = self._bench.execute(f"cat {json_path} 2>/dev/null")
+        if not payload.ok or not payload.stdout.strip():
+            raise RuntimeError(f"hackathon benchmark result missing for workload {workload}")
+
+        return _parse_hackathon_result(payload.stdout, target_url)
 
     def get_metrics(self) -> dict:
         metrics = {}
@@ -250,6 +369,40 @@ def _extract_latency(text: str, percentile: str) -> float:
     return value
 
 
+def _parse_hackathon_result(output: str, url: str) -> BenchmarkResult:
+    data = json.loads(output)
+    results = data.get("results", {})
+    requests = results.get("requests", {})
+    latency = results.get("latency", {})
+    percentiles = latency.get("percentiles", {})
+    return BenchmarkResult(
+        requests_per_sec=float(requests.get("per_sec", 0) or 0),
+        latency_p50_ms=_latency_to_ms(percentiles.get("p50", "0ms")),
+        latency_p99_ms=_latency_to_ms(percentiles.get("p99", "0ms")),
+        error_rate=0.0,
+        duration_sec=int(results.get("duration", 0) or 0),
+        url=url,
+    )
+
+
+def _latency_to_ms(value: str) -> float:
+    text = str(value).strip()
+    if text.endswith("us"):
+        return float(text[:-2]) / 1000
+    if text.endswith("ms"):
+        return float(text[:-2])
+    if text.endswith("s"):
+        return float(text[:-1]) * 1000
+    return float(text or 0)
+
+
+def _workload_from_url(url: str, bench_cfg: dict) -> str:
+    for workload in ("small", "medium", "large"):
+        if url and url == bench_cfg.get(f"{workload}_file_url"):
+            return workload
+    return "homepage"
+
+
 def _rewrite_listen_backlog_line(line: str, backlog: str) -> str:
     """Rewrite one listen directive line to set backlog=<value>, preserving comments."""
     comment = ""
@@ -283,6 +436,10 @@ def _upsert_directive_in_context(
     block_open_idx: int | None = None
     seen = False
 
+    # For http-level directives, also remove duplicates from server blocks
+    # so the http-level value isn't overridden by a more specific scope.
+    remove_from_children = context == "http"
+
     for line in lines:
         stripped = line.strip()
         current_scope = _scope_name(stack)
@@ -291,6 +448,10 @@ def _upsert_directive_in_context(
             if not seen:
                 new_lines.append(new_directive)
                 seen = True
+            continue
+
+        # Remove same directive from child scopes (e.g. server block)
+        if remove_from_children and current_scope not in ("main", context) and pattern.match(line):
             continue
 
         new_lines.append(line)

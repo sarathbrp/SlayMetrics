@@ -1,26 +1,23 @@
 llm:
-  active_profile: claude-haiku          # change this one line to switch LLM
+  active_profile: gpt-oss-api           # change this one line to switch LLM
 
   profiles:
-    granite-local:                     # default: fully local, air-gapped
-      backend: vllm
-      model: granite-3.1-8b-lab-v2.1
-      base_url: http://localhost:8000/v1
+    granite-api:                       # Granite 4 via Ollama API
+      backend: ollama
+      model: granite4:7b-a1b-h
+      base_url: http://localhost:11434
 
-    claude-remote:                     # best reasoning, requires API key
+    gpt-oss-api:                       # GPT-OSS via OpenAI-compatible endpoint
+      backend: openai
+      model: /models/gpt-oss-120b
+      model_env: GPT_OSS_MODEL
+      base_url: ${GPT_OSS_BASE_URL}
+      api_key_env: GPT_OSS_API_KEY  # pragma: allowlist secret
+
+    claude-api:                        # Claude via Anthropic API
       backend: claude
       model: claude-opus-4-6
       api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
-
-    claude-haiku:                      # fast + cheap, good enough for diagnosis
-      backend: claude
-      model: claude-haiku-4-5-20251001
-      api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
-
-    ollama-local:                      # lightweight alternative, zero infra
-      backend: ollama
-      model: llama3.2
-      base_url: http://localhost:11434/v1
 
 memory:
   backend: tidb
@@ -38,7 +35,7 @@ target:
   ssh_timeout: 30
 
 bench:
-  host: localhost                   # where wrk2 runs (localhost = this machine)
+  host: localhost                   # agent runs here, wrk runs here
   ssh_user: root
   ssh_key: ~/.ssh/id_rsa
   ssh_timeout: 30
@@ -50,20 +47,20 @@ service:
   systemd_unit: nginx.service
   log_path: /var/log/nginx/access.log
   benchmark:
-    tool: wrk2
+    # Use hackathon's official benchmark.sh instead of wrk2
+    tool: hackathon
+    script: /root/hackathon-tools/benchmark.sh
+    contestant_name_env: CONTESTANT_NAME
+    contestant_name: slaymetrics
+    target_host_env: DUT_HOST
+    # Fallback wrk2 config (used if benchmark.sh not available)
     duration: 30
-    threads: 4
-    connections: 400
-    rate: 150000
-    # URLs use DUT_HOST from .env; fallback to localhost
+    threads: 16
+    connections: 1000
+    rate: 1000000
     small_file_url: "http://${DUT_HOST:-localhost}/1kb.html"
     medium_file_url: "http://${DUT_HOST:-localhost}/100kb.html"
     large_file_url: "http://${DUT_HOST:-localhost}/1mb.html"
-  metrics:
-    - requests_per_sec
-    - latency_p50
-    - latency_p99
-    - error_rate
 
 rhel:
   checks:
@@ -79,11 +76,113 @@ rhel:
     - kernel_version
 
 agent:
-  improvement_threshold_pct: 5        # min % improvement to count a fix as worthwhile
-  max_iterations: 50                   # safety cap on hypothesis loop
+  improvement_threshold_pct: 5
+  max_iterations: 3
+  max_phase: 4
+  baseline_mode: fresh
+  debug_planner_payloads: true
+  persist_hypotheses: true
   benchmark_after_every_fix: true
   stability:
-    enabled: false                     # enable for final run (30 min test)
-    duration_sec: 1800                 # 30 minutes total
-    sample_interval_sec: 60            # one wrk2 run per minute
-    url_key: small_file_url            # which payload to use for stability
+    enabled: false
+    duration_sec: 1800
+    sample_interval_sec: 60
+    url_key: small_file_url
+
+tuning:
+  # Category 1: webserver — nginx directives the agent can inspect and apply
+  webserver_targets:
+    worker_processes: "auto"
+    worker_connections: "65536"
+    worker_rlimit_nofile: "200000"
+    worker_cpu_affinity: "auto"
+    sendfile: "on"
+    tcp_nopush: "on"
+    tcp_nodelay: "on"
+    multi_accept: "on"
+    accept_mutex: "off"
+    access_log: "off"
+    error_log_level: "warn"
+    open_file_cache: "max=200000 inactive=60s"
+    open_file_cache_valid: "30s"
+    open_file_cache_min_uses: "2"
+    keepalive_requests: "10000"
+    keepalive_timeout: "30"
+    reset_timedout_connection: "on"
+    listen_backlog: "65535"
+    gzip: "off"
+    gzip_comp_level: "1"
+    limit_rate: "0"
+    limit_rate_after: "0"
+    limit_req: "remove"
+    limit_conn: "remove"
+    directio: "off"
+    aio: "off"
+    output_buffers: "2 32k"
+    postpone_output: "0"
+    client_body_timeout: "60"
+    client_header_timeout: "60"
+    send_timeout: "60"
+
+  # Category 2: kernel — sysctl, THP, SELinux, CPU, IRQ
+  kernel_targets:
+    net.core.somaxconn: "65535"
+    net.ipv4.tcp_max_syn_backlog: "65535"
+    net.core.netdev_max_backlog: "65535"
+    net.core.rmem_max: "16777216"
+    net.core.wmem_max: "16777216"
+    net.core.rmem_default: "262144"
+    net.core.wmem_default: "262144"
+    net.ipv4.tcp_rmem: "4096 87380 16777216"
+    net.ipv4.tcp_wmem: "4096 65536 16777216"
+    net.ipv4.tcp_tw_reuse: "1"
+    net.ipv4.tcp_max_tw_buckets: "2000000"
+    net.ipv4.tcp_fin_timeout: "15"
+    net.ipv4.tcp_slow_start_after_idle: "0"
+    net.ipv4.tcp_max_orphans: "65536"
+    net.ipv4.tcp_orphan_retries: "3"
+    net.ipv4.tcp_keepalive_time: "600"
+    net.ipv4.tcp_keepalive_intvl: "15"
+    net.ipv4.tcp_keepalive_probes: "5"
+    net.ipv4.ip_local_port_range: "1024 65535"
+    vm.swappiness: "10"
+    vm.vfs_cache_pressure: "50"
+    vm.dirty_ratio: "40"
+    vm.dirty_background_ratio: "10"
+    vm.dirty_expire_centisecs: "3000"
+    vm.dirty_writeback_centisecs: "500"
+    transparent_hugepage: "never"
+    selinux: "permissive"
+    cpu_governor: "performance"
+    irqbalance: "active"
+
+  # Category 3: resource_limits — cgroups, systemd, ulimits
+  resource_limits_targets:
+    systemd_nofile: "524288"
+    systemd_nproc: "infinity"
+    cgroup_cpu: "max"
+    cgroup_memory: "max"
+    cgroup_io_weight: "100"
+    cgroup_cpu_weight: "100"
+    numa_policy: "remove"
+    kill_background_hogs: "true"
+
+  # Category 4: network — firewall, conntrack, tc
+  network_targets:
+    iptables_drop_rules: "flush"
+    conntrack_max: "1048576"
+    tc_rules: "remove"
+
+  # Category 5: storage — I/O scheduler, readahead
+  storage_targets:
+    io_scheduler: "none"
+    readahead: "256"
+    kill_io_hogs: "true"
+
+  # Backward compatibility aliases
+  nginx_targets: {}
+  system_targets: {}
+
+telemetry:
+  langfuse:
+    enabled: true

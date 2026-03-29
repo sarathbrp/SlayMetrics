@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from pydantic import BaseModel
+from dataclasses import dataclass
 
 from adapters.base import BenchmarkResult as AdapterBenchmarkResult
 from agents import AgentDeps
 from core.log import log
 
 
-class BenchmarkOutput(BaseModel):
+@dataclass
+class BenchmarkOutput:
     requests_per_sec: float
     latency_p50_ms: float
     latency_p99_ms: float
@@ -21,11 +22,11 @@ class BenchmarkOutput(BaseModel):
 
 
 async def run(model, deps: AgentDeps, duration: int = 30, url: str = "") -> BenchmarkOutput:
-    """Run benchmark directly — no LLM needed for this step."""
+    del model
     bench_cfg = deps.config["service"]["benchmark"]
     target_url = url or bench_cfg.get("small_file_url", "http://localhost/")
 
-    log("benchmark", f"Running wrk2 for {duration}s against {target_url}", "action")
+    log("benchmark", f"Running benchmark for {duration}s against {target_url}", "action")
     result: AdapterBenchmarkResult = deps.adapter.benchmark(duration, target_url)
     log(
         "benchmark",

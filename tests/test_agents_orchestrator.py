@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from pydantic_ai.models.test import TestModel
-
 from adapters.base import BenchmarkResult
 from agents import TokenCounter, analyzer, benchmark, collector, remediation
 from core import orchestrator
@@ -18,6 +16,19 @@ class FakeMemory:
 
     def save_context(self, *args):
         self.saved.append(args)
+
+    def get_contexts(self, session_id, type=None, source_prefix=None, limit=None):
+        del session_id, type, source_prefix, limit
+        return [
+            {
+                "source": "baseline:series",
+                "content": '{"summary":{"sample_count":5,"duration_sec":4,"run_queue_avg":1.2,"run_queue_max":3,"rx_drop_delta":2,"rx_drop_rate_per_sec":0.5,"worker_core_spread_max":4},"first_sample":{"nginx_worker_count":112,"nginx_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":900,"mem_used_mb":1000,"vmstat_run_queue":1,"vmstat_blocked":0},"last_sample":{"nginx_worker_count":112,"nginx_worker_cores":[0,1,2,3],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":2,"tx_drop_total":0,"tcp_established":1024,"mem_used_mb":1001,"vmstat_run_queue":3,"vmstat_blocked":0}}',
+            },
+            {
+                "source": "baseline:post",
+                "content": '{"summary":{"nginx_worker_count":112,"nginx_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":1024}}',
+            }
+        ]
 
     def save_fact(self, **kwargs):
         self.saved.append(("fact", kwargs))
@@ -41,6 +52,10 @@ class FakeMemory:
 
     def get_profile(self, session_id):
         return {"service": "nginx", "host": "localhost"}
+
+    def get_latest_session_for_host(self, host, exclude_session_id=None):
+        del host, exclude_session_id
+        return None
 
     def get_queue(self, session_id):
         return []
@@ -108,6 +123,7 @@ def _deps():
             },
             "rhel": {"checks": ["cpu_governor"]},
             "agent": {
+                "baseline_mode": "fresh",
                 "stability": {
                     "enabled": True,
                     "duration_sec": 2,
@@ -116,6 +132,61 @@ def _deps():
                 }
             },
         },
+    )
+
+
+def test_orchestrator_reuses_stored_baseline(monkeypatch):
+    deps = _deps()
+    deps.memory.get_latest_session_for_host = lambda host, exclude_session_id=None: "prior-s1"
+
+    def fake_get_contexts(session_id, type=None, source_prefix=None, limit=None):
+        del type, limit
+        if session_id == "prior-s1" and source_prefix == "baseline_small":
+            return [{"content": '{"rps": 123.0, "p99": 4.0, "cpu_pct": 0, "mem_mb": 0, "error_rate": 0}'}]
+        if session_id == "prior-s1" and source_prefix == "baseline_homepage":
+            return [{"content": '{"rps": 456.0, "p99": 1.0, "cpu_pct": 0, "mem_mb": 0, "error_rate": 0}'}]
+        if session_id == "prior-s1" and source_prefix is None:
+            return [
+                {
+                    "source": "baseline:series",
+                    "content": '{"summary":{"sample_count":3,"duration_sec":2,"run_queue_avg":0.5,"run_queue_max":1,"rx_drop_delta":1,"rx_drop_rate_per_sec":0.1,"worker_core_spread_max":8},"first_sample":{"nginx_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":10,"tx_drop_total":0,"tcp_established":90},"last_sample":{"nginx_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":11,"tx_drop_total":0,"tcp_established":95}}',
+                }
+            ]
+        return []
+
+    deps.memory.get_contexts = fake_get_contexts
+    deps.config["agent"]["baseline_mode"] = "reuse"
+
+    monkeypatch.setattr(orchestrator.system_checks, "run_all", lambda ssh, checks: [])
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run",
+        lambda model, deps, context_prompt: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                notes="planned",
+                recommendations=[],
+                rca_records=[],
+                nginx_applied=False,
+                system_applied=False,
+                after_rps=0.0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}),
+    )
+    monkeypatch.setattr(orchestrator.reporter, "generate", lambda *a, **k: "report.md")
+
+    report = asyncio.run(orchestrator.run("model", deps))
+
+    assert report == "report.md"
+    assert any(
+        args[2] == "benchmark_evidence" and "123.0" in args[3]
+        for args in deps.memory.saved
+        if isinstance(args, tuple) and len(args) >= 4
     )
 
 
@@ -130,7 +201,7 @@ def test_benchmark_and_collector_run():
 
 def test_analyzer_tools_and_run(monkeypatch):
     deps = _deps()
-    agent = analyzer.build(TestModel())
+    agent = analyzer.build("model")
     query_memory = agent._function_toolset.tools["query_memory"].function
     get_past_facts = agent._function_toolset.tools["get_past_facts"].function
     run_diagnostic = agent._function_toolset.tools["run_diagnostic_command"].function
@@ -166,7 +237,7 @@ def test_analyzer_tools_and_run(monkeypatch):
 
 def test_remediation_tools_and_run(monkeypatch):
     deps = _deps()
-    agent = remediation.build(TestModel())
+    agent = remediation.build("model")
     ctx = SimpleNamespace(deps=deps)
     assert (
         asyncio.run(agent._function_toolset.tools["run_benchmark"].function(ctx, 1))[
@@ -228,8 +299,70 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
     )
     monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}),
+    )
+    monkeypatch.setattr(
         orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
     )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_snapshot",
+        lambda *a, **k: {
+            "scope": k["scope"],
+            "source": k["source"],
+            "host": "localhost",
+            "summary": {},
+            "sections": {},
+        },
+    )
+    monkeypatch.setattr(orchestrator, "start_sampler", lambda *a, **k: {"scope": k["scope"], "ok": True})
+    monkeypatch.setattr(
+        orchestrator,
+        "stop_sampler",
+        lambda *a, **k: {
+            "scope": k["scope"],
+            "ok": True,
+            "csv_content": "timestamp,nginx_worker_count,nginx_worker_cores,somaxconn,tcp_max_syn_backlog,ip_local_port_range,rx_drop_total,tx_drop_total,tcp_established,mem_used_mb,vmstat_run_queue,vmstat_blocked\n1,112,\"0,1\",4096,1024,\"32768 60999\",0,0,900,1000,1,0\n2,112,\"0,1,2,3\",4096,1024,\"32768 60999\",2,0,1024,1001,3,0\n",
+            "summary": {
+                "sample_count": 2,
+                "duration_sec": 1,
+                "run_queue_avg": 2.0,
+                "run_queue_max": 3,
+                "rx_drop_delta": 2,
+                "rx_drop_rate_per_sec": 2.0,
+                "first_sample": {
+                    "nginx_worker_count": 112,
+                    "nginx_worker_cores": [0, 1],
+                    "somaxconn": "4096",
+                    "tcp_max_syn_backlog": "1024",
+                    "ip_local_port_range": "32768 60999",
+                    "rx_drop_total": 0,
+                    "tx_drop_total": 0,
+                    "tcp_established": 900,
+                    "mem_used_mb": 1000,
+                    "vmstat_run_queue": 1,
+                    "vmstat_blocked": 0,
+                },
+                "last_sample": {
+                    "nginx_worker_count": 112,
+                    "nginx_worker_cores": [0, 1, 2, 3],
+                    "somaxconn": "4096",
+                    "tcp_max_syn_backlog": "1024",
+                    "ip_local_port_range": "32768 60999",
+                    "rx_drop_total": 2,
+                    "tx_drop_total": 0,
+                    "tcp_established": 1024,
+                    "mem_used_mb": 1001,
+                    "vmstat_run_queue": 3,
+                    "vmstat_blocked": 0,
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(orchestrator, "persist_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "persist_sampler_result", lambda *a, **k: None)
     for name in ["panel", "step", "check", "status", "benchmark", "log"]:
         monkeypatch.setattr(orchestrator.logger, name, lambda *a, **k: None)
     report = asyncio.run(orchestrator.run("model", deps))
@@ -240,9 +373,64 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         8,
         16,
         ["- x"],
-        {"small": {"rps": 1.0, "p50": 1.0, "p99": 2.0, "cpu_pct": 3.0, "error_rate": 0.0}},
-        "cfg",
-        ["k"],
+        "- baseline small: 1.0 RPS, p99=2.0ms",
         [{"parameter": "p", "value": "v", "impact": 1.0}],
+        "- baseline:post: workers=112",
     )
-    assert "Already Applied" in prompt
+    assert "Already applied (skip)" in prompt
+    assert "Telemetry:" in prompt
+    assert "Benchmark Evidence:" in prompt
+
+
+def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
+    deps = _deps()
+    deps.config["agent"]["max_phase"] = 3
+    monkeypatch.setattr(
+        orchestrator.system_checks,
+        "run_all",
+        lambda ssh, checks: [CheckResult("cpu_governor", "ok", "ok", "")],
+    )
+    diagnosis = SimpleNamespace(summary="done", recommendations=[{"title": "Raise limits"}])
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run",
+        lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
+    )
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}),
+    )
+    monkeypatch.setattr(
+        orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_snapshot",
+        lambda *a, **k: {
+            "scope": k["scope"],
+            "source": k["source"],
+            "host": "localhost",
+            "summary": {},
+            "sections": {},
+        },
+    )
+    monkeypatch.setattr(orchestrator, "start_sampler", lambda *a, **k: {"scope": k["scope"], "ok": True})
+    monkeypatch.setattr(
+        orchestrator,
+        "stop_sampler",
+        lambda *a, **k: {
+            "scope": k["scope"],
+            "ok": True,
+            "csv_content": "",
+            "summary": {"sample_count": 0, "first_sample": {}, "last_sample": {}},
+        },
+    )
+    monkeypatch.setattr(orchestrator, "persist_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "persist_sampler_result", lambda *a, **k: None)
+    for name in ["panel", "step", "check", "status", "benchmark", "log"]:
+        monkeypatch.setattr(orchestrator.logger, name, lambda *a, **k: None)
+
+    report = asyncio.run(orchestrator.run("model", deps))
+
+    assert report.endswith("report.md")

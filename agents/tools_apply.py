@@ -1,0 +1,297 @@
+"""Apply tools — fix DUT state across 5 categories.
+
+Each tool builds a single bash script for its category and executes
+it in one SSH call. Only applies parameters listed in config.yaml targets.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from tools.ssh import LocalClient, SSHClient
+
+
+def apply_kernel(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[str, Any]:
+    """Category 2: Apply kernel params in one SSH script."""
+    if not changes:
+        return {"applied": {}, "failed": {}, "skipped": []}
+
+    lines = ["#!/bin/bash", "set +e", "RESULT=''"]
+
+    for param, value in changes.items():
+        if param == "transparent_hugepage":
+            lines.append(
+                f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
+                f' && RESULT="$RESULT {param}=OK"'
+                f' || RESULT="$RESULT {param}=FAIL"'
+            )
+        elif param == "selinux":
+            mode = "0" if value.lower() in ("permissive", "0") else "1"
+            lines.append(f"setenforce {mode} 2>&1")
+            if value.lower() in ("permissive", "0"):
+                lines.append(
+                    "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
+                    " /etc/selinux/config 2>/dev/null || true"
+                )
+            lines.append(f'RESULT="$RESULT {param}=OK"')
+        elif param == "cpu_governor":
+            lines.append(
+                f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/"
+                f"scaling_governor >/dev/null 2>&1"
+                f' && RESULT="$RESULT {param}=OK"'
+                f' || RESULT="$RESULT {param}=FAIL"'
+            )
+        elif param == "irqbalance":
+            lines.append(
+                "systemctl enable --now irqbalance 2>&1"
+                f' && RESULT="$RESULT {param}=OK"'
+                f' || RESULT="$RESULT {param}=FAIL"'
+            )
+        elif param == "net.ipv4.ip_local_port_range":
+            lines.append(
+                f"sysctl -w 'net.ipv4.ip_local_port_range={value}' 2>&1"
+                f' && RESULT="$RESULT {param}=OK"'
+                f' || RESULT="$RESULT {param}=FAIL"'
+            )
+        elif param.startswith(("net.", "vm.", "fs.")):
+            # Quote values with spaces (e.g. tcp_rmem="4096 87380 16777216")
+            quoted_value = f'"{value}"' if " " in value else value
+            lines.append(
+                f"sysctl -w {param}={quoted_value} 2>&1"
+                f' && RESULT="$RESULT {param}=OK"'
+                f' || RESULT="$RESULT {param}=FAIL"'
+            )
+
+    lines.append("echo $RESULT")
+    script = "\n".join(lines)
+
+    result = ssh.execute(f"bash -c '{script}'", timeout=30)
+    return _parse_script_result(result.stdout, changes)
+
+
+def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[str, Any]:
+    """Category 3: Fix cgroups, systemd limits, kill background hogs."""
+    if not changes:
+        return {"applied": {}, "failed": {}, "actions": []}
+
+    actions: list[str] = []
+
+    # Remove cgroup CPU cap
+    if changes.get("cgroup_cpu") == "max":
+        ssh.execute(
+            "systemctl set-property nginx.service CPUQuota= 2>/dev/null || true",
+            timeout=10,
+        )
+        actions.append("removed cgroup CPU cap")
+
+    # Remove cgroup memory cap
+    if changes.get("cgroup_memory") == "max":
+        ssh.execute(
+            "systemctl set-property nginx.service MemoryMax=infinity 2>/dev/null || true",
+            timeout=10,
+        )
+        actions.append("removed cgroup memory cap")
+
+    # Fix systemd LimitNOFILE via drop-in (the RIGHT way)
+    nofile = changes.get("systemd_nofile")
+    if nofile:
+        ssh.execute(
+            "mkdir -p /etc/systemd/system/nginx.service.d && "
+            "cat > /etc/systemd/system/nginx.service.d/limits.conf << 'EOF'\n"
+            "[Service]\n"
+            f"LimitNOFILE={nofile}\n"
+            f"LimitNPROC={changes.get('systemd_nproc', 'infinity')}\n"
+            "EOF",
+            timeout=10,
+        )
+        actions.append(f"systemd drop-in: LimitNOFILE={nofile}")
+
+    # Also update limits.conf as belt-and-suspenders
+    if nofile:
+        ssh.execute(
+            "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true && "
+            f"echo '* soft nofile {nofile}' >> /etc/security/limits.conf && "
+            f"echo '* hard nofile {nofile}' >> /etc/security/limits.conf",
+            timeout=10,
+        )
+
+    # Fix cgroup IO weight (reset to default 100)
+    io_w = changes.get("cgroup_io_weight")
+    if io_w:
+        ssh.execute(
+            f"systemctl set-property nginx.service IOWeight={io_w} 2>/dev/null || true",
+            timeout=10,
+        )
+        # Also remove any persistent override
+        ssh.execute(
+            "rm -f /etc/systemd/system/nginx.service.d/50-IOWeight.conf 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"cgroup IOWeight={io_w}")
+
+    # Fix cgroup CPU weight (reset to default 100)
+    cpu_w = changes.get("cgroup_cpu_weight")
+    if cpu_w:
+        ssh.execute(
+            f"systemctl set-property nginx.service CPUWeight={cpu_w} 2>/dev/null || true",
+            timeout=10,
+        )
+        ssh.execute(
+            "rm -f /etc/systemd/system/nginx.service.d/50-CPUWeight.conf 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"cgroup CPUWeight={cpu_w}")
+
+    # Remove NUMA interleave policy (numactl drop-in)
+    if changes.get("numa_policy") == "remove":
+        ssh.execute(
+            "rm -f /etc/systemd/system/nginx.service.d/numa.conf 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append("removed NUMA interleave drop-in")
+
+    # Kill background hogs (stress-ng, dd, fio, etc.)
+    if changes.get("kill_background_hogs") == "true":
+        ssh.execute(
+            "pkill -9 -f 'dd if=/dev' 2>/dev/null; "
+            "pkill -9 -f 'dd of=' 2>/dev/null; "
+            "pkill -9 -f 'fio' 2>/dev/null; "
+            "pkill -9 -f 'stress-ng' 2>/dev/null; "
+            "pkill -9 -f 'stress ' 2>/dev/null; "
+            "pkill -9 -f 'sysbench' 2>/dev/null; "
+            "pkill -9 -f 'iperf' 2>/dev/null; "
+            "pkill -9 -f 'io_pressure' 2>/dev/null; "
+            "rm -f /tmp/io_pressure* 2>/dev/null; "
+            "umount /dev/shm 2>/dev/null;"
+            " mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true; "
+            "echo done",
+            timeout=10,
+        )
+        actions.append("killed background hog processes")
+
+    # Reload systemd and restart nginx to pick up new limits
+    needs_restart = any(
+        changes.get(k)
+        for k in (
+            "systemd_nofile",
+            "cgroup_cpu",
+            "cgroup_memory",
+            "cgroup_io_weight",
+            "cgroup_cpu_weight",
+            "numa_policy",
+        )
+    )
+    if needs_restart:
+        ssh.execute(
+            "systemctl daemon-reload && systemctl restart nginx 2>&1 || true",
+            timeout=15,
+        )
+        actions.append("restarted nginx with new limits")
+
+    return {"applied": changes, "failed": {}, "actions": actions}
+
+
+def apply_network(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[str, Any]:
+    """Category 4: Fix firewall, conntrack, tc rules."""
+    if not changes:
+        return {"applied": {}, "failed": {}, "actions": []}
+
+    actions: list[str] = []
+
+    # Flush iptables DROP/connlimit rules
+    if changes.get("iptables_drop_rules") == "flush":
+        # Remove only DROP and connlimit rules, keep ACCEPT
+        ssh.execute(
+            "iptables -L INPUT --line-numbers -n 2>/dev/null"
+            " | grep -iE 'DROP|REJECT|connlimit' | awk '{print $1}'"
+            " | sort -rn | while read n; do iptables -D INPUT $n 2>/dev/null; done; "
+            "iptables -L FORWARD --line-numbers -n 2>/dev/null"
+            " | grep -iE 'DROP|REJECT|connlimit' | awk '{print $1}'"
+            " | sort -rn | while read n; do iptables -D FORWARD $n 2>/dev/null; done; "
+            "iptables -L OUTPUT --line-numbers -n 2>/dev/null"
+            " | grep -iE 'DROP|REJECT|connlimit' | awk '{print $1}'"
+            " | sort -rn | while read n; do iptables -D OUTPUT $n 2>/dev/null; done; "
+            "echo done",
+            timeout=15,
+        )
+        actions.append("flushed iptables DROP/connlimit rules")
+
+    # Fix conntrack max
+    conntrack = changes.get("conntrack_max")
+    if conntrack:
+        ssh.execute(
+            f"sysctl -w net.netfilter.nf_conntrack_max={conntrack} 2>/dev/null || "
+            f"sysctl -w net.nf_conntrack_max={conntrack} 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"conntrack_max={conntrack}")
+
+    # Remove tc rules
+    if changes.get("tc_rules") == "remove":
+        ssh.execute(
+            "for dev in $(ip -o link show | awk -F': ' '{print $2}'); do "
+            "tc qdisc del dev $dev root 2>/dev/null; done; echo done",
+            timeout=10,
+        )
+        actions.append("removed tc qdisc rules")
+
+    return {"applied": changes, "failed": {}, "actions": actions}
+
+
+def apply_storage(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[str, Any]:
+    """Category 5: Fix I/O scheduler, readahead, kill I/O hogs."""
+    if not changes:
+        return {"applied": {}, "failed": {}, "actions": []}
+
+    actions: list[str] = []
+
+    # Set I/O scheduler
+    scheduler = changes.get("io_scheduler")
+    if scheduler:
+        ssh.execute(
+            f"echo {scheduler} > /sys/block/$(lsblk -ndo NAME | head -1)"
+            f"/queue/scheduler 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"I/O scheduler={scheduler}")
+
+    # Set readahead
+    readahead = changes.get("readahead")
+    if readahead:
+        ssh.execute(
+            f"blockdev --setra {readahead} /dev/$(lsblk -ndo NAME | head -1) 2>/dev/null || true",
+            timeout=5,
+        )
+        actions.append(f"readahead={readahead}")
+
+    # Kill I/O hog processes
+    if changes.get("kill_io_hogs") == "true":
+        ssh.execute(
+            "pkill -f 'dd if=/dev' 2>/dev/null; pkill -f 'fio ' 2>/dev/null; echo done",
+            timeout=10,
+        )
+        actions.append("killed I/O hog processes")
+
+    return {"applied": changes, "failed": {}, "actions": actions}
+
+
+def _parse_script_result(output: str, changes: dict[str, str]) -> dict[str, Any]:
+    """Parse bash script output with PARAM=OK/FAIL tokens."""
+    applied: dict[str, str] = {}
+    failed: dict[str, str] = {}
+
+    for token in output.split():
+        if "=" not in token:
+            continue
+        key, status = token.rsplit("=", 1)
+        if status == "OK":
+            applied[key] = changes.get(key, "")
+        elif status == "FAIL":
+            failed[key] = "command failed"
+
+    # Params not in output assumed applied
+    for param, value in changes.items():
+        if param not in applied and param not in failed:
+            applied[param] = value
+
+    return {"applied": applied, "failed": failed}

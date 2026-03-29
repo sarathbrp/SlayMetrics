@@ -86,20 +86,23 @@ else
 fi
 
 # ── 3. Python venv + deps ────────────────────────────────────────────────────
-if [ -f "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -c "import pydantic_ai" &>/dev/null 2>&1; then
-    ok "Python venv      $VENV_DIR (pydantic-ai installed)"
+if [ -f "$VENV_DIR/bin/python3" ] && "$VENV_DIR/bin/python3" -c "import langgraph, langchain" &>/dev/null 2>&1; then
+    ok "Python venv      $VENV_DIR (LangChain/LangGraph deps installed)"
     PRESENT+=("pydeps")
 else
     miss "Python venv      not found or deps missing"
     MISSING+=("pydeps")
 fi
 
-# ── 4. wrk2 ─────────────────────────────────────────────────────────────────
-if command -v wrk2 &>/dev/null; then
+# ── 4. wrk / wrk2 ──────────────────────────────────────────────────────────
+if command -v wrk &>/dev/null; then
+    ok "wrk              $(wrk --version 2>&1 | head -1)"
+    PRESENT+=("wrk2")
+elif command -v wrk2 &>/dev/null; then
     ok "wrk2             $(wrk2 --version 2>&1 | head -1)"
     PRESENT+=("wrk2")
 else
-    miss "wrk2             not found (will build from source)"
+    miss "wrk/wrk2         not found (will build from source)"
     MISSING+=("wrk2")
 fi
 
@@ -172,7 +175,8 @@ if [ ${#MISSING[@]} -eq 0 ]; then
     echo ""
     echo "  To run the agent:"
     echo "    cd $INSTALL_DIR"
-    echo "    cp .env.example .env  # set ANTHROPIC_API_KEY and DUT_HOST"
+    echo "    cp .env.example .env  # set DUT_HOST (and ANTHROPIC_API_KEY only if using Claude)"
+    echo "    ollama pull granite4:7b-a1b-h"
     echo "    $VENV_DIR/bin/python3 main.py -v"
     echo ""
     exit 0
@@ -205,23 +209,24 @@ if [ ${#SYS_PKGS[@]} -gt 0 ]; then
     $PKG install -y "${SYS_PKGS[@]}" 2>&1 | tail -5
 fi
 
-# ── wrk2 ─────────────────────────────────────────────────────────────────────
+# ── wrk/wrk2 ─────────────────────────────────────────────────────────────────
 if contains "wrk2" "${MISSING[@]}"; then
-    log "Building wrk2 from source..."
+    # Install zlib-devel if needed for build
+    $PKG install -y zlib-devel 2>&1 | tail -2
+    log "Building wrk from source..."
     cd /tmp
-    [ -d wrk2 ] && rm -rf wrk2
-    git clone https://github.com/giltene/wrk2.git 2>/dev/null
-    cd wrk2
-    for hdr in src/hdr_histogram.c deps/hdr_histogram/hdr_histogram.c; do
-        if [ -f "$hdr" ]; then
-            grep -q "stdint.h" "$hdr" || sed -i '1i #include <stdint.h>' "$hdr"
-        fi
-    done
+    [ -d wrk ] && rm -rf wrk
+    git clone https://github.com/wg/wrk.git 2>/dev/null
+    cd wrk
     make -j$(nproc) 2>&1 | tail -3
-    cp wrk /usr/local/bin/wrk2
+    cp wrk /usr/local/bin/wrk
     cd /
-    rm -rf /tmp/wrk2
-    log "wrk2 installed: $(wrk2 --version 2>&1 | head -1)"
+    rm -rf /tmp/wrk
+    if command -v wrk &>/dev/null; then
+        log "wrk installed: $(wrk --version 2>&1 | head -1)"
+    else
+        warn "wrk build failed — benchmark.sh may not work"
+    fi
 fi
 
 # ── Python venv + deps ────────────────────────────────────────────────────────
@@ -301,6 +306,7 @@ echo ""
 echo "  Next steps:"
 echo "    1. Copy SSH key to DUT:  ssh-copy-id root@<DUT_IP>"
 echo "    2. Configure:            cp .env.example .env"
-echo "       Set ANTHROPIC_API_KEY and DUT_HOST in .env"
-echo "    3. Run:                  $VENV_DIR/bin/python3 main.py -v"
+echo "       Set DUT_HOST in .env"
+echo "    3. Start Granite:        ollama pull granite4:7b-a1b-h"
+echo "    4. Run:                  $VENV_DIR/bin/python3 main.py -v"
 echo ""

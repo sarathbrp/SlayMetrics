@@ -5,7 +5,6 @@ import asyncio
 import hashlib
 import json
 import os
-import sys
 import uuid
 from pathlib import Path
 
@@ -16,6 +15,8 @@ from agents import AgentDeps, TokenCounter
 from core import log as logger
 from memory.embeddings import from_config as embedder_from_config
 from memory.tidb_store import from_config as tidb_from_config
+from models import create_model
+from telemetry import LangfuseClient
 from tools.ssh import from_config as ssh_from_config
 
 
@@ -54,37 +55,7 @@ def load_config(path: str) -> dict:
 
 
 def get_model(cfg: dict):
-    from pydantic_ai.models.anthropic import AnthropicModel
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
-
-    profile_name = cfg["llm"]["active_profile"]
-    profile = cfg["llm"]["profiles"][profile_name]
-    logger.status(
-        "main", f"LLM profile: {profile_name} ({profile['backend']} / {profile['model']})"
-    )
-
-    match profile["backend"]:
-        case "claude":
-            api_key = os.environ.get(profile.get("api_key_env", "ANTHROPIC_API_KEY"))
-            if not api_key:
-                logger.log(
-                    "main", f"{profile.get('api_key_env', 'ANTHROPIC_API_KEY')} not set", "error"
-                )
-                sys.exit(1)
-            return AnthropicModel(profile["model"])
-        case "vllm" | "ollama":
-            provider = OpenAIProvider(
-                base_url=profile["base_url"],
-                api_key="ollama",  # pragma: allowlist secret
-            )
-            return OpenAIChatModel(
-                profile["model"],
-                provider=provider,
-            )
-        case _:
-            logger.log("main", f"Unknown backend: {profile['backend']}", "error")
-            sys.exit(1)
+    return create_model(cfg)
 
 
 def load_knowledge(cfg: dict, embedder, memory) -> None:
@@ -127,7 +98,7 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
 
     # Clear old knowledge
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM facts WHERE type = 'knowledge'")
+        cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
 
     total = 0
     for filepath in md_files:
@@ -140,12 +111,14 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO facts (id, session_id, type, parameter, reasoning, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO knowledge
+                        (id, discovered_by, scope, type, parameter, reasoning, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                     (
                         fid,
                         "__knowledge__",
+                        "universal",
                         "knowledge",
                         chunk["title"],
                         chunk["body"][:10000],
@@ -190,11 +163,22 @@ def _chunk_markdown(text: str, source_file: str) -> list[dict]:
     return chunks
 
 
-async def main(config_path: str, session_id: str | None, verbose: bool = False) -> None:
+async def main(
+    config_path: str,
+    session_id: str | None,
+    verbose: bool = False,
+    max_phase: int = 4,
+    planner_mode: str = "debate",
+    baseline_mode: str = "fresh",
+) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
     load_dotenv()
 
     cfg = load_config(config_path)
+    cfg.setdefault("agent", {})
+    cfg["agent"]["max_phase"] = max_phase
+    cfg["agent"]["planner_mode"] = planner_mode
+    cfg["agent"]["baseline_mode"] = baseline_mode
 
     # Session ID — generate or reuse
     if session_id is None:
@@ -243,20 +227,56 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
         )
 
     token_counter = TokenCounter()
+    tracing_cfg = cfg.get("telemetry", {}).get("langfuse", {}) or {}
+    langfuse_enabled = bool(tracing_cfg.get("enabled", False))
+    langfuse = LangfuseClient.from_env(
+        {
+            "session_id": session_id,
+            "service": cfg["service"]["name"],
+            "planner_mode": planner_mode,
+            "max_phase": max_phase,
+            "baseline_mode": baseline_mode,
+            "llm_profile": profile_name,
+            "dut_host": host,
+            "bench_host": bench_host,
+        },
+        enabled=langfuse_enabled,
+    )
+    if langfuse.enabled:
+        if langfuse.auth_check():
+            logger.status("langfuse", "Tracing enabled (auth OK)")
+        else:
+            logger.log("langfuse", "Tracing disabled: auth check failed", "warn")
+            langfuse = LangfuseClient.from_env(enabled=False)
     deps = AgentDeps(
         adapter=adapter,
         memory=memory,
         ssh=ssh,
+        bench=bench,
         session_id=session_id,
         config=cfg,
         token_counter=token_counter,
+        langfuse=langfuse,
     )
 
     try:
         from core.orchestrator import run
 
-        report_path = await run(model, deps)
+        with langfuse.trace(
+            "slaymetrics_run",
+            input={"config_path": config_path},
+            metadata={
+                "session_id": session_id,
+                "planner_mode": planner_mode,
+                "max_phase": max_phase,
+                "baseline_mode": baseline_mode,
+                "llm_profile": profile_name,
+            },
+        ):
+            report_path = await run(model, deps)
         logger.status("main", f"Report: {report_path}")
+        if langfuse.last_trace_url:
+            logger.status("langfuse", f"Trace: {langfuse.last_trace_url}")
     except KeyboardInterrupt:
         logger.log("main", "Interrupted by user (Ctrl+C)", "warn")
         logger.log(
@@ -270,6 +290,8 @@ async def main(config_path: str, session_id: str | None, verbose: bool = False) 
         raise
     finally:
         # Silent cleanup
+        langfuse.flush()
+        langfuse.shutdown()
         logger.close()
         ssh.disconnect()
         if bench is not ssh:
@@ -289,8 +311,39 @@ if __name__ == "__main__":
         action="store_true",
         help="Show all agent logs (not just actions/results)",
     )
+    parser.add_argument(
+        "--max-phase",
+        type=int,
+        choices=[3, 4],
+        default=4,
+        help="Maximum phase to run: 3 stops after RCA/recommendations, 4 runs remediation",
+    )
+    parser.add_argument(
+        "--planner-mode",
+        choices=["single", "debate"],
+        default="debate",
+        help="Planning path: single planner or nginx-vs-rhel debate with synthesis",
+    )
+    parser.add_argument(
+        "--baseline-mode",
+        choices=["fresh", "reuse"],
+        default="fresh",
+        help=(
+            "Baseline acquisition: run a fresh baseline or reuse "
+            "the latest stored one for this host"
+        ),
+    )
     args = parser.parse_args()
     try:
-        asyncio.run(main(args.config, args.session, args.verbose))
+        asyncio.run(
+            main(
+                args.config,
+                args.session,
+                args.verbose,
+                args.max_phase,
+                args.planner_mode,
+                args.baseline_mode,
+            )
+        )
     except KeyboardInterrupt:
         print("\nAborted.")

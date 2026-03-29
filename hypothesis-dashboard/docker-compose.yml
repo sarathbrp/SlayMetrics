@@ -1,0 +1,11 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../hypothesis:/data/hypothesis:ro
+      - ../report:/data/report:ro
+    environment:
+      - DATA_DIR=/data
+      - STATIC_DIR=/app/static

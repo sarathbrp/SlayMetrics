@@ -96,13 +96,21 @@ class SSHClient:
         if not self._client:
             self.connect()
         assert self._client is not None
-        _, stdout, stderr = self._client.exec_command(command, timeout=timeout or self.timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        return SSHResult(
-            stdout=stdout.read().decode("utf-8", errors="replace"),
-            stderr=stderr.read().decode("utf-8", errors="replace"),
-            exit_code=exit_code,
-        )
+        try:
+            _, stdout, stderr = self._client.exec_command(command, timeout=timeout or self.timeout)
+        except Exception:
+            # Reconnect on channel/transport errors and retry once
+            self.disconnect()
+            self.connect()
+            assert self._client is not None
+            _, stdout, stderr = self._client.exec_command(command, timeout=timeout or self.timeout)
+        channel = stdout.channel
+        exit_code = channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        if hasattr(channel, "close"):
+            channel.close()
+        return SSHResult(stdout=out, stderr=err, exit_code=exit_code)
 
     def execute_as(self, command: str, user: str = "root") -> SSHResult:
         return self.execute(f"sudo -u {user} {command}")

@@ -1,137 +1,416 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import Any
-
-from pydantic import BaseModel
-from pydantic_ai import Agent, RunContext
+import unicodedata
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Annotated, Any, TypedDict
 
 from adapters.base import BenchmarkResult
-from agents import AgentDeps, TokenCounter
+from agents import AgentDeps
 from core.log import llm_call, log, tokens, tool_call, tool_result
+from telemetry import summarize_messages
+
+try:
+    from langgraph.graph.message import add_messages
+except ModuleNotFoundError:
+
+    def add_messages(left: list[Any], right: list[Any]) -> list[Any]:
+        return [*left, *right]
 
 
-class DiagnosisOutput(BaseModel):
-    """Minimal output — orchestrator builds the full report from tool returns."""
+class GraphState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+@dataclass
+class DiagnosisOutput:
+    """Canonical internal diagnosis result built in Python after the graph run."""
 
     nginx_applied: bool
     system_applied: bool
-    after_rps: float
-    improvement_pct: float
+    after_rps: float = 0.0
+    improvement_pct: float = 0.0
     notes: str = ""
+    rca_records: list[dict[str, Any]] | None = None
+    recommendations: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        self.after_rps = _coerce_float(self.after_rps)
+        self.improvement_pct = _coerce_float(self.improvement_pct)
+        self.notes = _coerce_notes(self.notes)
+        self.rca_records = list(self.rca_records or [])
+        self.recommendations = list(self.recommendations or [])
 
 
 SYSTEM_PROMPT = """\
-You are SlayMetricsAgent. Steps:
-1. Inspect nginx and system tuning
-2. Apply missing nginx fixes via apply_nginx_tuning
-3. Apply missing system fixes via apply_system_tuning
-4. Benchmark AFTER (baselines are provided — do NOT benchmark before)
-5. Call save_findings with both results in one call
-6. Return DiagnosisOutput
+You are SlayMetricsAgent.
 
-Proven nginx fixes: worker_connections=8192, open_file_cache=max=10000 inactive=60s, open_file_cache_valid=30s, open_file_cache_min_uses=2, worker_rlimit_nofile=65536, access_log=off, tcp_nodelay=on, keepalive_requests=1000, gzip=on, gzip_comp_level=1, listen_backlog=65535
+Diagnostic sequence:
+1. Inspect NGINX configuration first.
+2. Inspect RHEL/kernel/system tuning second.
+3. Inspect IRQ distribution and CPU affinity last.
+4. Save structured RCA via save_rca after all three stages are reviewed.
+5. Save transparent human-readable recommendations via save_recommendations.
+6. Return one short plain-text summary sentence.
 
-Proven system fixes: net.core.somaxconn=65535, net.ipv4.tcp_max_syn_backlog=65535, net.core.netdev_max_backlog=65535, transparent_hugepage=never, selinux=permissive, net.ipv4.tcp_tw_reuse=1, net.core.rmem_max=16777216, net.core.wmem_max=16777216
+Do not benchmark or apply changes during planning. Python will do one combined apply
+and one benchmark after planning is complete.
 
-Rules: skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
+For apply_nginx_tuning and apply_system_tuning:
+- Pass a structured object under the changes field
+- Example: {"changes":{"access_log":"off","listen_backlog":"65535"}}
+- If needed, you may also pass directive names directly as tool arguments instead of nesting them
+
+For save_findings:
+- Pass a structured list under the findings field
+- Example: {"findings":[{"parameter":"nginx.access_log","before_value":"on","after_value":"off"}]}
+
+For save_rca:
+- Pass a structured list under the records field
+- Each RCA record must include symptom, root_cause, confidence, recommendation
+- evidence may be a list of short strings
+- Example: {"records":[{"symptom":"High p99","root_cause":"backlog too low","confidence":0.9}]}
+
+For save_recommendations:
+- Pass a structured list under the recommendations field
+- Each recommendation must include title, recommendation, rationale,
+  expected_benefit, risk_level, validation, scope, changes
+- scope must be nginx or system
+- changes must be a structured object of parameter -> target value
+- risk_level should be low, medium, or high
+- Example: {"recommendations":[{"title":"Raise limit","scope":"nginx","changes":{"aio":"threads"}}]}
+
+Use the inspect tool outputs as the source of truth for current values and candidate target values.
+Do not invent target values outside the inspect outputs.
+
+Do NOT apply gzip — test files are random binary data, compression wastes CPU.
+
+Rules:
+- Stage 1 must focus on NGINX configuration only.
+- Stage 2 must focus on RHEL/kernel/system tuning only.
+- Stage 3 must focus on IRQ distribution / CPU affinity evidence only.
+- Only recommend IRQ-related action if the IRQ stage evidence supports it.
+- Skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
+- Do not call apply_nginx_tuning, apply_system_tuning, run_benchmark,
+  or save_findings yourself; Python will execute saved recommendations
+  after you finish planning.
 """
 
 
-def build(model) -> Agent:
-    agent: Agent[AgentDeps, DiagnosisOutput] = Agent(
-        model,
-        deps_type=AgentDeps,
-        output_type=DiagnosisOutput,
-        system_prompt=SYSTEM_PROMPT,
-    )
+class DiagnosisWorkflow:
+    def __init__(self, model, state: dict[str, Any], test_tools: dict[str, Any], tool_factory):
+        self.model = model
+        self._slaymetrics_state = state
+        self._tool_factory = tool_factory
+        self._function_toolset = SimpleNamespace(
+            tools={name: SimpleNamespace(function=fn) for name, fn in test_tools.items()}
+        )
+
+    async def run(self, context_prompt: str, deps: AgentDeps):
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langgraph.graph import END, StateGraph
+        from langgraph.prebuilt import ToolNode
+
+        tools = self._tool_factory(deps)
+        llm = self.model.bind_tools(tools)
+
+        def call_model(state: GraphState):
+            messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+            _lf = getattr(deps, "langfuse", None)
+            with (
+                _lf.generation(
+                    "single_planner_turn",
+                    model=_resolve_model_name(self.model),
+                    input={"messages": summarize_messages(messages)},
+                    metadata={
+                        "planner_mode": "single",
+                        "session_id": deps.session_id,
+                    },
+                    model_parameters={"temperature": 0},
+                )
+                if _lf
+                else _null_generation() as _
+            ):
+                response = llm.invoke(messages)
+                usage = getattr(response, "usage_metadata", None) or {}
+                if _lf:
+                    _lf.update_generation(
+                        output={
+                            "content": _extract_final_text([response])[:2000],
+                            "tool_calls": getattr(response, "tool_calls", None),
+                        },
+                        usage_details={
+                            "prompt_tokens": int(
+                                usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+                            ),
+                            "completion_tokens": int(
+                                usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                            ),
+                        },
+                    )
+            return {"messages": [response]}
+
+        def route(state: GraphState):
+            last = state["messages"][-1]
+            return "tools" if getattr(last, "tool_calls", None) else "end"
+
+        graph = StateGraph(GraphState)
+        graph.add_node("agent", call_model)
+        graph.add_node("tools", ToolNode(tools))
+        graph.set_entry_point("agent")
+        graph.add_conditional_edges("agent", route, {"tools": "tools", "end": END})
+        graph.add_edge("tools", "agent")
+
+        app = graph.compile()
+        result = await app.ainvoke(
+            {"messages": [HumanMessage(content=context_prompt)]},
+            config={"recursion_limit": 25},
+        )
+        messages = result["messages"]
+        output = _extract_final_text(messages)
+        usage = _aggregate_usage(messages)
+        return SimpleNamespace(
+            output=output,
+            usage=lambda: SimpleNamespace(
+                input_tokens=usage["input_tokens"], output_tokens=usage["output_tokens"]
+            ),
+            all_messages=lambda: messages,
+        )
+
+
+def build(model, config=None) -> DiagnosisWorkflow:
+    state: dict[str, Any] = {
+        "nginx_applied": False,
+        "system_applied": False,
+        "after_rps": 0.0,
+        "after_p99_ms": 0.0,
+        "after_error_rate": 0.0,
+        "findings": [],
+        "rca_records": [],
+        "recommendations": [],
+        "guardrail_failure": "",
+    }
+    memory_query_count = 0
+    max_memory_queries = 3
 
     def _normalize_changes(
-        raw_changes: dict[str, str] | str, tool_name: str
+        raw_changes: dict[str, str] | str | None, tool_name: str
     ) -> tuple[dict[str, str] | None, str | None]:
+        if raw_changes is None:
+            return {}, None
         changes_obj = raw_changes
         if isinstance(changes_obj, str):
             try:
                 changes_obj = json.loads(changes_obj)
             except json.JSONDecodeError as e:
-                return None, f"{tool_name}: invalid JSON for 'changes' ({e.msg})"
+                return None, f"{tool_name}: invalid JSON payload ({e.msg})"
 
         if not isinstance(changes_obj, dict):
-            return None, f"{tool_name}: 'changes' must be a dictionary"
+            return None, f"{tool_name}: payload must be a dictionary"
 
         normalized: dict[str, str] = {}
         for key, value in changes_obj.items():
-            if not isinstance(key, str):
-                key = str(key)
+            key_str = str(key).lstrip(".")
             if isinstance(value, (dict, list)):
-                normalized[key] = json.dumps(value, separators=(",", ":"))
+                normalized[key_str] = json.dumps(value, separators=(",", ":"))
             else:
-                normalized[key] = str(value)
+                normalized[key_str] = str(value)
         return normalized, None
 
-    # Proven optimal values — inspect compares against these
-    NGINX_TARGETS = {
-        "worker_connections": "8192",
-        "open_file_cache": "max=10000 inactive=60s",
-        "open_file_cache_valid": "30s",
-        "open_file_cache_min_uses": "2",
-        "worker_rlimit_nofile": "65536",
-        "access_log": "off",
-        "tcp_nodelay": "on",
-        "keepalive_requests": "1000",
-        "gzip": "on",
-        "gzip_comp_level": "1",
-        "listen_backlog": "65535",
+    def _debug_enabled(deps: AgentDeps) -> bool:
+        cfg = getattr(deps, "config", {}) or {}
+        return bool((cfg.get("agent") or {}).get("debug_planner_payloads", False))
+
+    def _debug_planner(deps: AgentDeps, label: str, payload: Any) -> None:
+        if not _debug_enabled(deps):
+            return
+        text = _sanitize_debug_text(
+            json.dumps(payload, ensure_ascii=False)
+            if isinstance(payload, (dict, list))
+            else str(payload)
+        )
+        tool_result("debug", f"{label}: {text}")
+        _persist_hypothesis_markdown(
+            deps,
+            filename=f"debug_{label}.md",
+            title=f"Debug {label}",
+            sections=[
+                ("Summary", f"Planner debug artifact for `{label}`."),
+                ("Payload", _markdown_json(payload)),
+            ],
+        )
+
+    def _langfuse_event(
+        deps: AgentDeps,
+        name: str,
+        *,
+        input: Any = None,
+        output: Any = None,
+        metadata: dict[str, Any] | None = None,
+        level: str | None = None,
+    ) -> None:
+        client = getattr(deps, "langfuse", None)
+        if client:
+            with client.tool_span(name, input=input, metadata=metadata):
+                client.update_span(
+                    output=output if level != "ERROR" else {"error": output},
+                    metadata={"level": level} if level else None,
+                )
+
+    def _coerce_tool_changes(
+        raw_changes: dict[str, str] | str | None,
+        extra_changes: dict[str, Any],
+        tool_name: str,
+    ) -> tuple[dict[str, str] | None, str | None]:
+        normalized_changes, parse_error = _normalize_changes(raw_changes, tool_name)
+        if parse_error:
+            return None, parse_error
+
+        merged = dict(normalized_changes or {})
+        for key, value in extra_changes.items():
+            if key == "changes":
+                continue
+            key_str = str(key).lstrip(".")
+            if isinstance(value, (dict, list)):
+                merged[key_str] = json.dumps(value, separators=(",", ":"))
+            else:
+                merged[key_str] = str(value)
+        return merged, None
+
+    _tuning_cfg = (config or {}).get("tuning") or {}
+    # Build allowlists from new config categories (webserver_targets, kernel_targets)
+    # with backward compat for old nginx_targets/system_targets
+    nginx_targets: dict[str, str] = {
+        str(k): str(v)
+        for k, v in (
+            _tuning_cfg.get("webserver_targets") or _tuning_cfg.get("nginx_targets") or {}
+        ).items()
+    }
+    system_targets: dict[str, str] = {
+        str(k): str(v)
+        for k, v in (
+            _tuning_cfg.get("kernel_targets") or _tuning_cfg.get("system_targets") or {}
+        ).items()
     }
 
-    SYSTEM_TARGETS = {
-        "net.core.somaxconn": "65535",
-        "net.ipv4.tcp_max_syn_backlog": "65535",
-        "net.core.netdev_max_backlog": "65535",
-        "transparent_hugepage": "never",
-        "selinux": "permissive",
-        "net.ipv4.tcp_tw_reuse": "1",
-        "net.core.rmem_max": "16777216",
-        "net.core.wmem_max": "16777216",
-    }
+    def inspect_irq_impl(deps: AgentDeps) -> dict:
+        tool_call("inspect", "irq distribution — checking for IRQ lock and CPU spread")
+        ssh = deps.ssh
+        interrupts = ssh.execute(
+            "cat /proc/interrupts | grep -E 'eth|ens|eno|virtio' | head -n 20"
+        ).stdout
+        workers = ssh.execute("ps -eo pid,psr,comm | grep nginx").stdout
+        telemetry_rows = deps.memory.get_contexts(
+            deps.session_id, type="telemetry", source_prefix="baseline:", limit=6
+        )
 
-    @agent.tool
-    async def inspect_nginx_config(ctx: RunContext[AgentDeps]) -> dict:
-        """Inspect nginx config and return only what needs fixing vs proven targets."""
-        tool_call("inspect", "nginx config — comparing against proven fixes")
-        ssh = ctx.deps.ssh
+        worker_cores: list[int] = []
+        for line in workers.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[2] == "nginx":
+                try:
+                    worker_cores.append(int(parts[1]))
+                except ValueError:
+                    continue
 
-        raw = ssh.execute("nginx -T 2>/dev/null").stdout
+        latest_series = {}
+        for row in telemetry_rows:
+            if row.get("source") != "baseline:series":
+                continue
+            try:
+                latest_series = json.loads(row.get("content", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                latest_series = {}
+            break
 
-        # Parse current values
-        current = {}
-        for d in NGINX_TARGETS:
-            if d == "listen_backlog":
-                m = re.search(r"listen\s+.*backlog=(\d+)", raw)
-                current[d] = m.group(1) if m else "not set"
-            else:
-                m = re.search(rf"^\s*{d}\s+(.+?);", raw, re.MULTILINE)
-                current[d] = m.group(1).strip() if m else "not set"
-
-        # Compare against targets
-        needs_fixing = {}
-        already_ok = []
-        for param, target in NGINX_TARGETS.items():
-            cur = current.get(param, "not set")
-            if cur == "not set" or cur != target:
-                needs_fixing[param] = {"current": cur, "target": target}
-            else:
-                already_ok.append(param)
+        summary = latest_series.get("summary", {}) if isinstance(latest_series, dict) else {}
+        latest_sample = (
+            latest_series.get("last_sample", {}) if isinstance(latest_series, dict) else {}
+        )
+        current = {
+            "irq_lines": interrupts.strip()[:2000] or "no ethernet IRQs found",
+            "nginx_worker_cores": sorted(set(worker_cores)),
+            "worker_core_spread": len(set(worker_cores)),
+            "telemetry_run_queue_max": summary.get("run_queue_max", 0),
+            "telemetry_rx_drop_delta": summary.get("rx_drop_delta", 0),
+            "telemetry_rx_drop_rate_per_sec": summary.get("rx_drop_rate_per_sec", 0),
+            "telemetry_tcp_established": latest_sample.get("tcp_established", 0),
+        }
+        needs_investigation = []
+        if not interrupts.strip():
+            needs_investigation.append("no_nic_irq_visibility")
+        if current["worker_core_spread"] <= 2 and current["telemetry_rx_drop_delta"]:
+            needs_investigation.append("possible_irq_or_worker_core_lock")
+        if current["telemetry_run_queue_max"] and current["telemetry_run_queue_max"] >= 4:
+            needs_investigation.append("run_queue_pressure_during_load")
 
         result = {
-            "needs_fixing": needs_fixing,
-            "already_ok": already_ok,
+            "needs_investigation": needs_investigation,
+            "current": current,
         }
+        _langfuse_event(
+            deps,
+            "tool.inspect_irq_distribution",
+            input={"telemetry_rows": len(telemetry_rows)},
+            output=result,
+        )
+        deps.token_counter.tool_calls += 1
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "inspect_irq",
+            str(result),
+            (
+                f"irq: {len(needs_investigation)} signals, "
+                f"worker_spread={current['worker_core_spread']}"
+            ),
+        )
+        tool_result(
+            "inspect",
+            (
+                f"irq: {len(needs_investigation)} signals, "
+                f"worker_spread={current['worker_core_spread']}"
+            ),
+        )
+        state["irq_inspection"] = result
+        return result
 
-        ctx.deps.token_counter.tool_calls += 1
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+    def inspect_nginx_impl(deps: AgentDeps) -> dict:
+        tool_call("inspect", "nginx config — stage 1 analysis")
+        raw = deps.ssh.execute("nginx -T 2>/dev/null").stdout
+        current: dict[str, str] = {}
+        for directive in nginx_targets:
+            if directive == "listen_backlog":
+                match = re.search(r"listen\s+.*backlog=(\d+)", raw)
+                current[directive] = match.group(1) if match else "not set"
+            else:
+                match = re.search(rf"^\s*{directive}\s+(.+?);", raw, re.MULTILINE)
+                current[directive] = match.group(1).strip() if match else "not set"
+
+        needs_fixing = {}
+        already_ok = []
+        for parameter, target in nginx_targets.items():
+            cur = current.get(parameter, "not set")
+            if cur == "not set" or cur != target:
+                needs_fixing[parameter] = {"current": cur, "target": target}
+            else:
+                already_ok.append(parameter)
+
+        result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
+        _langfuse_event(
+            deps,
+            "tool.inspect_nginx_config",
+            input={"directive_count": len(nginx_targets)},
+            output=result,
+        )
+        deps.token_counter.tool_calls += 1
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             "inspect_nginx",
             str(result),
@@ -140,56 +419,60 @@ def build(model) -> Agent:
         tool_result(
             "inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
+        state["nginx_inspection"] = result
         return result
 
-    @agent.tool
-    async def inspect_system_tuning(ctx: RunContext[AgentDeps]) -> dict:
-        """Inspect system tuning and return only what needs fixing vs proven targets."""
-        tool_call("inspect", "system tuning — comparing against proven fixes")
-        ssh = ctx.deps.ssh
-
+    def inspect_system_impl(deps: AgentDeps) -> dict:
+        tool_call("inspect", "rhel/kernel tuning — stage 2 analysis")
+        ssh = deps.ssh
         current = {}
-
-        # Sysctl params
         for key in [
             "net.core.somaxconn",
             "net.ipv4.tcp_max_syn_backlog",
             "net.core.netdev_max_backlog",
             "net.ipv4.tcp_tw_reuse",
+            "net.ipv4.tcp_max_tw_buckets",
+            "net.ipv4.ip_local_port_range",
             "net.core.rmem_max",
             "net.core.wmem_max",
         ]:
-            r = ssh.execute(f"sysctl -n {key} 2>/dev/null")
-            current[key] = r.stdout.strip()
+            sysctl_r = ssh.execute(f"sysctl -n {key} 2>/dev/null")
+            current[key] = sysctl_r.stdout.strip()
 
-        # THP
-        r = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
-        m = re.search(r"\[(\w+)\]", r.stdout)
-        current["transparent_hugepage"] = m.group(1) if m else "unknown"
-
-        # SELinux
+        thp = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
+        match = re.search(r"\[(\w+)\]", thp.stdout)
+        current["transparent_hugepage"] = match.group(1) if match else "unknown"
         current["selinux"] = (
             ssh.execute("getenforce 2>/dev/null || echo Disabled").stdout.strip().lower()
         )
+        governor = ssh.execute(
+            "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
+        )
+        current["cpu_governor"] = governor.stdout.strip() or "not available"
+        nofile_r = ssh.execute("ulimit -Sn 2>/dev/null || echo unknown")
+        current["nofile"] = nofile_r.stdout.strip()
+        irq_r = ssh.execute("systemctl is-active irqbalance 2>/dev/null || echo inactive")
+        current["irqbalance"] = irq_r.stdout.strip()
 
-        # Compare against targets
         needs_fixing = {}
         already_ok = []
-        for param, target in SYSTEM_TARGETS.items():
-            cur = current.get(param, "unknown")
+        for parameter, target in system_targets.items():
+            cur = current.get(parameter, "unknown")
             if cur != target:
-                needs_fixing[param] = {"current": cur, "target": target}
+                needs_fixing[parameter] = {"current": cur, "target": target}
             else:
-                already_ok.append(param)
+                already_ok.append(parameter)
 
-        result = {
-            "needs_fixing": needs_fixing,
-            "already_ok": already_ok,
-        }
-
-        ctx.deps.token_counter.tool_calls += 1
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
+        _langfuse_event(
+            deps,
+            "tool.inspect_system_tuning",
+            input={"parameter_count": len(system_targets)},
+            output=result,
+        )
+        deps.token_counter.tool_calls += 1
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             "inspect_system",
             str(result),
@@ -198,73 +481,88 @@ def build(model) -> Agent:
         tool_result(
             "inspect", f"system: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
         )
+        state["system_inspection"] = result
         return result
 
-    @agent.tool
-    async def apply_nginx_tuning(ctx: RunContext[AgentDeps], changes: dict[str, str] | str) -> dict:
-        """Apply multiple nginx config changes in one batch, then reload.
-        Example: {"sendfile": "on", "tcp_nopush": "on",
-        "open_file_cache": "max=10000 inactive=60s"}
-        """
-        normalized_changes, parse_error = _normalize_changes(changes, "apply_nginx")
+    def apply_nginx_impl(
+        deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any
+    ) -> dict:
+        normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_nginx")
         if parse_error:
             tool_call("apply_nginx", "invalid input payload")
             tool_result("apply_nginx", f"FAILED: {parse_error}")
-            ctx.deps.token_counter.tool_calls += 1
+            _langfuse_event(
+                deps,
+                "tool.apply_nginx_tuning",
+                input={"changes": changes, "kwargs": kwargs},
+                output={"error": parse_error},
+                level="ERROR",
+            )
+            deps.token_counter.tool_calls += 1
             return {"applied": [], "failed": [], "reload": "FAILED", "error": parse_error}
 
-        if normalized_changes is None:
-            return {"applied": [], "failed": [], "reload": "FAILED", "error": "invalid payload"}
-        changes_dict = normalized_changes
-        allowed = getattr(ctx.deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
+        changes_dict = normalized_changes or {}
+        allowed = getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", None)
         unsupported: list[str] = []
         if allowed is not None:
-            unsupported = [k for k in changes_dict if k not in allowed]
-            changes_dict = {k: v for k, v in changes_dict.items() if k in allowed}
+            unsupported = [key for key in changes_dict if key not in allowed]
+            changes_dict = {key: value for key, value in changes_dict.items() if key in allowed}
             if unsupported and not changes_dict:
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
                 tool_call("apply_nginx", "unsupported directives")
                 tool_result("apply_nginx", f"FAILED: {error}")
-                ctx.deps.token_counter.tool_calls += 1
+                _langfuse_event(
+                    deps,
+                    "tool.apply_nginx_tuning",
+                    input={"changes": changes_dict, "unsupported": unsupported},
+                    output={"error": error},
+                    level="ERROR",
+                )
+                deps.token_counter.tool_calls += 1
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
         tool_call("apply_nginx", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
 
-        config_path = ctx.deps.config["service"]["config_path"]
-        batch_backup = f"/tmp/slay_nginx_batch_{ctx.deps.session_id}.conf"
-        ctx.deps.ssh.execute(f"cp {config_path} {batch_backup}")
+        config_path = deps.config["service"]["config_path"]
+        batch_backup = f"/tmp/slay_nginx_batch_{deps.session_id}.conf"
+        deps.ssh.execute(f"cp {config_path} {batch_backup}")
 
         applied = []
         failed = list(unsupported)
         for param, value in changes_dict.items():
-            success = ctx.deps.adapter.apply_config(param, value)
+            success = deps.adapter.apply_config(param, value)
             if success:
                 applied.append(param)
             else:
                 failed.append(param)
-                ctx.deps.ssh.execute(f"cp {batch_backup} {config_path}")
+                deps.ssh.execute(f"cp {batch_backup} {config_path}")
                 result = {
                     "applied": applied,
                     "failed": failed,
                     "reload": "FAILED",
                     "error": f"failed to apply nginx directive: {param}",
                 }
-                ctx.deps.token_counter.tool_calls += 1
-                ctx.deps.memory.save_context(
-                    ctx.deps.session_id,
+                deps.token_counter.tool_calls += 1
+                deps.memory.save_context(
+                    deps.session_id,
                     "command_output",
                     f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
                     f"applied={applied} failed={failed}",
                     "nginx batch apply",
                 )
                 tool_result("apply_nginx", f"FAILED: {result['error']}")
+                _langfuse_event(
+                    deps,
+                    "tool.apply_nginx_tuning",
+                    input={"changes": changes_dict},
+                    output=result,
+                    level="ERROR",
+                )
                 return result
 
-        # Test config before reload
-        test = ctx.deps.ssh.execute("nginx -t 2>&1")
+        test = deps.ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
-            # Config is broken — revert to backup and report error
-            ctx.deps.ssh.execute(f"cp {batch_backup} {config_path}")
+            deps.ssh.execute(f"cp {batch_backup} {config_path}")
             error_msg = test.stdout.strip()[:200]
             result = {
                 "applied": applied,
@@ -272,239 +570,2466 @@ def build(model) -> Agent:
                 "reload": "FAILED",
                 "error": f"nginx -t failed: {error_msg}",
             }
-            ctx.deps.token_counter.tool_calls += 1
-            ctx.deps.memory.save_context(
-                ctx.deps.session_id,
+            deps.token_counter.tool_calls += 1
+            deps.memory.save_context(
+                deps.session_id,
                 "command_output",
                 f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
                 f"applied={applied} failed={failed}",
                 "nginx batch apply failed",
             )
             tool_result("apply_nginx", f"FAILED: {error_msg}")
+            _langfuse_event(
+                deps,
+                "tool.apply_nginx_tuning",
+                input={"changes": changes_dict},
+                output=result,
+                level="ERROR",
+            )
             return result
 
-        # Config valid — reload
-        reload_ok = ctx.deps.adapter.reload()
-
-        result = {
-            "applied": applied,
-            "failed": failed,
-            "reload": "OK" if reload_ok else "FAILED",
-        }
+        reload_ok = deps.adapter.reload()
+        result = {"applied": applied, "failed": failed, "reload": "OK" if reload_ok else "FAILED"}
         if unsupported:
             result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
+        state["nginx_applied"] = state["nginx_applied"] or bool(applied and reload_ok)
         summary = f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}"
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             f"apply_nginx:{','.join(changes_dict.keys())}"[:250],
             summary,
             "nginx batch apply",
         )
+        _langfuse_event(
+            deps,
+            "tool.apply_nginx_tuning",
+            input={"changes": changes_dict},
+            output=result,
+        )
         tool_result("apply_nginx", summary)
         return result
 
-    @agent.tool
-    async def apply_system_tuning(
-        ctx: RunContext[AgentDeps], changes: dict[str, str] | str
+    def apply_system_impl(
+        deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any
     ) -> dict:
-        """Apply multiple sysctl/kernel changes in one batch.
-        Example: {"net.core.somaxconn": "65535", "transparent_hugepage": "never",
-        "selinux": "permissive"}
-        """
-        normalized_changes, parse_error = _normalize_changes(changes, "apply_system")
+        normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_system")
         if parse_error:
             tool_call("apply_system", "invalid input payload")
             tool_result("apply_system", f"FAILED: {parse_error}")
-            ctx.deps.token_counter.tool_calls += 1
+            _langfuse_event(
+                deps,
+                "tool.apply_system_tuning",
+                input={"changes": changes, "kwargs": kwargs},
+                output={"error": parse_error},
+                level="ERROR",
+            )
+            deps.token_counter.tool_calls += 1
             return {"applied": {}, "failed": {"_input": parse_error}}
 
-        if normalized_changes is None:
-            return {"applied": {}, "failed": {"_input": "invalid payload"}}
-        changes_dict = normalized_changes
-        tool_call(
-            "apply_system",
-            f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}",
-        )
+        changes_dict = normalized_changes or {}
+        tool_call("apply_system", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
 
-        ssh = ctx.deps.ssh
+        ssh = deps.ssh
         applied = {}
         failed = {}
-
         for param, value in changes_dict.items():
             if param == "transparent_hugepage":
-                r = ssh.execute(f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1")
-                if r.ok:
+                result = ssh.execute(
+                    f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
+                )
+                if result.ok:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()
+                    failed[param] = result.stderr.strip()
             elif param == "selinux":
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
-                r = ssh.execute(f"setenforce {mode} 2>&1")
-                applied[param] = value
-            else:
-                r = ssh.execute(f"sysctl -w {param}={value} 2>&1")
-                if r.ok:
+                result = ssh.execute(f"setenforce {mode} 2>&1")
+                # Persist across reboots
+                if value.lower() in ("permissive", "0"):
+                    ssh.execute(
+                        "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
+                        " /etc/selinux/config 2>/dev/null || true"
+                    )
+                # Verify it actually changed
+                verify = ssh.execute("getenforce 2>/dev/null")
+                actual = verify.stdout.strip().lower()
+                expected = "permissive" if mode == "0" else "enforcing"
+                if actual == expected:
                     applied[param] = value
                 else:
-                    failed[param] = r.stderr.strip()
+                    failed[param] = f"setenforce ran but getenforce={actual}"
+            elif param == "cpu_governor":
+                result = ssh.execute(
+                    f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>&1"
+                )
+                if result.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = result.stderr.strip()
+            elif param == "net.ipv4.ip_local_port_range":
+                result = ssh.execute(f'sysctl -w net.ipv4.ip_local_port_range="{value}" 2>&1')
+                if result.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = result.stderr.strip()
+            elif param == "nofile":
+                cmds = [
+                    "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
+                    f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
+                    f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
+                    f"systemctl set-property nginx.service LimitNOFILE={value} 2>/dev/null || true",
+                    "systemctl daemon-reload && systemctl restart nginx 2>&1 || true",
+                ]
+                for cmd in cmds:
+                    ssh.execute(cmd)
+                applied[param] = value
+            elif param == "irqbalance":
+                result = ssh.execute("systemctl enable --now irqbalance 2>&1")
+                if result.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = result.stderr.strip() or "irqbalance enable failed"
+            else:
+                result = ssh.execute(f"sysctl -w {param}={value} 2>&1")
+                if result.ok:
+                    applied[param] = value
+                else:
+                    failed[param] = result.stderr.strip()
 
-        result = {"applied": applied, "failed": failed}
-
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
+        state["system_applied"] = state["system_applied"] or bool(applied)
         summary = f"applied={list(applied.keys())} failed={list(failed.keys())}"
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        deps.memory.save_context(
+            deps.session_id,
             "command_output",
             f"apply_system:{','.join(changes_dict.keys())}"[:250],
             summary,
             "system batch apply",
         )
+        _langfuse_event(
+            deps,
+            "tool.apply_system_tuning",
+            input={"changes": changes_dict},
+            output={"applied": applied, "failed": failed},
+        )
         tool_result("apply_system", summary)
-        return result
+        return {"applied": applied, "failed": failed}
 
-    @agent.tool
-    async def run_benchmark(ctx: RunContext[AgentDeps], duration: int = 30) -> dict:
-        """Run wrk2 benchmark against the small file URL. Returns RPS and latency."""
-        bench_cfg = ctx.deps.config["service"]["benchmark"]
+    def run_benchmark_impl(deps: AgentDeps, duration: int = 30) -> dict:
+        bench_cfg = deps.config["service"]["benchmark"]
         url = bench_cfg.get("small_file_url", "http://localhost/")
-        tool_call("benchmark", f"wrk2 {duration}s -> {url}")
-        result: BenchmarkResult = ctx.deps.adapter.benchmark(duration, url)
+        bench_tool = bench_cfg.get("tool", "wrk2")
+        benchmark_label = "benchmark.sh" if bench_tool == "hackathon" else "wrk2"
+        tool_call("benchmark", f"{benchmark_label} {duration}s -> {url}")
+        result: BenchmarkResult = deps.adapter.benchmark(duration, url)
         tool_result(
             "benchmark",
             f"{result.requests_per_sec:.1f} RPS, "
             f"p99={result.latency_p99_ms:.1f}ms, CPU={result.cpu_pct:.1f}%",
         )
-        ctx.deps.memory.save_context(
-            ctx.deps.session_id,
+        deps.memory.save_context(
+            deps.session_id,
             "benchmark",
             url,
-            f"RPS={result.requests_per_sec:.1f} p99={result.latency_p99_ms:.1f}ms CPU={result.cpu_pct:.1f}%",
+            (
+                f"RPS={result.requests_per_sec:.1f} "
+                f"p99={result.latency_p99_ms:.1f}ms "
+                f"CPU={result.cpu_pct:.1f}%"
+            ),
             "post-fix benchmark",
         )
-        ctx.deps.token_counter.tool_calls += 1
+        deps.token_counter.tool_calls += 1
+        state["after_rps"] = float(result.requests_per_sec)
+        state["after_p99_ms"] = float(result.latency_p99_ms)
+        state["after_error_rate"] = float(result.error_rate)
+        _langfuse_event(
+            deps,
+            "tool.run_benchmark",
+            input={"duration": duration, "url": url, "backend": bench_tool},
+            output=result.__dict__,
+        )
         return result.__dict__
 
-    _memory_query_count = 0
-    MAX_MEMORY_QUERIES = 3
-
-    @agent.tool
-    async def query_memory(ctx: RunContext[AgentDeps], symptom: str) -> list[dict]:
-        """Search the knowledge base and past findings. Limited to 3 queries — use wisely."""
-        nonlocal _memory_query_count
-        _memory_query_count += 1
-        if _memory_query_count > MAX_MEMORY_QUERIES:
-            tool_call("memory", f"BLOCKED — limit reached ({MAX_MEMORY_QUERIES})")
+    def query_memory_impl(deps: AgentDeps, symptom: str) -> list[dict]:
+        nonlocal memory_query_count
+        memory_query_count += 1
+        if memory_query_count > max_memory_queries:
+            tool_call("memory", f"BLOCKED — limit reached ({max_memory_queries})")
             tool_result("memory", "limit reached; returning no additional memory results")
-            ctx.deps.token_counter.tool_calls += 1
+            deps.token_counter.tool_calls += 1
             return []
-        tool_call("memory", f"query {_memory_query_count}/{MAX_MEMORY_QUERIES}: {symptom}")
-        results = ctx.deps.memory.semantic_search(symptom, ctx.deps.session_id, top_k=5)
+        tool_call("memory", f"query {memory_query_count}/{max_memory_queries}: {symptom}")
+        results = deps.memory.semantic_search(symptom, deps.session_id, top_k=5)
         tool_result("memory", f"{len(results)} results found")
-        ctx.deps.token_counter.tool_calls += 1
+        _langfuse_event(
+            deps,
+            "tool.query_memory",
+            input={"symptom": symptom, "query_index": memory_query_count},
+            output={"result_count": len(results), "top_results": results[:3]},
+        )
+        deps.token_counter.tool_calls += 1
         return results
 
-    @agent.tool
-    async def save_findings(
-        ctx: RunContext[AgentDeps],
-        findings: list[dict[str, Any]],
-    ) -> bool:
-        """Save all fix results to memory in one call.
-        Each finding: {parameter, before_value, after_value, before_rps, after_rps, impact_pct}
-        """
+    def save_findings_impl(deps: AgentDeps, findings: list[dict[str, Any]]) -> bool:
         tool_call("save", f"{len(findings)} findings")
-        for f in findings:
-            param = f.get("parameter", "unknown")
-            ctx.deps.memory.save_fact(
-                session_id=ctx.deps.session_id,
+
+        def _coerce_optional_float(value: Any) -> float | None:
+            if value is None or value == "":
+                return None
+            if isinstance(value, bool):
+                return float(value)
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value.strip())
+                except ValueError:
+                    return None
+            return None
+
+        try:
+            profile = deps.memory.get_profile(deps.session_id) or {}
+        except Exception:
+            profile = {}
+
+        baseline_rps = _coerce_optional_float(profile.get("baseline_rps")) or 0.0
+        run_after_rps = _coerce_optional_float(state.get("after_rps")) or 0.0
+        derived_impact = (
+            ((run_after_rps - baseline_rps) / baseline_rps * 100)
+            if baseline_rps and run_after_rps
+            else 0.0
+        )
+
+        for finding in findings:
+            param = finding.get("parameter", "unknown")
+            before_rps = _coerce_optional_float(finding.get("before_rps"))
+            after_rps = _coerce_optional_float(finding.get("after_rps"))
+            impact_pct = _coerce_optional_float(finding.get("impact_pct"))
+
+            if before_rps is None and baseline_rps:
+                before_rps = baseline_rps
+            if after_rps is None and run_after_rps:
+                after_rps = run_after_rps
+            if impact_pct is None and before_rps and after_rps:
+                impact_pct = (after_rps - before_rps) / before_rps * 100
+            elif impact_pct is None and derived_impact:
+                impact_pct = derived_impact
+
+            deps.memory.save_fact(
+                session_id=deps.session_id,
                 type="fix",
                 parameter=param,
-                reasoning=f.get("reasoning", "proven fix applied"),
-                before_value=f.get("before_value", ""),
-                after_value=f.get("after_value", ""),
-                before_rps=f.get("before_rps", 0),
-                after_rps=f.get("after_rps", 0),
-                impact_pct=f.get("impact_pct", 0),
+                reasoning=finding.get("reasoning", "proven fix applied"),
+                before_value=finding.get("before_value", ""),
+                after_value=finding.get("after_value", ""),
+                before_rps=before_rps,
+                after_rps=after_rps,
+                impact_pct=impact_pct,
             )
-            tool_result("save", f"{param} ({f.get('impact_pct', 0):+.1f}%)")
-        ctx.deps.token_counter.tool_calls += 1
+            impact_label = "n/a" if impact_pct is None else f"{impact_pct:+.1f}%"
+            tool_result("save", f"{param} ({impact_label})")
+        deps.token_counter.tool_calls += 1
+        state["findings"] = findings
+        _langfuse_event(
+            deps,
+            "tool.save_findings",
+            input={"count": len(findings)},
+            output={"saved": findings[:10]},
+        )
         return True
 
-    return agent
+    def save_rca_impl(deps: AgentDeps, records: list[dict[str, Any]]) -> bool:
+        tool_call("rca", f"{len(records)} records")
+        _debug_planner(deps, "raw_rca_records", records[:3])
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "planner_rca_raw",
+            json.dumps(records, ensure_ascii=True),
+            f"raw rca payload ({len(records)} records)",
+        )
+        normalized_records: list[dict[str, Any]] = []
+        for idx, record in enumerate(records, start=1):
+            symptom = str(record.get("symptom", "")).strip() or "unknown symptom"
+            root_cause = str(record.get("root_cause", "")).strip() or "unknown root cause"
+            recommendation = str(record.get("recommendation", "")).strip() or "no recommendation"
+            confidence = _coerce_float(record.get("confidence", 0.0))
+            evidence = record.get("evidence", [])
+            if isinstance(evidence, str):
+                evidence_list = [evidence]
+            elif isinstance(evidence, list):
+                evidence_list = [str(item) for item in evidence[:6]]
+            else:
+                evidence_list = [str(evidence)]
+            normalized = {
+                "symptom": symptom,
+                "root_cause": root_cause,
+                "confidence": confidence,
+                "recommendation": recommendation,
+                "evidence": evidence_list,
+            }
+            if _debug_enabled(deps) and (
+                symptom == "unknown symptom" or root_cause == "unknown root cause"
+            ):
+                tool_result(
+                    "debug",
+                    (
+                        f"rca_{idx} malformed: raw={json.dumps(record, ensure_ascii=True)[:500]} "
+                        f"normalized={json.dumps(normalized, ensure_ascii=True)[:300]}"
+                    ),
+                )
+            deps.memory.save_context(
+                deps.session_id,
+                "rca",
+                f"rca_{idx}",
+                json.dumps(normalized),
+                f"{symptom} -> {root_cause} (conf={confidence:.2f})",
+            )
+            normalized_records.append(normalized)
+            tool_result("rca", f"{symptom} -> {root_cause} ({confidence:.2f})")
+        deps.token_counter.tool_calls += 1
+        state["rca_records"] = normalized_records
+        _persist_hypothesis_markdown(
+            deps,
+            filename="04_rca.md",
+            title="RCA",
+            sections=[
+                ("Summary", f"Accepted RCA records: {len(normalized_records)}"),
+                ("Records", _markdown_json(normalized_records)),
+            ],
+        )
+        _langfuse_event(
+            deps,
+            "tool.save_rca",
+            input={"count": len(records)},
+            output={"normalized_records": normalized_records[:10]},
+        )
+        return True
+
+    def save_recommendations_impl(deps: AgentDeps, recommendations: list[dict[str, Any]]) -> bool:
+        tool_call("recommend", f"{len(recommendations)} recommendations")
+        _debug_planner(deps, "raw_recommendations", recommendations[:3])
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "planner_recommendations_raw",
+            json.dumps(recommendations, ensure_ascii=True),
+            f"raw recommendation payload ({len(recommendations)} items)",
+        )
+        normalized_items: list[dict[str, Any]] = []
+        for idx, item in enumerate(recommendations, start=1):
+            scope = str(item.get("scope", "nginx")).strip().lower() or "nginx"
+            if scope not in {"nginx", "system"}:
+                if _debug_enabled(deps):
+                    tool_result(
+                        "debug",
+                        (
+                            f"recommendation_{idx} reject invalid scope: "
+                            f"raw={json.dumps(item, ensure_ascii=True)[:500]}"
+                        ),
+                    )
+                deps.memory.save_context(
+                    deps.session_id,
+                    "command_output",
+                    f"recommendation_rejected_{idx}",
+                    json.dumps(
+                        {
+                            "reason": "invalid scope",
+                            "scope": scope,
+                            "raw": item,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    f"recommendation_{idx} rejected: invalid scope {scope}",
+                )
+                _persist_hypothesis_markdown(
+                    deps,
+                    filename="06_rejections.md",
+                    title="Rejected Recommendations",
+                    sections=[
+                        (
+                            "Rejection",
+                            _markdown_json(
+                                {
+                                    "index": idx,
+                                    "reason": "invalid scope",
+                                    "scope": scope,
+                                    "raw": item,
+                                }
+                            ),
+                        )
+                    ],
+                    append=True,
+                )
+                tool_result("recommend", f"skipped recommendation_{idx}: invalid scope {scope}")
+                continue
+            changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
+            if parse_error:
+                changes = {}
+            allowed_params = set(nginx_targets) if scope == "nginx" else set(system_targets)
+            filtered_changes = {
+                key: value for key, value in (changes or {}).items() if key in allowed_params
+            }
+            if not filtered_changes:
+                if _debug_enabled(deps):
+                    tool_result(
+                        "debug",
+                        (
+                            f"recommendation_{idx} reject no allowed changes: "
+                            f"title={str(item.get('title', ''))[:80]!r} "
+                            f"scope={scope} "
+                            f"raw_changes="
+                            f"{json.dumps(item.get('changes', {}), ensure_ascii=True)[:300]} "
+                            f"normalized={json.dumps(changes or {}, ensure_ascii=True)[:300]}"
+                        ),
+                    )
+                deps.memory.save_context(
+                    deps.session_id,
+                    "command_output",
+                    f"recommendation_rejected_{idx}",
+                    json.dumps(
+                        {
+                            "reason": "no allowed performance changes",
+                            "scope": scope,
+                            "raw": item,
+                            "normalized_changes": changes or {},
+                            "allowed_params": sorted(allowed_params),
+                        },
+                        ensure_ascii=True,
+                    ),
+                    f"recommendation_{idx} rejected: no allowed performance changes",
+                )
+                _persist_hypothesis_markdown(
+                    deps,
+                    filename="06_rejections.md",
+                    title="Rejected Recommendations",
+                    sections=[
+                        (
+                            "Rejection",
+                            _markdown_json(
+                                {
+                                    "index": idx,
+                                    "reason": "no allowed performance changes",
+                                    "scope": scope,
+                                    "raw": item,
+                                    "normalized_changes": changes or {},
+                                    "allowed_params": sorted(allowed_params),
+                                }
+                            ),
+                        )
+                    ],
+                    append=True,
+                )
+                tool_result(
+                    "recommend", f"skipped recommendation_{idx}: no allowed performance changes"
+                )
+                continue
+            normalized = {
+                "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
+                "recommendation": str(item.get("recommendation", "")).strip()
+                or "no recommendation",
+                "rationale": str(item.get("rationale", "")).strip() or "no rationale",
+                "expected_benefit": str(item.get("expected_benefit", "")).strip()
+                or "no expected benefit",
+                "risk_level": str(item.get("risk_level", "medium")).strip().lower() or "medium",
+                "validation": str(item.get("validation", "")).strip()
+                or "manual verification required",
+                "scope": scope,
+                "changes": filtered_changes,
+            }
+            deps.memory.save_context(
+                deps.session_id,
+                "recommendation",
+                f"recommendation_{idx}",
+                json.dumps(normalized),
+                f"{normalized['title']} [{normalized['risk_level']}]",
+            )
+            normalized_items.append(normalized)
+            tool_result("recommend", f"{normalized['title']} [{normalized['risk_level']}]")
+        deps.token_counter.tool_calls += 1
+        state["recommendations"] = normalized_items
+        _persist_hypothesis_markdown(
+            deps,
+            filename="05_recommendations.md",
+            title="Recommendations",
+            sections=[
+                ("Summary", f"Accepted recommendations: {len(normalized_items)}"),
+                ("Recommendations", _markdown_json(normalized_items)),
+            ],
+        )
+        _langfuse_event(
+            deps,
+            "tool.save_recommendations",
+            input={"count": len(recommendations)},
+            output={"accepted": normalized_items[:10]},
+        )
+        return True
+
+    def _evaluate_nginx_guardrails(
+        deps: AgentDeps, benchmark_result: dict[str, Any]
+    ) -> dict[str, Any]:
+        def _load_baseline_benchmark() -> dict[str, Any]:
+            for source in ("baseline_small", "baseline_homepage"):
+                try:
+                    rows = deps.memory.get_contexts(
+                        deps.session_id, type="benchmark", source_prefix=source, limit=1
+                    )
+                except Exception:
+                    rows = []
+                if not rows:
+                    continue
+                content = rows[0].get("content", "")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                try:
+                    parsed = json.loads(content)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+            return {}
+
+        try:
+            profile = deps.memory.get_profile(deps.session_id) or {}
+        except Exception:
+            profile = {}
+        baseline_benchmark = _load_baseline_benchmark()
+
+        baseline_rps = _coerce_float(profile.get("baseline_rps")) or _coerce_float(
+            baseline_benchmark.get("rps")
+        )
+        baseline_p99 = _coerce_float(baseline_benchmark.get("p99"))
+        baseline_error_rate = _coerce_float(baseline_benchmark.get("error_rate"))
+        after_rps = _coerce_float(benchmark_result.get("requests_per_sec"))
+        after_p99 = _coerce_float(benchmark_result.get("latency_p99_ms"))
+        after_error_rate = _coerce_float(benchmark_result.get("error_rate"))
+        reasons: list[str] = []
+
+        if baseline_rps and after_rps < baseline_rps * 0.95:
+            reasons.append(f"RPS regressed ({after_rps:.1f} < {baseline_rps:.1f})")
+        if baseline_p99 and after_p99 > baseline_p99 * 1.10:
+            reasons.append(f"p99 regressed ({after_p99:.1f}ms > {baseline_p99:.1f}ms)")
+        if after_error_rate > baseline_error_rate:
+            reasons.append(
+                f"error rate regressed ({after_error_rate:.3f} > {baseline_error_rate:.3f})"
+            )
+
+        impact_pct = ((after_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
+        return {
+            "ok": not reasons,
+            "summary": "validated for nginx performance" if not reasons else "; ".join(reasons),
+            "baseline_rps": baseline_rps,
+            "after_rps": after_rps,
+            "impact_pct": impact_pct,
+        }
+
+    def _verify_applied_changes(
+        deps: AgentDeps,
+        nginx_applied: list[str] | Any,
+        nginx_changes: dict[str, str],
+        system_applied: dict[str, str],
+    ) -> dict[str, Any]:
+        """Re-read DUT state and verify changes actually took effect."""
+        ssh = deps.ssh
+        mismatches: list[dict[str, str]] = []
+        fixed: list[str] = []
+
+        # ── Verify nginx directives via nginx -T ────────────────────────
+        if nginx_applied:
+            raw = ssh.execute("nginx -T 2>/dev/null").stdout
+            for param in nginx_applied:
+                expected = nginx_changes.get(param, "")
+                if param == "listen_backlog":
+                    match = re.search(r"listen\s+.*backlog=(\d+)", raw)
+                    actual = match.group(1) if match else "not set"
+                else:
+                    match = re.search(rf"^\s*{param}\s+(.+?);", raw, re.MULTILINE)
+                    actual = match.group(1).strip() if match else "not set"
+                if actual != expected and actual != "not set":
+                    # Check if the value is functionally equivalent
+                    if actual.replace(" ", "") == expected.replace(" ", ""):
+                        continue
+                if actual == "not set" or actual != expected:
+                    mismatches.append(
+                        {
+                            "scope": "nginx",
+                            "param": param,
+                            "expected": expected,
+                            "actual": actual,
+                        }
+                    )
+                    # Try to fix: remove from conf.d and retry
+                    ssh.execute(
+                        f"sed -i '/^[[:space:]]*{param}[[:space:]]/d'"
+                        " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
+                    )
+                    fixed.append(param)
+
+            if fixed:
+                # Reload nginx after conf.d cleanup
+                ssh.execute("nginx -t 2>&1 && nginx -s reload 2>&1")
+                tool_result(
+                    "verify",
+                    f"fixed {len(fixed)} conf.d overrides: {', '.join(fixed)}",
+                )
+
+        # ── Verify system parameters ────────────────────────────────────
+        sysctl_params = [p for p in system_applied if p.startswith("net.") or p.startswith("fs.")]
+        for param in sysctl_params:
+            expected = system_applied[param]
+            result = ssh.execute(f"sysctl -n {param} 2>/dev/null")
+            actual = result.stdout.strip()
+            if actual != expected:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": param,
+                        "expected": expected,
+                        "actual": actual,
+                    }
+                )
+                # Retry the sysctl
+                ssh.execute(f"sysctl -w {param}={expected} 2>&1")
+
+        if "transparent_hugepage" in system_applied:
+            result = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
+            match = re.search(r"\[(\w+)\]", result.stdout)
+            actual = match.group(1) if match else "unknown"
+            if actual != system_applied["transparent_hugepage"]:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": "transparent_hugepage",
+                        "expected": system_applied["transparent_hugepage"],
+                        "actual": actual,
+                    }
+                )
+
+        if "selinux" in system_applied:
+            result = ssh.execute("getenforce 2>/dev/null")
+            actual = result.stdout.strip().lower()
+            if actual != system_applied["selinux"]:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": "selinux",
+                        "expected": system_applied["selinux"],
+                        "actual": actual,
+                    }
+                )
+
+        if "nofile" in system_applied:
+            result = ssh.execute(
+                "cat /proc/$(pgrep -o nginx)/limits 2>/dev/null | grep 'Max open files'"
+            )
+            actual_line = result.stdout.strip()
+            nofile_match = re.search(r"(\d+)\s+(\d+)", actual_line)
+            actual_soft = nofile_match.group(1) if nofile_match else "unknown"
+            if actual_soft != system_applied["nofile"]:
+                mismatches.append(
+                    {
+                        "scope": "system",
+                        "param": "nofile",
+                        "expected": system_applied["nofile"],
+                        "actual": actual_soft,
+                    }
+                )
+                # Force restart nginx to pick up new limits
+                ssh.execute("systemctl restart nginx 2>&1 || true")
+
+        # Log results
+        if mismatches:
+            summary = "; ".join(
+                f"{m['param']}={m['actual']} (expected {m['expected']})" for m in mismatches
+            )
+            tool_result("verify", f"mismatches found: {summary}")
+            deps.memory.save_context(
+                deps.session_id,
+                "command_output",
+                "post_apply_verification",
+                json.dumps({"mismatches": mismatches, "fixed": fixed}),
+                f"verification: {len(mismatches)} mismatches, {len(fixed)} conf.d fixes",
+            )
+        else:
+            tool_result("verify", "all changes verified on DUT")
+            deps.memory.save_context(
+                deps.session_id,
+                "command_output",
+                "post_apply_verification",
+                json.dumps({"status": "all_verified"}),
+                "verification: all changes confirmed on DUT",
+            )
+
+        return {"mismatches": mismatches, "fixed": fixed}
+
+    def _translate_recommendations(
+        raw_recommendations: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Extract nginx and system changes from recommendations.
+
+        Uses nginx_targets/system_targets keys as anchors — scans all text
+        fields in each recommendation for known parameter names, extracts
+        values. Falls back to target defaults if value is unclear.
+        No format-specific parsing. Works with ANY LLM output shape.
+        """
+        nginx_changes: dict[str, str] = {}
+        system_changes: dict[str, str] = {}
+
+        # Build a blob of all recommendation text for scanning
+        all_text = json.dumps(raw_recommendations, ensure_ascii=False)
+
+        # For each known target, check if any recommendation mentions it
+        for param, default_value in nginx_targets.items():
+            if param not in all_text:
+                continue
+            # Find the recommendation that mentions this param
+            value = _extract_value_for_param(param, raw_recommendations)
+            nginx_changes[param] = value or default_value
+
+        for param, default_value in system_targets.items():
+            if param not in all_text:
+                continue
+            value = _extract_value_for_param(param, raw_recommendations)
+            system_changes[param] = value or default_value
+
+        return nginx_changes, system_changes
+
+    def _extract_value_for_param(param: str, recommendations: list[dict[str, Any]]) -> str | None:
+        """Extract the value for a parameter from recommendation fields.
+
+        Checks structured fields first (setting/value, changes, directive),
+        then falls back to regex extraction from text fields.
+        """
+        for rec in recommendations:
+            # 1. Direct changes dict
+            changes = rec.get("changes", {})
+            if isinstance(changes, dict) and param in changes:
+                val = str(changes[param]).strip().rstrip(";").strip()
+                # Strip inline comments
+                if "#" in val:
+                    val = val[: val.index("#")].strip().rstrip(";").strip()
+                if val:
+                    return val
+
+            # 2. setting/value pair
+            if str(rec.get("setting", "")).strip() == param:
+                val = str(rec.get("value", "")).strip().rstrip(";").strip()
+                if "#" in val:
+                    val = val[: val.index("#")].strip().rstrip(";").strip()
+                if val:
+                    return val
+
+            # 3. directive field: "param value;" or "param value"
+            directive = rec.get("directive")
+            directives = (
+                directive
+                if isinstance(directive, list)
+                else [directive]
+                if isinstance(directive, str)
+                else []
+            )
+            for d in directives:
+                d_str = str(d).strip().rstrip(";").strip()
+                parts = d_str.split(None, 1)
+                if parts and parts[0] == param and len(parts) == 2:
+                    val = parts[1].strip().rstrip(";").strip()
+                    if "#" in val:
+                        val = val[: val.index("#")].strip()
+                    if val:
+                        return val
+
+            # 4. config_snippet: parse lines for "param value;"
+            snippet = str(rec.get("config_snippet", "")).strip()
+            if snippet and param in snippet:
+                for line in snippet.replace("\\n", "\n").splitlines():
+                    line = line.strip().rstrip(";").strip()
+                    if line.startswith("#"):
+                        continue
+                    # Special: listen ... backlog=N
+                    if param == "listen_backlog" and "backlog=" in line:
+                        m = re.search(r"backlog=(\d+)", line)
+                        if m:
+                            return m.group(1)
+                    parts = line.split(None, 1)
+                    if parts and parts[0] == param and len(parts) == 2:
+                        val = parts[1].strip().rstrip(";").strip()
+                        if "#" in val:
+                            val = val[: val.index("#")].strip()
+                        if val:
+                            return val
+
+            # 5. commands field: extract value from shell commands
+            commands = rec.get("commands") or (
+                [rec["command"]] if isinstance(rec.get("command"), str) else []
+            )
+            for cmd in commands:
+                cmd_str = str(cmd).strip()
+                # sysctl -w param=value
+                m = re.search(rf"{re.escape(param)}=('[^']*'|\"[^\"]*\"|[^\s]+)", cmd_str)
+                if m:
+                    return m.group(1).strip().strip("'\"")
+                # nginx directive in commands: "param value;"
+                parts = cmd_str.rstrip(";").strip().split(None, 1)
+                if parts and parts[0] == param and len(parts) == 2:
+                    return parts[1].strip().rstrip(";").strip()
+
+        return None
+
+    def _batch_apply_nginx(deps: AgentDeps, changes: dict[str, str]) -> dict:
+        """Apply all nginx changes in a single operation."""
+        if not changes:
+            return {"applied": [], "failed": [], "reload": "SKIPPED"}
+
+        tool_call(
+            "apply_nginx",
+            f"batch {len(changes)} directives: {', '.join(changes.keys())}",
+        )
+
+        ssh = deps.ssh
+        config_path = deps.config["service"]["config_path"]
+
+        # Backup
+        ssh.execute(f"cp {config_path} {config_path}.pre_batch")
+
+        # Apply via adapter (it handles upsert + conf.d cleanup)
+        applied = []
+        failed = []
+        # Apply worker_processes first (fundamental directive)
+        priority_order = ["worker_processes", "worker_rlimit_nofile"]
+        ordered_params = sorted(
+            changes.keys(),
+            key=lambda p: priority_order.index(p) if p in priority_order else 99,
+        )
+        for param in ordered_params:
+            value = changes[param]
+            if deps.adapter.apply_config(param, value):
+                applied.append(param)
+            else:
+                failed.append(param)
+
+        # Reload once after all changes
+        if applied:
+            test = ssh.execute("nginx -t 2>&1")
+            if "syntax is ok" in test.stdout or "test is successful" in test.stdout:
+                deps.adapter.reload()
+                reload_status = "OK"
+            else:
+                # Rollback everything
+                ssh.execute(f"cp {config_path}.pre_batch {config_path}")
+                ssh.execute("nginx -s reload 2>&1 || true")
+                reload_status = "FAILED"
+                failed = list(changes.keys())
+                applied = []
+        else:
+            reload_status = "SKIPPED"
+
+        result = {"applied": applied, "failed": failed, "reload": reload_status}
+        tool_result(
+            "apply_nginx",
+            f"applied={applied} failed={failed} reload={reload_status}",
+        )
+
+        deps.token_counter.tool_calls += 1
+        state["nginx_applied"] = state["nginx_applied"] or bool(applied)
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            f"batch_apply_nginx:{','.join(changes.keys())}"[:250],
+            json.dumps(result),
+            f"nginx batch: {len(applied)} applied, {len(failed)} failed",
+        )
+        return result
+
+    def _batch_apply_system(deps: AgentDeps, changes: dict[str, str]) -> dict:
+        """Apply all system changes in a single SSH script."""
+        if not changes:
+            return {"applied": {}, "failed": {}}
+
+        tool_call(
+            "apply_system",
+            f"batch {len(changes)} params: {', '.join(changes.keys())}",
+        )
+
+        ssh = deps.ssh
+        # Build a single script
+        script_lines = ["#!/bin/bash", "set +e", "RESULT=''"]
+
+        for param, value in changes.items():
+            if param == "transparent_hugepage":
+                script_lines.append(
+                    f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param == "selinux":
+                mode = "0" if value.lower() in ("permissive", "0") else "1"
+                script_lines.append(f"setenforce {mode} 2>&1")
+                if value.lower() in ("permissive", "0"):
+                    script_lines.append(
+                        "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
+                        " /etc/selinux/config 2>/dev/null || true"
+                    )
+                script_lines.append(f'RESULT="$RESULT {param}=OK"')
+            elif param == "cpu_governor":
+                script_lines.append(
+                    f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/"
+                    f"scaling_governor >/dev/null 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param == "nofile":
+                script_lines.extend(
+                    [
+                        "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
+                        f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
+                        f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
+                        f"systemctl set-property nginx.service LimitNOFILE={value}"
+                        " 2>/dev/null || true",
+                        f'RESULT="$RESULT {param}=OK"',
+                    ]
+                )
+            elif param == "irqbalance":
+                script_lines.append(
+                    "systemctl enable --now irqbalance 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param == "net.ipv4.ip_local_port_range":
+                script_lines.append(
+                    f"sysctl -w 'net.ipv4.ip_local_port_range={value}' 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            elif param.startswith("net.") or param.startswith("fs."):
+                script_lines.append(
+                    f"sysctl -w {param}={value} 2>&1"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
+                )
+            else:
+                script_lines.append(f'RESULT="$RESULT {param}=SKIP"')
+
+        # Restart nginx to pick up nofile changes (if any)
+        if "nofile" in changes:
+            script_lines.append("systemctl daemon-reload && systemctl restart nginx 2>&1 || true")
+
+        script_lines.append("echo $RESULT")
+        script = "\n".join(script_lines)
+
+        result = ssh.execute(f"bash -c '{script}'", timeout=30)
+        output = result.stdout.strip()
+
+        # Parse results
+        applied = {}
+        failed = {}
+        for token in output.split():
+            if "=" not in token:
+                continue
+            key, status = token.rsplit("=", 1)
+            if status == "OK":
+                applied[key] = changes.get(key, "")
+            elif status == "FAIL":
+                failed[key] = "command failed"
+
+        # Any param not in output is assumed applied (some don't echo)
+        for param, value in changes.items():
+            if param not in applied and param not in failed:
+                applied[param] = value
+
+        result_dict: dict[str, Any] = {"applied": applied, "failed": failed}
+        tool_result(
+            "apply_system",
+            f"applied={list(applied.keys())} failed={list(failed.keys())}",
+        )
+
+        deps.token_counter.tool_calls += 1
+        state["system_applied"] = state["system_applied"] or bool(applied)
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            f"batch_apply_system:{','.join(changes.keys())}"[:250],
+            json.dumps(result_dict),
+            f"system batch: {len(applied)} applied, {len(failed)} failed",
+        )
+        return result_dict
+
+    def apply_saved_recommendations_impl(deps: AgentDeps) -> dict[str, Any]:
+        from agents.tools_apply import (
+            apply_kernel,
+            apply_network,
+            apply_resource_limits,
+            apply_storage,
+        )
+
+        apply_plan = state.get("apply_plan") or {}
+        _tuning = deps.config.get("tuning") or {}
+
+        # Extract changes per category, filtered by config allowlist
+        category_configs = {
+            "webserver": _tuning.get("webserver_targets") or {},
+            "kernel": _tuning.get("kernel_targets") or {},
+            "resource_limits": _tuning.get("resource_limits_targets") or {},
+            "network": _tuning.get("network_targets") or {},
+            "storage": _tuning.get("storage_targets") or {},
+        }
+        changes_by_cat: dict[str, dict[str, str]] = {}
+        for cat, allowed in category_configs.items():
+            raw = apply_plan.get(cat, {})
+            if isinstance(raw, dict):
+                filtered = {
+                    str(k).strip(): str(v).strip().rstrip(";").strip()
+                    for k, v in raw.items()
+                    if str(k).strip() in allowed
+                }
+                if filtered:
+                    changes_by_cat[cat] = filtered
+
+        # Also accept webserver params from adapter allowlist
+        adapter_allowed: set[str] = set(getattr(deps.adapter, "ALLOWED_BATCH_DIRECTIVES", set()))
+        raw_web = apply_plan.get("webserver", {})
+        if isinstance(raw_web, dict):
+            for k, v in raw_web.items():
+                k_s = str(k).strip()
+                if k_s in adapter_allowed and k_s not in changes_by_cat.get("webserver", {}):
+                    changes_by_cat.setdefault("webserver", {})[k_s] = (
+                        str(v).strip().rstrip(";").strip()
+                    )
+
+        # Auto-apply resource_limits/network/storage from inspection problems
+        # even if the apply_planner didn't include them (safe: removes throttling)
+        inspection = state.get("inspection") or {}
+        for cat, targets_key in (
+            ("resource_limits", "resource_limits_targets"),
+            ("network", "network_targets"),
+            ("storage", "storage_targets"),
+        ):
+            cat_inspection = inspection.get(cat, {})
+            if cat_inspection.get("problems") and cat not in changes_by_cat:
+                # Inspection found problems but LLM didn't recommend fixes
+                # Auto-apply all defaults from config
+                defaults = _tuning.get(targets_key) or {}
+                if defaults:
+                    changes_by_cat[cat] = dict(defaults)
+                    n_problems = len(cat_inspection["problems"])
+                    tool_result(
+                        "auto_fix",
+                        f"{cat}: applying defaults due to {n_problems} problems",
+                    )
+
+        tool_call(
+            "apply",
+            " | ".join(f"{c}={len(v)}" for c, v in changes_by_cat.items() if v) or "no changes",
+        )
+
+        results: dict[str, Any] = {}
+        ssh = deps.ssh
+
+        # Apply webserver (nginx) changes
+        web_changes = changes_by_cat.get("webserver", {})
+        if web_changes:
+            results["webserver"] = _batch_apply_nginx(deps, web_changes)
+            state["nginx_applied"] = True
+
+        # Apply kernel changes
+        kern_changes = changes_by_cat.get("kernel", {})
+        if kern_changes:
+            results["kernel"] = apply_kernel(ssh, kern_changes)
+            state["system_applied"] = True
+
+        # Apply resource limits
+        res_changes = changes_by_cat.get("resource_limits", {})
+        if res_changes:
+            results["resource_limits"] = apply_resource_limits(ssh, res_changes)
+            state["system_applied"] = True
+
+        # Apply network fixes
+        net_changes = changes_by_cat.get("network", {})
+        if net_changes:
+            results["network"] = apply_network(ssh, net_changes)
+            state["system_applied"] = True
+
+        # Apply storage fixes
+        stor_changes = changes_by_cat.get("storage", {})
+        if stor_changes:
+            results["storage"] = apply_storage(ssh, stor_changes)
+            state["system_applied"] = True
+
+        # Log results per category
+        for cat, result in results.items():
+            applied = result.get("applied", {})
+            failed = result.get("failed", {})
+            actions = result.get("actions", [])
+            detail = (
+                f"applied={list(applied.keys()) if isinstance(applied, dict) else applied}"
+                f" failed={list(failed.keys()) if isinstance(failed, dict) else failed}"
+            )
+            if actions:
+                detail += f" actions={actions}"
+            tool_result(f"apply_{cat}", detail)
+
+        # Verify changes on DUT
+        tool_call("verify", "checking applied changes on DUT")
+        web_applied = results.get("webserver", {}).get("applied", [])
+        kern_applied = results.get("kernel", {}).get("applied", {})
+        _verify_applied_changes(
+            deps,
+            nginx_applied=web_applied,
+            nginx_changes=web_changes,
+            system_applied=kern_applied,
+        )
+
+        # Build findings from all categories
+        inspection = state.get("inspection") or {}
+        web_current = inspection.get("webserver", {}).get("current") or {}
+        kern_current = inspection.get("kernel", {}).get("current") or {}
+        findings: list[dict[str, Any]] = []
+        for param in web_applied if isinstance(web_applied, list) else web_applied.keys():
+            findings.append(
+                {
+                    "parameter": f"webserver.{param}",
+                    "before_value": web_current.get(param, ""),
+                    "after_value": web_changes.get(param, ""),
+                    "reasoning": "config-driven tuning",
+                }
+            )
+        for param, value in kern_applied.items():
+            findings.append(
+                {
+                    "parameter": f"kernel.{param}",
+                    "before_value": kern_current.get(param, ""),
+                    "after_value": value,
+                    "reasoning": "config-driven tuning",
+                }
+            )
+        for cat in ("resource_limits", "network", "storage"):
+            for action in results.get(cat, {}).get("actions", []):
+                findings.append(
+                    {
+                        "parameter": f"{cat}",
+                        "before_value": "",
+                        "after_value": action,
+                        "reasoning": "config-driven fix",
+                    }
+                )
+
+        if findings:
+            save_findings_impl(deps, findings)
+
+        return {"results": results, "findings": findings}
+
+    async def inspect_nginx_config(ctx) -> dict:
+        return inspect_nginx_impl(ctx.deps)
+
+    async def inspect_system_tuning(ctx) -> dict:
+        return inspect_system_impl(ctx.deps)
+
+    async def inspect_irq_distribution(ctx) -> dict:
+        return inspect_irq_impl(ctx.deps)
+
+    async def apply_nginx_tuning(
+        ctx, changes: dict[str, str] | str | None = None, **kwargs: Any
+    ) -> dict:
+        return apply_nginx_impl(ctx.deps, changes, **kwargs)
+
+    async def apply_system_tuning(
+        ctx, changes: dict[str, str] | str | None = None, **kwargs: Any
+    ) -> dict:
+        return apply_system_impl(ctx.deps, changes, **kwargs)
+
+    async def run_benchmark(ctx, duration: int = 30) -> dict:
+        return run_benchmark_impl(ctx.deps, duration)
+
+    async def query_memory(ctx, symptom: str) -> list[dict]:
+        return query_memory_impl(ctx.deps, symptom)
+
+    async def save_findings(ctx, findings: list[dict[str, Any]]) -> bool:
+        return save_findings_impl(ctx.deps, findings)
+
+    async def save_rca(ctx, records: list[dict[str, Any]]) -> bool:
+        return save_rca_impl(ctx.deps, records)
+
+    async def save_recommendations(ctx, recommendations: list[dict[str, Any]]) -> bool:
+        return save_recommendations_impl(ctx.deps, recommendations)
+
+    def tool_factory(deps: AgentDeps):
+        from langchain_core.tools import tool
+
+        @tool
+        def inspect_nginx_config() -> dict:
+            """Inspect nginx config and return only what needs fixing vs proven targets."""
+            return inspect_nginx_impl(deps)
+
+        @tool
+        def inspect_system_tuning() -> dict:
+            """Stage 2: inspect RHEL/kernel/system tuning and return candidate fixes."""
+            return inspect_system_impl(deps)
+
+        @tool
+        def inspect_irq_distribution() -> dict:
+            """Stage 3: inspect IRQ distribution, worker CPU spread, and IRQ lock signals."""
+            return inspect_irq_impl(deps)
+
+        @tool
+        def apply_nginx_tuning(changes: dict[str, Any] | str | None = None) -> dict:
+            """Apply multiple nginx config changes from a structured changes object."""
+            return apply_nginx_impl(deps, changes)
+
+        @tool
+        def apply_system_tuning(changes: dict[str, Any] | str | None = None) -> dict:
+            """Apply multiple system tuning changes from a structured changes object."""
+            return apply_system_impl(deps, changes)
+
+        @tool
+        def run_benchmark(duration: int = 30) -> dict:
+            """Run the post-fix benchmark."""
+            return run_benchmark_impl(deps, duration)
+
+        @tool
+        def query_memory(symptom: str) -> list[dict]:
+            """Search the knowledge base and past findings."""
+            return query_memory_impl(deps, symptom)
+
+        @tool
+        def save_findings(findings: list[dict[str, Any]]) -> bool:
+            """Save all findings from a structured findings list."""
+            return save_findings_impl(deps, findings)
+
+        @tool
+        def save_rca(records: list[dict[str, Any]]) -> bool:
+            """Save structured root-cause analysis records before remediation."""
+            return save_rca_impl(deps, records)
+
+        @tool
+        def save_recommendations(recommendations: list[dict[str, Any]]) -> bool:
+            """Save transparent human-readable recommendations before remediation."""
+            return save_recommendations_impl(deps, recommendations)
+
+        return [
+            inspect_nginx_config,
+            inspect_system_tuning,
+            inspect_irq_distribution,
+            save_rca,
+            save_recommendations,
+            query_memory,
+        ]
+
+    test_tools = {
+        "inspect_nginx_config": inspect_nginx_config,
+        "inspect_system_tuning": inspect_system_tuning,
+        "inspect_irq_distribution": inspect_irq_distribution,
+        "save_rca": save_rca,
+        "save_recommendations": save_recommendations,
+        "apply_nginx_tuning": apply_nginx_tuning,
+        "apply_system_tuning": apply_system_tuning,
+        "run_benchmark": run_benchmark,
+        "query_memory": query_memory,
+        "save_findings": save_findings,
+    }
+    workflow = DiagnosisWorkflow(model, state, test_tools, tool_factory)
+    workflow._apply_from_recommendations = apply_saved_recommendations_impl  # type: ignore[attr-defined]
+    return workflow
+
+
+def _save_preflight_hypothesis(
+    deps: AgentDeps,
+    diag: dict[str, Any],
+    url_results: dict[str, dict[str, Any]],
+    problems: list[str],
+) -> None:
+    """Save preflight diagnostics to the hypothesis folder."""
+    cfg = getattr(deps, "config", {}) or {}
+    agent_cfg = cfg.get("agent") or {}
+    enabled = bool(agent_cfg.get("persist_hypotheses")) or bool(
+        agent_cfg.get("debug_planner_payloads", False)
+    )
+    if not enabled:
+        return
+
+    path = Path(__file__).resolve().parent.parent / "hypothesis" / str(deps.session_id)
+    path.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# Pre-flight Validation",
+        "",
+        "## HTTP Response Checks",
+        "",
+        "| Workload | Status | Size | Time | Result |",
+        "|----------|--------|------|------|--------|",
+    ]
+    for name, result in url_results.items():
+        status = result.get("status", "?")
+        size = result.get("size", "?")
+        time = result.get("time", "?")
+        ok = "OK" if status == "200" else "FAIL"
+        lines.append(f"| {name} | {status} | {size} | {time}s | {ok} |")
+
+    lines.extend(["", "## System Diagnostics", ""])
+
+    diag_items = [
+        ("SELinux Mode", "selinux_mode"),
+        ("SELinux Denials", "selinux_denials"),
+        ("File Labels", "file_labels"),
+        ("Stress Data Labels", "stress_data_labels"),
+        ("Nginx Config Test", "nginx_test"),
+        ("Nginx Error Log", "nginx_error_log"),
+        ("Iptables Rules", "iptables_rules"),
+        ("Nftables Rules", "nftables_rules"),
+        ("Traffic Control", "tc_rules"),
+        ("Nginx Nice/Priority", "nginx_nice"),
+        ("Nginx Cgroup CPU", "nginx_cgroup_cpu"),
+        ("Nginx Service Limits", "nginx_service_limits"),
+        ("Top CPU Processes", "top_cpu_procs"),
+        ("Swap Usage", "swap_usage"),
+        ("MTU", "mtu"),
+        ("NIC Offload", "nic_offload"),
+        ("CPU Governor", "cpu_governor"),
+        ("Document Root", "document_root"),
+    ]
+    for label, key in diag_items:
+        val = diag.get(key, "")
+        if val:
+            lines.append(f"### {label}")
+            lines.append(f"```\n{val[:500]}\n```")
+            lines.append("")
+
+    if problems:
+        lines.extend(["## Problems Detected", ""])
+        for p in problems:
+            lines.append(f"- {p}")
+        lines.append("")
+    else:
+        lines.extend(["## Result", "", "All workloads return HTTP 200 — no issues found.", ""])
+
+    target = path / "00_preflight.md"
+    target.write_text("\n".join(lines), encoding="utf-8")
+
+
+async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
+    """Pre-flight validation agent: verify DUT serves all workloads correctly.
+
+    Runs before baseline benchmarks. Detects misconfigurations that would
+    produce invalid baselines (403s, connection refused, wrong content).
+    Uses LLM to diagnose and fix issues found.
+    """
+    ssh = deps.ssh
+    cfg = deps.config
+    host = cfg["target"].get("host", "localhost")
+    tool_call("preflight", "verifying DUT serves all workloads correctly")
+
+    # ── Collect diagnostics from DUT ────────────────────────────────
+    diag: dict[str, Any] = {}
+
+    # 1. HTTP response check — curl each workload type
+    test_urls = {
+        "homepage": f"http://{host}/",
+        "small": f"http://{host}/stress_test_data/small/000/000/file_000000000.html",
+        "medium": f"http://{host}/stress_test_data/medium/000/000/file_000000000.html",
+        "large": f"http://{host}/stress_test_data/large/000/000/file_000000000.html",
+    }
+    # Discover actual document root and test files
+    docroot_r = ssh.execute(
+        "nginx -T 2>/dev/null | grep -E '^\\s*root ' | head -1 | awk '{print $2}' | tr -d ';'"
+    )
+    docroot = docroot_r.stdout.strip() or "/var/www/nginx"
+    diag["document_root"] = docroot
+
+    url_results: dict[str, dict[str, Any]] = {}
+    for name, url in test_urls.items():
+        r = ssh.execute(
+            f"curl -s -o /dev/null -w '%{{http_code}} %{{size_download}} %{{time_total}}'"
+            f" {url} 2>&1"
+        )
+        parts = r.stdout.strip().split()
+        status = parts[0] if parts else "000"
+        size = parts[1] if len(parts) > 1 else "0"
+        time = parts[2] if len(parts) > 2 else "0"
+        url_results[name] = {"status": status, "size": size, "time": time}
+    diag["url_checks"] = url_results
+
+    # Helper: run SSH with 5s timeout — all commands finish in <1s normally
+    def _q(cmd: str) -> str:
+        return ssh.execute(cmd, timeout=5).stdout.strip()
+
+    # 2. SELinux state and AVC denials
+    diag["selinux_mode"] = _q("getenforce 2>/dev/null")
+    diag["selinux_denials"] = _q("timeout 5 ausearch -m avc -ts recent 2>/dev/null | tail -20")[
+        :2000
+    ]
+
+    # 3. File permissions and SELinux labels
+    diag["file_labels"] = _q(f"ls -laZ {docroot}/ 2>/dev/null | head -10")
+    if "stress_test_data" in _q(f"ls {docroot}/ 2>/dev/null"):
+        diag["stress_data_labels"] = _q(
+            f"ls -laZ {docroot}/stress_test_data/small/000/000/ 2>/dev/null | head -5"
+        )
+
+    # 4. Nginx config validation
+    diag["nginx_test"] = _q("nginx -t 2>&1")
+    diag["nginx_error_log"] = _q("tail -20 /var/log/nginx/error.log 2>/dev/null")[:1000]
+
+    # 5. Firewall / traffic control rules
+    diag["iptables_rules"] = _q(
+        "timeout 5 iptables -L -n 2>/dev/null | grep -v '^Chain\\|^target\\|^$' | head -20"
+    )
+    diag["nftables_rules"] = _q(
+        "timeout 5 nft list ruleset 2>/dev/null | grep -E 'drop|reject|limit' | head -10"
+    )
+    diag["tc_rules"] = _q("tc qdisc show 2>/dev/null | grep -v 'noqueue\\|pfifo_fast' | head -10")
+
+    # 6. Process-level throttling
+    diag["nginx_nice"] = _q("ps -o pid,ni,cls,rtprio,comm -C nginx | head -5")
+    diag["nginx_cgroup_cpu"] = _q(
+        "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null"
+        " || cat /sys/fs/cgroup/cpu/system.slice/nginx.service/"
+        "cpu.cfs_quota_us 2>/dev/null || echo 'no cgroup throttle'"
+    )
+    diag["nginx_service_limits"] = _q(
+        "systemctl show nginx.service 2>/dev/null"
+        " | grep -E 'LimitNOFILE|LimitMEMLOCK|CPUQuota|MemoryLimit'"
+    )
+
+    # 7. Background resource hogs
+    diag["top_cpu_procs"] = _q("ps aux --sort=-%cpu | head -10")
+    diag["swap_usage"] = _q("free -m | grep Swap")
+
+    # 8. Network interface checks
+    diag["mtu"] = _q(
+        "ip link show $(ip route get 1 | awk '{print $5; exit}') 2>/dev/null | grep mtu"
+    )
+    diag["nic_offload"] = _q(
+        "ethtool -k $(ip route get 1 | awk '{print $5; exit}')"
+        " 2>/dev/null"
+        " | grep -E 'tcp-segmentation|generic-segmentation"
+        "|generic-receive'"
+    )
+
+    # 9. CPU governor
+    diag["cpu_governor"] = _q(
+        "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null"
+    )
+
+    # ── Check if there are problems ─────────────────────────────────
+    problems = []
+    for name, result in url_results.items():
+        if result["status"] != "200":
+            problems.append(f"{name}: HTTP {result['status']} (expected 200)")
+
+    # Save preflight diagnostics to hypothesis folder
+    _save_preflight_hypothesis(deps, diag, url_results, problems)
+
+    if not problems:
+        tool_result("preflight", "all workloads return HTTP 200 — OK")
+        deps.memory.save_context(
+            deps.session_id,
+            "command_output",
+            "preflight_validation",
+            json.dumps({"status": "ok", "checks": diag}),
+            "preflight: all workloads serve correctly",
+        )
+        return {"status": "ok", "problems": [], "fixes": [], "diagnostics": diag}
+
+    # ── Problems found — ask LLM to diagnose and fix ────────────────
+    tool_result(
+        "preflight",
+        f"PROBLEMS: {'; '.join(problems)}",
+    )
+
+    preflight_prompt = (
+        "You are a RHEL system administrator. The DUT (device under test) "
+        "is failing to serve some workload URLs correctly. "
+        "Diagnose the root cause and provide exact shell commands to fix it.\n\n"
+        "Return strict JSON with keys:\n"
+        '- "diagnosis": one-sentence root cause\n'
+        '- "fixes": list of shell commands to run on the DUT to fix the issue\n\n'
+        "Problems detected:\n"
+        + "\n".join(f"  - {p}" for p in problems)
+        + "\n\nDiagnostics collected from DUT:\n"
+        + json.dumps(diag, indent=2, ensure_ascii=False)[:6000]
+    )
+
+    fix_plan, fix_usage = _invoke_json_planner(
+        model, "planner.preflight_fix", preflight_prompt, deps
+    )
+    tool_result(
+        "preflight",
+        f"diagnosis: {fix_plan.get('diagnosis', 'unknown')}",
+    )
+
+    deps.token_counter.input_tokens += fix_usage["input_tokens"]
+    deps.token_counter.output_tokens += fix_usage["output_tokens"]
+
+    # Apply fixes
+    fixes_applied = []
+    fix_commands = fix_plan.get("fixes", [])
+    if isinstance(fix_commands, list):
+        for cmd in fix_commands:
+            cmd_str = str(cmd).strip()
+            if not cmd_str or cmd_str.startswith("#"):
+                continue
+            tool_call("preflight_fix", cmd_str[:100])
+            cmd_result = ssh.execute(cmd_str, timeout=120)
+            fixes_applied.append(
+                {
+                    "command": cmd_str,
+                    "ok": cmd_result.ok,
+                    "output": cmd_result.stdout.strip()[:200],
+                }
+            )
+
+    # Re-verify after fixes
+    recheck: dict[str, str] = {}
+    remaining_problems = []
+    for name, url in test_urls.items():
+        r = ssh.execute(f"curl -s -o /dev/null -w '%{{http_code}}' {url} 2>&1")
+        status = r.stdout.strip()
+        recheck[name] = status
+        if status != "200":
+            remaining_problems.append(f"{name}: still HTTP {status}")
+
+    if remaining_problems:
+        tool_result(
+            "preflight",
+            f"STILL FAILING after fixes: {'; '.join(remaining_problems)}",
+        )
+    else:
+        tool_result("preflight", "all workloads now return HTTP 200 — fixed")
+
+    # Persist results
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, "preflight_fix", fix_plan, iteration=_iter)
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        "preflight_validation",
+        json.dumps(
+            {
+                "status": "fixed" if not remaining_problems else "partial",
+                "problems": problems,
+                "diagnosis": fix_plan.get("diagnosis", ""),
+                "fixes_applied": fixes_applied,
+                "recheck": recheck,
+                "remaining": remaining_problems,
+            }
+        ),
+        f"preflight: {len(problems)} problems, "
+        f"{len(fixes_applied)} fixes, "
+        f"{len(remaining_problems)} remaining",
+    )
+
+    return {
+        "status": "fixed" if not remaining_problems else "partial",
+        "problems": problems,
+        "fixes": fixes_applied,
+        "diagnostics": diag,
+    }
 
 
 async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
-    """Run the single agent with full context."""
+    """Run the diagnosis workflow and derive the final structured result in Python."""
     llm_call("agent", "Starting diagnosis — sending context to LLM...")
-    agent = build(model)
-    result = await agent.run(context_prompt, deps=deps)
-    _attribute_tool_tokens(result, deps.token_counter)
-    inp, out = deps.token_counter.add(result.usage())
+    agent = build(model, config=getattr(deps, "config", None))
+    state = getattr(agent, "_slaymetrics_state", {})
+    config = getattr(deps, "config", {}) or {}
+    planner_mode = str((config.get("agent") or {}).get("planner_mode", "debate")).strip().lower()
+    if planner_mode == "debate":
+        result = await _run_debate_planner(agent, model, deps, context_prompt, state)
+    else:
+        result = await agent.run(context_prompt, deps=deps)
+    apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
+    max_phase = int((config.get("agent") or {}).get("max_phase", 4))
+    if callable(apply_from_recommendations) and max_phase >= 4:
+        apply_from_recommendations(deps)
+    inp, out = result.usage().input_tokens or 0, result.usage().output_tokens or 0
+    deps.token_counter.input_tokens += int(inp)
+    deps.token_counter.output_tokens += int(out)
+    deps.token_counter.tool_calls += 1
     llm_call("agent", f"LLM finished — {inp:,} in / {out:,} out tokens")
     tokens("agent", inp, out, deps.token_counter.summary())
+
     rows = deps.token_counter.tool_token_rows()
     if rows:
         top = ", ".join(
-            f"{r['tool']}={r['total_tokens']:,}t/{r['calls']}c"
-            for r in sorted(rows, key=lambda x: x["total_tokens"], reverse=True)[:5]
+            f"{row['tool']}={row['total_tokens']:,}t/{row['calls']}c"
+            for row in sorted(rows, key=lambda item: item["total_tokens"], reverse=True)[:5]
         )
         log("agent", f"Tool token attribution: {top}", "result")
-    return result.output
 
-
-def _attribute_tool_tokens(run_result: Any, token_counter: TokenCounter) -> None:
-    """Approximate per-tool token attribution from model message usage deltas."""
     try:
-        messages = run_result.all_messages()
+        profile = deps.memory.get_profile(deps.session_id) or {}
     except Exception:
-        return
+        profile = {}
 
-    pending_post_tools: list[str] = []
-    for msg in messages:
-        usage = getattr(msg, "usage", None)
-        parts = getattr(msg, "parts", None) or []
-
-        tool_names = [p.tool_name for p in parts if getattr(p, "part_kind", "") == "tool-call"]
-
-        if usage and pending_post_tools and not tool_names:
-            _distribute_usage(
-                token_counter,
-                pending_post_tools,
-                int(usage.input_tokens or 0),
-                int(usage.output_tokens or 0),
-                phase="post",
-            )
-            pending_post_tools = []
-
-        if usage and tool_names:
-            _distribute_usage(
-                token_counter,
-                tool_names,
-                int(usage.input_tokens or 0),
-                int(usage.output_tokens or 0),
-                phase="call",
-            )
-            pending_post_tools = list(tool_names)
-
-
-def _distribute_usage(
-    token_counter: TokenCounter,
-    tool_names: list[str],
-    input_tokens: int,
-    output_tokens: int,
-    phase: str,
-) -> None:
-    n = len(tool_names)
-    if n == 0:
-        return
-    in_base, in_rem = divmod(max(0, input_tokens), n)
-    out_base, out_rem = divmod(max(0, output_tokens), n)
-    for i, name in enumerate(tool_names):
-        in_part = in_base + (1 if i < in_rem else 0)
-        out_part = out_base + (1 if i < out_rem else 0)
-        if phase == "call":
-            token_counter.add_tool_tokens(name, calls=1, call_input=in_part, call_output=out_part)
+    baseline_rps = float(profile.get("baseline_rps") or 0.0)
+    after_rps = float(state.get("after_rps") or 0.0)
+    improvement_pct = ((after_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
+    notes = str(result.output).strip()
+    if not notes:
+        findings = state.get("findings") or []
+        if findings:
+            params = ", ".join(str(finding.get("parameter", "unknown")) for finding in findings[:4])
+            notes = f"Applied findings: {params}."
         else:
-            token_counter.add_tool_tokens(name, post_input=in_part, post_output=out_part)
+            notes = "Diagnosis completed."
+    guardrail_failure = str(state.get("guardrail_failure") or "").strip()
+    if guardrail_failure:
+        notes = f"{notes} Guardrail: {guardrail_failure}"
+
+    return DiagnosisOutput(
+        nginx_applied=bool(state.get("nginx_applied", False)),
+        system_applied=bool(state.get("system_applied", False)),
+        after_rps=after_rps,
+        improvement_pct=improvement_pct,
+        notes=notes,
+        rca_records=list(state.get("rca_records") or []),
+        recommendations=list(state.get("recommendations") or []),
+    )
+
+
+async def _run_debate_planner(
+    agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None
+):
+    ctx = SimpleNamespace(deps=deps)
+    save_rca = agent._function_toolset.tools["save_rca"].function
+    save_recommendations = agent._function_toolset.tools["save_recommendations"].function
+
+    # Compound inspect: all 5 categories in one call
+    from agents.tools_inspect import inspect_all
+
+    tool_call("inspect", "compound inspect — all 5 categories")
+    all_inspection = inspect_all(deps.ssh, deps.config)
+    tool_result(
+        "inspect",
+        f"issues: {all_inspection.get('summary', {}).get('total_issues', 0)} "
+        f"({json.dumps(all_inspection.get('summary', {}).get('by_category', {}))}) ",
+    )
+    deps.token_counter.tool_calls += 1
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        "compound_inspection",
+        json.dumps(all_inspection, ensure_ascii=True)[:8000],
+        f"compound inspect: {all_inspection.get('summary', {}).get('total_issues', 0)} issues",
+    )
+
+    # Save to state for later use
+    if agent_state is not None:
+        agent_state["inspection"] = all_inspection
+
+    # Split inspection data for the two experts
+    webserver_data = all_inspection.get("webserver", {})
+    kernel_data = all_inspection.get("kernel", {})
+    resource_data = all_inspection.get("resource_limits", {})
+    network_data = all_inspection.get("network", {})
+    storage_data = all_inspection.get("storage", {})
+
+    nginx_prompt = (
+        "You are an NGINX/webserver performance expert. "
+        "Review the webserver inspection evidence. "
+        "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
+        f"Shared Context:\n{context_prompt}\n\n"
+        f"Webserver Inspection:\n{json.dumps(webserver_data, ensure_ascii=True)}"
+    )
+    rhel_prompt = (
+        "You are a RHEL Linux performance expert. "
+        "Review kernel, resource limits, network, and storage evidence. "
+        "Return strict JSON with keys summary, rca_records, recommendations, counterpoints.\n\n"
+        f"Shared Context:\n{context_prompt}\n\n"
+        f"Kernel Inspection:\n{json.dumps(kernel_data, ensure_ascii=True)}\n\n"
+        f"Resource Limits:\n{json.dumps(resource_data, ensure_ascii=True)}\n\n"
+        f"Network:\n{json.dumps(network_data, ensure_ascii=True)}\n\n"
+        f"Storage:\n{json.dumps(storage_data, ensure_ascii=True)}"
+    )
+
+    (nginx_analysis, nginx_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
+        asyncio.to_thread(_invoke_json_planner, model, "planner.nginx_expert", nginx_prompt, deps),
+        asyncio.to_thread(_invoke_json_planner, model, "planner.rhel_expert", rhel_prompt, deps),
+    )
+    if _planner_debug_enabled(deps):
+        tool_result(
+            "debug",
+            f"nginx_expert raw: {json.dumps(nginx_analysis, ensure_ascii=False)}",
+        )
+        tool_result(
+            "debug",
+            f"rhel_expert raw: {json.dumps(rhel_analysis, ensure_ascii=False)}",
+        )
+
+    synth_prompt = (
+        "You are the synthesis arbiter between an NGINX expert "
+        "and a RHEL Linux performance expert. "
+        "Merge their outputs into one final plan. "
+        "Keep only grounded recommendations supported by evidence. "
+        "Prefer nginx fixes first, system fixes second, IRQ fixes only if clearly justified. "
+        "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
+        f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
+        f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
+    )
+    synthesis, synth_usage = _invoke_json_planner(model, "planner.synthesizer", synth_prompt, deps)
+    if _planner_debug_enabled(deps):
+        tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=False)}")
+
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, "nginx_expert", nginx_analysis, iteration=_iter)
+    _save_planner_artifact(deps, "rhel_expert", rhel_analysis, iteration=_iter)
+    _save_planner_artifact(deps, "synthesizer", synthesis, iteration=_iter)
+
+    rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
+    recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)
+    if rca_records:
+        await save_rca(ctx, rca_records)
+    if recommendations:
+        await save_recommendations(ctx, recommendations)
+
+    # ── 4th agent: apply_planner ─────────────────────────────────────
+    # Group all recommendations into 5 categories matching our tools.
+    _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
+    _web_tgt = _tuning.get("webserver_targets") or {}
+    _kern_tgt = _tuning.get("kernel_targets") or {}
+    _res_tgt = _tuning.get("resource_limits_targets") or {}
+    _net_tgt = _tuning.get("network_targets") or {}
+    _stor_tgt = _tuning.get("storage_targets") or {}
+    apply_prompt = (
+        "You are a performance tuning executor. "
+        "Given the synthesizer's recommendations, produce a JSON object "
+        "with exactly 5 keys — one per category. "
+        "Only use allowed parameter names listed below.\n\n"
+        '1. "webserver" — nginx config directives.\n'
+        f"   Allowed: {', '.join(sorted(_web_tgt))}\n"
+        f"   Defaults: {json.dumps(_web_tgt)}\n\n"
+        '2. "kernel" — sysctl, THP, SELinux, CPU governor, IRQ.\n'
+        f"   Allowed: {', '.join(sorted(_kern_tgt))}\n"
+        f"   Defaults: {json.dumps(_kern_tgt)}\n\n"
+        '3. "resource_limits" — cgroup, systemd limits, background processes.\n'
+        f"   Allowed: {', '.join(sorted(_res_tgt))}\n"
+        f"   Defaults: {json.dumps(_res_tgt)}\n\n"
+        '4. "network" — iptables, conntrack, tc rules.\n'
+        f"   Allowed: {', '.join(sorted(_net_tgt))}\n"
+        f"   Defaults: {json.dumps(_net_tgt)}\n\n"
+        '5. "storage" — I/O scheduler, readahead, I/O hogs.\n'
+        f"   Allowed: {', '.join(sorted(_stor_tgt))}\n"
+        f"   Defaults: {json.dumps(_stor_tgt)}\n\n"
+        "Rules:\n"
+        "- Include parameters the synthesizer recommends AND any "
+        "problems detected in the inspection below\n"
+        "- Values must be clean (no comments, no semicolons)\n"
+        "- Use defaults if a param is mentioned without a value\n"
+        "- Empty categories should be empty dicts {}\n"
+        "- CRITICAL: if inspection shows cgroup CPU/memory caps or "
+        "systemd LimitNOFILE too low, include resource_limits fixes\n\n"
+        "Synthesizer recommendations:\n"
+        f"{json.dumps(synthesis.get('recommendations', []), ensure_ascii=True)}\n\n"
+        "Inspection problems detected (also fix these):\n"
+        f"resource_limits: {json.dumps(resource_data.get('problems', []))}\n"
+        f"network: {json.dumps(network_data.get('problems', []))}\n"
+        f"storage: {json.dumps(storage_data.get('problems', []))}"
+    )
+    apply_plan, apply_usage = _invoke_json_planner(
+        model, "planner.apply_planner", apply_prompt, deps
+    )
+    # Always log apply_planner output — this is the critical translation step
+    categories = ["webserver", "kernel", "resource_limits", "network", "storage"]
+    plan_summary = {cat: list((apply_plan.get(cat) or {}).keys()) for cat in categories}
+    tool_call(
+        "apply_planner",
+        " | ".join(f"{c}={len(v)}" for c, v in plan_summary.items() if v),
+    )
+    if _planner_debug_enabled(deps):
+        tool_result(
+            "debug",
+            f"apply_planner raw: {json.dumps(apply_plan, ensure_ascii=False)}",
+        )
+    _save_planner_artifact(deps, "apply_planner", apply_plan, iteration=_iter)
+
+    # Store the grouped changes for apply_saved_recommendations_impl
+    if agent_state is not None:
+        agent_state["apply_plan"] = apply_plan
+
+    total_in = (
+        nginx_usage["input_tokens"]
+        + rhel_usage["input_tokens"]
+        + synth_usage["input_tokens"]
+        + apply_usage["input_tokens"]
+    )
+    total_out = (
+        nginx_usage["output_tokens"]
+        + rhel_usage["output_tokens"]
+        + synth_usage["output_tokens"]
+        + apply_usage["output_tokens"]
+    )
+    return SimpleNamespace(
+        output=str(synthesis.get("summary") or "Debate planning completed.").strip(),
+        usage=lambda: SimpleNamespace(input_tokens=total_in, output_tokens=total_out),
+        all_messages=lambda: [],
+    )
+
+
+@contextmanager
+def _null_generation():
+    yield None
+
+
+def _resolve_model_name(model: Any) -> str:
+    for attr in ("model_name", "model", "_model", "model_id"):
+        value = getattr(model, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return model.__class__.__name__
+
+
+def _invoke_json_planner(
+    model, name: str, prompt: str, deps: AgentDeps | None = None
+) -> tuple[dict[str, Any], dict[str, int]]:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    messages = [
+        SystemMessage(
+            content=(
+                f"You are {name}. Return JSON only. No markdown fences. "
+                "If unsure, return empty arrays instead of prose."
+            )
+        ),
+        HumanMessage(content=prompt),
+    ]
+    langfuse = getattr(deps, "langfuse", None) if deps else None
+    with (
+        langfuse.generation(
+            name,
+            model=_resolve_model_name(model),
+            input={"messages": summarize_messages(messages)},
+            metadata={
+                "planner_name": name,
+                "session_id": getattr(deps, "session_id", ""),
+                "planner_mode": "debate",
+            },
+            model_parameters={"temperature": 0},
+        )
+        if langfuse
+        else _null_generation()
+    ):
+        response = model.invoke(messages)
+    text = _extract_final_text([response])
+    payload = _extract_json_dict(text)
+    usage = getattr(response, "usage_metadata", None) or {}
+    if langfuse:
+        langfuse.update_generation(
+            output={"text": text[:4000], "payload": payload},
+            usage_details={
+                "prompt_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(
+                    usage.get("output_tokens") or usage.get("completion_tokens") or 0
+                ),
+            },
+        )
+    return payload, {
+        "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+    }
+
+
+def _extract_json_dict(text: str) -> dict[str, Any]:
+    if not text:
+        return {}
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if "\n" in candidate:
+            candidate = candidate.split("\n", 1)[1]
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    candidate = candidate[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _planner_debug_enabled(deps: AgentDeps) -> bool:
+    cfg = getattr(deps, "config", {}) or {}
+    return bool((cfg.get("agent") or {}).get("debug_planner_payloads", False))
+
+
+def _sanitize_debug_text(value: str, limit: int = 4000) -> str:
+    text = unicodedata.normalize("NFKC", value)
+    text = text.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+    text = text.replace("\u202f", " ").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = f"{text[: limit - 3]}..."
+    return text
+
+
+def _coerce_records(value: Any, deps: AgentDeps | None = None) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for idx, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            if deps and _planner_debug_enabled(deps):
+                tool_result("debug", f"synthesized rca_{idx} dropped: non-dict item {item!r}")
+            continue
+        issue = str(item.get("issue", "")).strip()
+        cause = str(item.get("cause", "")).strip()
+        description = str(item.get("description", "")).strip()
+        impact = str(item.get("impact", "")).strip()
+        symptom = str(item.get("symptom", "")).strip() or issue or cause or description
+        root_cause = str(item.get("root_cause", "")).strip()
+        if not root_cause:
+            if impact:
+                root_cause = impact
+            else:
+                root_cause = cause or description
+        recommendation = str(item.get("recommendation", "")).strip()
+        if not recommendation:
+            recommendation = impact or "no recommendation"
+        if not symptom or not root_cause:
+            if deps and _planner_debug_enabled(deps):
+                tool_result(
+                    "debug",
+                    (
+                        f"synthesized rca_{idx} dropped: missing required fields "
+                        f"raw={json.dumps(item, ensure_ascii=True)[:500]}"
+                    ),
+                )
+            continue
+        records.append(
+            {
+                "symptom": symptom,
+                "root_cause": root_cause,
+                "confidence": _coerce_float(item.get("confidence", 0.0)),
+                "recommendation": recommendation or "no recommendation",
+                "evidence": item.get("evidence", []),
+            }
+        )
+    return records
+
+
+def _coerce_recommendations(value: Any, deps: AgentDeps | None = None) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    recommendations: list[dict[str, Any]] = []
+    for idx, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            if deps and _planner_debug_enabled(deps):
+                tool_result(
+                    "debug",
+                    f"synthesized recommendation_{idx} dropped: non-dict item {item!r}",
+                )
+            continue
+        normalized_item = _normalize_synthesized_recommendation(item)
+        changes = normalized_item.get("changes", {})
+        if not isinstance(changes, dict) or not changes:
+            if deps and _planner_debug_enabled(deps):
+                tool_result(
+                    "debug",
+                    (
+                        f"synthesized recommendation_{idx} dropped: empty/invalid changes "
+                        f"raw={json.dumps(item, ensure_ascii=True)[:500]}"
+                    ),
+                )
+            continue
+        recommendations.append(
+            {
+                "title": str(normalized_item.get("title", "")).strip() or f"recommendation_{idx}",
+                "recommendation": str(normalized_item.get("recommendation", "")).strip()
+                or "no recommendation",
+                "rationale": str(normalized_item.get("rationale", "")).strip() or "no rationale",
+                "expected_benefit": str(normalized_item.get("expected_benefit", "")).strip()
+                or "no expected benefit",
+                "risk_level": str(normalized_item.get("risk_level", "medium")).strip().lower()
+                or "medium",
+                "validation": str(normalized_item.get("validation", "")).strip()
+                or "manual verification required",
+                "scope": str(normalized_item.get("scope", "nginx")).strip().lower() or "nginx",
+                "changes": changes,
+            }
+        )
+    return recommendations
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Strip trailing '# comment' and ';' from a directive value."""
+    # Remove inline comments: "auto; # resolves to 112" -> "auto"
+    idx = value.find("#")
+    if idx > 0:
+        value = value[:idx]
+    return value.strip().rstrip(";").strip()
+
+
+def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(item)
+    changes = item.get("changes")
+    if isinstance(changes, dict) and changes:
+        return normalized
+
+    rec_type = str(item.get("type", "")).strip().lower()
+    if rec_type in {"nginx", "system", "irq"}:
+        normalized["scope"] = "system" if rec_type in {"system", "irq"} else "nginx"
+
+    setting = item.get("setting")
+    value = item.get("value")
+    if isinstance(setting, list) and isinstance(value, list) and len(setting) == len(value):
+        normalized["changes"] = {
+            str(k): _strip_inline_comment(str(v)) for k, v in zip(setting, value)
+        }
+        normalized["title"] = (
+            normalized.get("title") or str(item.get("description", "")).strip() or "batch setting"
+        )
+        normalized["recommendation"] = (
+            normalized.get("recommendation")
+            or str(item.get("description", "")).strip()
+            or "apply configuration changes"
+        )
+        normalized["rationale"] = (
+            normalized.get("rationale") or normalized.get("justification") or ""
+        )
+        return normalized
+
+    if setting and value not in (None, ""):
+        normalized["changes"] = {str(setting): _strip_inline_comment(str(value))}
+        normalized["title"] = (
+            normalized.get("title") or str(item.get("description", "")).strip() or f"Set {setting}"
+        )
+        normalized["recommendation"] = (
+            normalized.get("recommendation")
+            or str(item.get("description", "")).strip()
+            or f"Set {setting} to {value}"
+        )
+        normalized["rationale"] = (
+            normalized.get("rationale") or normalized.get("justification") or ""
+        )
+        return normalized
+
+    directive_raw = item.get("directive")
+    value = item.get("value")
+
+    # Parse directive(s) into changes — handles both string and list forms
+    directive_changes: dict[str, str] = {}
+    directives = (
+        directive_raw
+        if isinstance(directive_raw, list)
+        else [directive_raw]
+        if isinstance(directive_raw, str) and directive_raw.strip()
+        else []
+    )
+    for d in directives:
+        d_str = str(d).strip().rstrip(";").strip()
+        if not d_str:
+            continue
+        if value not in (None, ""):
+            # Explicit value provided separately
+            directive_changes[d_str] = _strip_inline_comment(str(value))
+        else:
+            # Parse "directive_name value" from the string itself
+            parts = d_str.split(None, 1)
+            if len(parts) == 2:
+                directive_changes[parts[0]] = _strip_inline_comment(parts[1].rstrip(";").strip())
+            elif len(parts) == 1:
+                # Single word like "on" or "off" — can't determine key/value
+                pass
+    if directive_changes:
+        normalized["scope"] = normalized.get("scope") or "nginx"
+        normalized["changes"] = directive_changes
+        normalized["title"] = (
+            normalized.get("title")
+            or str(item.get("action", "")).strip()
+            or f"Set {', '.join(directive_changes)}"
+        )
+        normalized["recommendation"] = (
+            normalized.get("recommendation")
+            or str(item.get("action", "")).strip()
+            or f"Apply directives: {', '.join(directive_changes)}"
+        )
+        normalized["rationale"] = (
+            normalized.get("rationale") or normalized.get("justification") or ""
+        )
+        return normalized
+
+    # Try config_snippet — synthesizer sometimes puts nginx directives here
+    snippet = str(item.get("config_snippet", "")).strip()
+    if snippet:
+        snippet_changes: dict[str, str] = {}
+        for line in snippet.replace("\\n", "\n").splitlines():
+            line = line.strip().rstrip(";").strip()
+            if not line or line.startswith("#"):
+                continue
+            # Extract backlog=N from listen lines
+            if line.startswith("listen "):
+                backlog_m = re.search(r"backlog=(\d+)", line)
+                if backlog_m:
+                    snippet_changes["listen_backlog"] = backlog_m.group(1)
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                snippet_changes[parts[0]] = _strip_inline_comment(parts[1].rstrip(";").strip())
+        if snippet_changes:
+            normalized["scope"] = normalized.get("scope") or "nginx"
+            normalized["changes"] = snippet_changes
+            normalized["title"] = (
+                normalized.get("title") or str(item.get("action", "")).strip() or "apply config"
+            )
+            normalized["recommendation"] = (
+                normalized.get("recommendation") or str(item.get("action", "")).strip() or snippet
+            )
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
+
+    action = str(item.get("action", "")).strip().rstrip(";")
+    if action:
+        action_changes = _extract_changes_from_action(action, normalized.get("scope", ""))
+        if action_changes:
+            normalized["changes"] = action_changes
+            normalized["title"] = normalized.get("title") or action or "apply tuning"
+            normalized["recommendation"] = normalized.get("recommendation") or action
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
+
+    command = item.get("command")
+    if isinstance(command, str) and command.strip():
+        extracted = _extract_changes_from_commands([command])
+        if extracted:
+            normalized["scope"] = normalized.get("scope") or "system"
+            normalized["changes"] = extracted
+            normalized["title"] = normalized.get("title") or action or "system tuning"
+            normalized["recommendation"] = normalized.get("recommendation") or action or command
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
+
+    commands = item.get("commands")
+    if isinstance(commands, list) and commands:
+        extracted = _extract_changes_from_commands(commands)
+        if extracted:
+            normalized["scope"] = normalized.get("scope") or "system"
+            normalized["changes"] = extracted
+            normalized["title"] = (
+                normalized.get("title") or str(item.get("action", "")).strip() or "system tuning"
+            )
+            normalized["recommendation"] = (
+                normalized.get("recommendation")
+                or str(item.get("action", "")).strip()
+                or "apply system tuning"
+            )
+            normalized["rationale"] = (
+                normalized.get("rationale") or normalized.get("justification") or ""
+            )
+            return normalized
+
+    return normalized
+
+
+def _extract_changes_from_action(action: str, scope: str) -> dict[str, str]:
+    extracted: dict[str, str] = {}
+    nginx_match = re.match(
+        r"(?i)(?:set|enable|disable|configure|reduce)\s+([A-Za-z0-9_]+)\s*(.*)$", action
+    )
+    if nginx_match and (not scope or scope == "nginx"):
+        key = nginx_match.group(1).strip()
+        remainder = nginx_match.group(2).strip().strip(";")
+        lowered = action.lower()
+        if key and remainder:
+            value = remainder
+            if key == "aio" and value.lower() == "threads":
+                extracted[key] = "threads"
+            else:
+                extracted[key] = value
+        elif key and "disable" in lowered:
+            extracted[key] = "off"
+        elif key and "enable" in lowered:
+            extracted[key] = "on"
+        elif key == "worker_cpu_affinity" and "auto" in lowered:
+            extracted[key] = "auto"
+        return extracted
+
+    return extracted
+
+
+def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:
+    extracted: dict[str, str] = {}
+    for raw_command in commands:
+        command = str(raw_command).strip()
+        if not command:
+            continue
+
+        if "sysctl" in command and "-w" in command:
+            # Extract all key=value pairs from multi-param sysctl commands
+            sysctl_pairs = re.findall(r"([A-Za-z0-9_.]+)=('[^']*'|\"[^\"]*\"|[^\s]+)", command)
+            if sysctl_pairs:
+                for key, value in sysctl_pairs:
+                    extracted[key] = value.strip().strip('"').strip("'")
+                continue
+
+        if "transparent_hugepage/enabled" in command and "echo never" in command:
+            extracted["transparent_hugepage"] = "never"
+            continue
+
+        if command.startswith("setenforce "):
+            mode = command.split(None, 1)[1].strip()
+            extracted["selinux"] = "permissive" if mode in {"0", "permissive"} else "enforcing"
+            continue
+
+        if "tcp_tw_reuse" in command and "sysctl -w" in command:
+            tw_match = re.search(r"tcp_tw_reuse=(.+)$", command)
+            if tw_match:
+                extracted["net.ipv4.tcp_tw_reuse"] = tw_match.group(1).strip().strip('"').strip("'")
+            continue
+
+        ulimit_match = re.search(r"ulimit\s+-n\s+(\d+)", command)
+        if ulimit_match:
+            extracted["nofile"] = ulimit_match.group(1)
+            continue
+
+        nofile_match = re.search(r"nofile\s+(\d+)", command)
+        if nofile_match and "limits.conf" in command and "soft" in command:
+            extracted["nofile"] = nofile_match.group(1)
+            continue
+
+        if "irqbalance" in command and any(v in command for v in ("enable", "start")):
+            extracted["irqbalance"] = "enabled"
+            continue
+
+    return extracted
+
+
+def _save_planner_artifact(
+    deps: AgentDeps,
+    source: str,
+    payload: dict[str, Any],
+    iteration: int = 0,
+) -> None:
+    iter_label = f"iter{iteration}_{source}" if iteration else source
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        iter_label,
+        json.dumps(payload, ensure_ascii=True),
+        f"{iter_label} planner output",
+    )
+    file_map = {
+        "nginx_expert": "01_nginx_expert",
+        "rhel_expert": "02_rhel_expert",
+        "synthesizer": "03_synthesizer",
+        "apply_planner": "04_apply_planner",
+    }
+    base = file_map.get(source, source)
+    if iteration:
+        filename = f"iter{iteration}_{base}.md"
+    else:
+        filename = f"{base}.md"
+    _persist_hypothesis_markdown(
+        deps,
+        filename=filename,
+        title=f"{'Iter ' + str(iteration) + ' — ' if iteration else ''}"
+        f"{source.replace('_', ' ').title()}",
+        sections=[
+            ("Summary", str(payload.get("summary", "")).strip() or "No summary returned."),
+            ("Payload", _markdown_json(payload)),
+        ],
+    )
+
+
+def save_iteration_summary(
+    deps: AgentDeps,
+    *,
+    iteration: int,
+    baselines: dict[str, Any],
+    results: dict[str, Any],
+    regressions: list[str],
+    decision: str,
+    diagnosis: Any = None,
+) -> None:
+    """Save a complete iteration summary to the hypothesis folder."""
+    cfg = getattr(deps, "config", {}) or {}
+    agent_cfg = cfg.get("agent") or {}
+    enabled = bool(agent_cfg.get("persist_hypotheses")) or bool(
+        agent_cfg.get("debug_planner_payloads", False)
+    )
+    if not enabled:
+        return
+
+    path = Path(__file__).resolve().parent.parent / "hypothesis" / str(deps.session_id)
+    path.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        f"# Iteration {iteration} Summary",
+        "",
+        "## Benchmark Results",
+        "",
+        "| Workload | Baseline RPS | Current RPS | Change | p99 (ms) | Status |",
+        "|----------|-------------|-------------|--------|----------|--------|",
+    ]
+    for workload in ("homepage", "small", "medium", "large", "mixed"):
+        b_rps = float(baselines.get(workload, {}).get("rps", 0) or 0)
+        c_rps = float(results.get(workload, {}).get("rps", 0) or 0)
+        c_p99 = float(results.get(workload, {}).get("p99", 0) or 0)
+        if not b_rps and not c_rps:
+            continue
+        pct = ((c_rps - b_rps) / b_rps * 100) if b_rps else 0
+        status = "OK" if c_rps >= b_rps * 0.99 else "REGRESSED"
+        lines.append(
+            f"| {workload} | {b_rps:.0f} | {c_rps:.0f} | {pct:+.1f}% | {c_p99:.1f} | {status} |"
+        )
+
+    # Applied changes
+    lines.extend(["", "## Applied Changes", ""])
+    if diagnosis:
+        nginx_applied = getattr(diagnosis, "nginx_applied", False)
+        system_applied = getattr(diagnosis, "system_applied", False)
+        lines.append(f"- Nginx applied: {nginx_applied}")
+        lines.append(f"- System applied: {system_applied}")
+        recs = getattr(diagnosis, "recommendations", []) or []
+        if recs:
+            lines.append(f"- Recommendations count: {len(recs)}")
+            for r in recs[:20]:
+                title = r.get("title", r.get("action", "?"))
+                scope = r.get("scope", "?")
+                changes = r.get("changes", {})
+                lines.append(f"  - [{scope}] {title}: {changes}")
+
+    # Regressions
+    if regressions:
+        lines.extend(["", "## Regressions Detected", ""])
+        for r in regressions:
+            lines.append(f"- {r}")
+
+    # Decision
+    lines.extend(["", "## Decision", "", decision, ""])
+
+    target = path / f"iter{iteration}_00_summary.md"
+    target.write_text("\n".join(lines), encoding="utf-8")
+
+    # Also save to TiDB
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        f"iter{iteration}_summary",
+        json.dumps(
+            {
+                "iteration": iteration,
+                "baselines": {
+                    w: baselines.get(w, {}).get("rps", 0) for w in ("small", "medium", "large")
+                },
+                "results": {
+                    w: results.get(w, {}).get("rps", 0) for w in ("small", "medium", "large")
+                },
+                "regressions": regressions,
+                "decision": decision,
+            }
+        ),
+        f"iteration {iteration}: {decision}",
+    )
+
+
+def _hypothesis_enabled(deps: AgentDeps) -> bool:
+    cfg = getattr(deps, "config", {}) or {}
+    agent_cfg = cfg.get("agent") or {}
+    if "persist_hypotheses" in agent_cfg:
+        return bool(agent_cfg.get("persist_hypotheses"))
+    return bool(agent_cfg.get("debug_planner_payloads", False))
+
+
+def _hypothesis_dir(deps: AgentDeps) -> Path:
+    root = Path(__file__).resolve().parent.parent
+    return root / "hypothesis" / str(getattr(deps, "session_id", "unknown"))
+
+
+def _markdown_json(payload: Any) -> str:
+    return f"```json\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n```"
+
+
+def _persist_hypothesis_markdown(
+    deps: AgentDeps,
+    *,
+    filename: str,
+    title: str,
+    sections: list[tuple[str, str]],
+    append: bool = False,
+) -> None:
+    if not _hypothesis_enabled(deps):
+        return
+    path = _hypothesis_dir(deps)
+    path.mkdir(parents=True, exist_ok=True)
+    target = path / filename
+    chunks: list[str] = []
+    if not append or not target.exists():
+        chunks.append(f"# {title}")
+    for heading, body in sections:
+        chunks.append(f"## {heading}")
+        chunks.append(body)
+    text = "\n\n".join(chunks).strip() + "\n"
+    if append and target.exists():
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write("\n" + text)
+    else:
+        target.write_text(text, encoding="utf-8")
+
+
+def _extract_final_text(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(str(item.get("text", "")))
+            text = "".join(text_parts).strip()
+            if text:
+                return text
+    return ""
+
+
+def _coerce_float(value: Any) -> float:
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _coerce_notes(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
+
+
+def _aggregate_usage(messages: list[Any]) -> dict[str, int]:
+    input_tokens = 0
+    output_tokens = 0
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None) or {}
+        if not usage:
+            continue
+        input_tokens += int(
+            usage.get("input_tokens")
+            or usage.get("prompt_tokens")
+            or usage.get("input_token_count")
+            or 0
+        )
+        output_tokens += int(
+            usage.get("output_tokens")
+            or usage.get("completion_tokens")
+            or usage.get("output_token_count")
+            or 0
+        )
+    return {"input_tokens": input_tokens, "output_tokens": output_tokens}

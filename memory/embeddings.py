@@ -8,8 +8,8 @@ class EmbeddingProvider(Protocol):
     def embed(self, text: str) -> list[float]: ...
 
 
-class ClaudeEmbeddings:
-    """Uses Anthropic's embedding API."""
+class RemoteEmbeddings:
+    """OpenAI/Anthropic-style remote embedding client, kept for optional use."""
 
     def __init__(self, model: str = "voyage-3"):
         import anthropic

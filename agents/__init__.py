@@ -92,4 +92,10 @@ class AgentDeps:
     ssh: LocalClient | SSHClient
     session_id: str
     config: dict
+    bench: LocalClient | SSHClient | None = None
     token_counter: TokenCounter = field(default_factory=TokenCounter)
+    langfuse: Any | None = None
+
+    def __post_init__(self) -> None:
+        if self.bench is None:
+            self.bench = self.ssh

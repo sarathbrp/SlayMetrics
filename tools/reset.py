@@ -23,13 +23,10 @@ import yaml
 from tools.ssh import from_config
 
 DEFAULT_NGINX_CONF = """\
-# For more information on configuration, see:
-#   * Official English Documentation: http://nginx.org/en/docs/
-#   * Official Russian Documentation: http://nginx.org/ru/docs/
-
 user nginx;
 worker_processes auto;
-error_log /var/log/nginx/error.log notice;
+worker_rlimit_nofile 1024;
+error_log /var/log/nginx/error.log;
 pid /run/nginx.pid;
 
 # Load dynamic modules. See /usr/share/doc/nginx/README.dynamic.
@@ -40,41 +37,34 @@ events {
 }
 
 http {
-    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
-                      '$status $body_bytes_sent "$http_referer" '
-                      '"$http_user_agent" "$http_x_forwarded_for"';
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
 
-    access_log  /var/log/nginx/access.log  main;
+        access_log /var/log/nginx/access.log main;
 
-    sendfile            on;
-    tcp_nopush          on;
-    keepalive_timeout   65;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 100;
     types_hash_max_size 4096;
+    client_body_buffer_size 8k;
+    client_max_body_size 1m;
 
-    include             /etc/nginx/mime.types;
-    default_type        application/octet-stream;
+    aio off;
+
+        gzip off;
+
+        open_file_cache off;
+
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
 
     # Load modular configuration files from the /etc/nginx/conf.d directory.
-    # See http://nginx.org/en/docs/beginners_guide.html
+    # See http://nginx.org/en/docs/ngx_core_module.html#include
+    # for more information.
     include /etc/nginx/conf.d/*.conf;
-
-    server {
-        listen       80;
-        listen       [::]:80;
-        server_name  _;
-        root         /usr/share/nginx/html;
-
-        # Load configuration files for the default server block.
-        include /etc/nginx/default.d/*.conf;
-
-        error_page 404 /404.html;
-        location = /404.html {
-        }
-
-        error_page 500 502 503 504 /50x.html;
-        location = /50x.html {
-        }
-    }
 }
 """
 
@@ -94,9 +84,10 @@ def reset_system(client) -> None:
 
     # 1. Restore default nginx.conf
     print("  [nginx] Restoring default nginx.conf...")
-    # Write default config
     client.execute(f"cat > /etc/nginx/nginx.conf << 'NGINX_EOF'\n{DEFAULT_NGINX_CONF}NGINX_EOF")
-    r = client.execute("nginx -t 2>&1")
+    # Find nginx binary (may not be in PATH over SSH)
+    nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
+    r = client.execute(f"{nginx_bin} -t 2>&1")
     if "syntax is ok" in r.stdout or "test is successful" in r.stdout:
         client.execute("systemctl restart nginx")
         print("  [nginx] Config restored and service restarted")
@@ -119,15 +110,20 @@ def reset_system(client) -> None:
 
     # 5. Reset tuned profile
     print("  [tuned] Resetting to default profile...")
-    client.execute("tuned-adm profile virtual-guest 2>/dev/null || true")
+    client.execute(
+        "tuned-adm profile throughput-performance 2>/dev/null || "
+        "tuned-adm profile virtual-guest 2>/dev/null || true"
+    )
 
     # 6. Verify
     print("\n  Verifying...")
-    r = client.execute("curl -s -o /dev/null -w '%{http_code}' http://localhost/1kb.html")
+    r = client.execute("curl -s -o /dev/null -w '%{http_code}' http://localhost/")
     print(f"  [nginx] HTTP status: {r.stdout.strip()}")
+    nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
     r = client.execute(
-        "nginx -T 2>&1 | "
-        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log|worker_connections'"
+        f"{nginx_bin} -T 2>&1 | "
+        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log"
+        "|worker_connections|open_file_cache|gzip|aio'"
     )
     for line in r.stdout.strip().splitlines():
         print(f"  [nginx] {line.strip()}")
@@ -143,17 +139,30 @@ def clear_db(cfg: dict) -> None:
         host=m["host"],
         port=int(m.get("port", 4000)),
         user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",
+        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
         database=m["database"],
         autocommit=True,
     )
+    tables = [
+        "validations",
+        "benchmarks",
+        "context",
+        "hypothesis_queue",
+        "sessions",
+    ]
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM context")
-        cur.execute("DELETE FROM facts WHERE type != 'knowledge'")
-        cur.execute("DELETE FROM hypothesis_queue")
-        cur.execute("DELETE FROM profile")
+        for table in tables:
+            try:
+                cur.execute(f"DELETE FROM {table}")
+            except pymysql.err.ProgrammingError:
+                pass  # table doesn't exist yet — skip
+        try:
+            cur.execute("DELETE FROM knowledge WHERE type != 'knowledge'")
+        except pymysql.err.ProgrammingError:
+            pass
+        # Keep systems — they persist across sessions
     conn.close()
-    print("  [tidb] Cleared all sessions (knowledge base preserved)")
+    print("  [tidb] Cleared all sessions (knowledge base and systems preserved)")
 
 
 def reset_all_db(cfg: dict) -> None:
@@ -164,15 +173,25 @@ def reset_all_db(cfg: dict) -> None:
         host=m["host"],
         port=int(m.get("port", 4000)),
         user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",
+        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
         database=m["database"],
         autocommit=True,
     )
+    tables = [
+        "validations",
+        "benchmarks",
+        "context",
+        "hypothesis_queue",
+        "knowledge",
+        "sessions",
+        "systems",
+    ]
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM context")
-        cur.execute("DELETE FROM facts")
-        cur.execute("DELETE FROM hypothesis_queue")
-        cur.execute("DELETE FROM profile")
+        for table in tables:
+            try:
+                cur.execute(f"DELETE FROM {table}")
+            except pymysql.err.ProgrammingError:
+                pass  # table doesn't exist yet — skip
     conn.close()
 
     # Remove knowledge hash so facts/ get reloaded on next run
@@ -196,7 +215,30 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.config))
+    # Load .env so DUT_HOST resolves in config
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(env_path):
+        for line in open(env_path):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+    # Resolve ${VAR:-default} in config
+    import re
+
+    raw = open(args.config).read()
+    raw = re.sub(r"\$\{(\w+):-([^}]*)\}", lambda m: os.environ.get(m.group(1), m.group(2)), raw)
+    raw = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), raw)
+    cfg = yaml.safe_load(raw)
+
+    # Resolve host_env for target
+    t = cfg["target"]
+    host_env = t.get("host_env")
+    if host_env:
+        t["host"] = os.environ.get(host_env, t.get("host", "127.0.0.1"))
+
+    print(f"  Target: {t['host']}")
     client = from_config(cfg)
     client.connect()
 

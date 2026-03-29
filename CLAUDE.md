@@ -111,6 +111,19 @@ The solution MUST produce a report containing:
 
 ---
 
+## Problem-Solving Workflow
+
+When the user reports a problem (error, debug output, unexpected behavior):
+
+1. **Explain the problem first** — what failed, root cause, which component
+2. **Propose the fix** — what will change and why, get approval before coding
+3. **Implement and verify** — fix the code, run tests, confirm it works
+4. **Summarize all fixes** — after fixing, provide a clear table or list of every problem found and what was done about it
+
+Never silently fix things. Always explain before and summarize after.
+
+---
+
 ## Core Rules
 
 - **No hardcoding** — all values come from `config.yaml`

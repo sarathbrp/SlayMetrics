@@ -5,8 +5,11 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv312/
 venv/
 env/
+.coverage
+coverage.xml
 
 # IDE
 .idea/
@@ -18,6 +21,8 @@ env/
 
 # Agent output
 report/
+context-window-sequence.html
+tokens-save-plan.md
 
 # Internal planning docs (not for sharing)
 idea.txt
@@ -44,3 +49,4 @@ id_ed25519
 source_env
 facts/default_nginx.conf
 scripts/
+trace-*.json
