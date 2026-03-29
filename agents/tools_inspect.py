@@ -130,7 +130,8 @@ def inspect_resource_limits(
     # Systemd service limits
     svc_limits = ssh.execute(
         "systemctl show nginx.service 2>/dev/null"
-        " | grep -E 'LimitNOFILE|LimitNPROC|CPUQuota|MemoryMax|MemoryLimit'",
+        " | grep -E 'LimitNOFILE|LimitNPROC|CPUQuota|MemoryMax|MemoryLimit"
+        "|IOWeight|CPUWeight'",
         timeout=5,
     ).stdout.strip()
     findings["systemd_limits"] = svc_limits
@@ -164,6 +165,19 @@ def inspect_resource_limits(
     ).stdout.strip()
     findings["cgroup_memory"] = cgroup_mem
 
+    # IO and CPU weight
+    io_weight_match = re.search(r"IOWeight=(\d+)", svc_limits)
+    findings["cgroup_io_weight"] = io_weight_match.group(1) if io_weight_match else "100"
+    cpu_weight_match = re.search(r"CPUWeight=(\d+)", svc_limits)
+    findings["cgroup_cpu_weight"] = cpu_weight_match.group(1) if cpu_weight_match else "100"
+
+    # NUMA policy check
+    numa_dropin = ssh.execute(
+        "cat /etc/systemd/system/nginx.service.d/numa.conf 2>/dev/null || echo 'none'",
+        timeout=5,
+    ).stdout.strip()
+    findings["numa_policy"] = "interleave" if "interleave" in numa_dropin else "default"
+
     # Background hogs
     top_procs = ssh.execute("ps aux --sort=-%cpu 2>/dev/null | head -8", timeout=5).stdout.strip()
     findings["top_cpu_procs"] = top_procs
@@ -185,10 +199,20 @@ def inspect_resource_limits(
         except ValueError:
             pass
     nofile_val = findings.get("systemd_nofile", "unknown")
-    if nofile_val not in ("unknown", "infinity") and int(nofile_val) < int(
-        targets.get("systemd_nofile", "524288")
-    ):
-        problems.append(f"systemd LimitNOFILE={nofile_val} (too low)")
+    if nofile_val not in ("unknown", "infinity"):
+        try:
+            if int(nofile_val) < int(targets.get("systemd_nofile", "524288")):
+                problems.append(f"systemd LimitNOFILE={nofile_val} (too low)")
+        except ValueError:
+            pass
+    io_w = findings.get("cgroup_io_weight", "100")
+    if io_w != "100" and io_w != targets.get("cgroup_io_weight", "100"):
+        problems.append(f"cgroup IOWeight={io_w} (below default 100)")
+    cpu_w = findings.get("cgroup_cpu_weight", "100")
+    if cpu_w != "100" and cpu_w != targets.get("cgroup_cpu_weight", "100"):
+        problems.append(f"cgroup CPUWeight={cpu_w} (below default 100)")
+    if findings.get("numa_policy") == "interleave":
+        problems.append("NUMA interleave policy active (worst for locality)")
     if hog_procs:
         problems.append(f"background hogs detected: {hog_procs[:100]}")
 
