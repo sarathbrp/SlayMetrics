@@ -375,10 +375,8 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         ["- x"],
         "- baseline small: 1.0 RPS, p99=2.0ms",
         [{"parameter": "p", "value": "v", "impact": 1.0}],
-        "- baseline:post: workers=112",
     )
     assert "Already applied (skip)" in prompt
-    assert "Telemetry:" in prompt
     assert "Benchmark Evidence:" in prompt
 
 

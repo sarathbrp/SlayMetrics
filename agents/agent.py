@@ -2271,6 +2271,31 @@ async def _run_debate_planner(
         "Keep only grounded recommendations supported by evidence. "
         "Prefer nginx fixes first, system fixes second, IRQ fixes only if clearly justified. "
         "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
+        "IMPORTANT — use EXACTLY these field names in your output:\n\n"
+        "rca_records — each item MUST have:\n"
+        '  {"symptom": "<what is wrong>", "root_cause": "<why it is wrong>", '
+        '"confidence": 0.9, "recommendation": "<what to do>", "evidence": ["..."]}\n'
+        "Example:\n"
+        '  {"symptom": "worker_processes fixed at 8 on 112-core system", '
+        '"root_cause": "Most CPU cores idle, limiting parallel request handling", '
+        '"confidence": 0.95, "recommendation": "Set worker_processes auto", '
+        '"evidence": ["nginx -T shows worker_processes 8"]}\n\n'
+        "recommendations — each item MUST have:\n"
+        '  {"title": "<short name>", "scope": "nginx" or "system", '
+        '"changes": {"<param_name>": "<target_value>"}, '
+        '"rationale": "<why>", "risk_level": "low|medium|high"}\n'
+        "Example:\n"
+        '  {"title": "Increase worker connections", "scope": "nginx", '
+        '"changes": {"worker_connections": "65536"}, '
+        '"rationale": "Current 2048 caps concurrency", "risk_level": "low"}\n'
+        '  {"title": "Tune TCP backlog", "scope": "system", '
+        '"changes": {"net.core.somaxconn": "65535"}, '
+        '"rationale": "Current 1024 causes connection refusals", '
+        '"risk_level": "low"}\n\n'
+        "CRITICAL RULES:\n"
+        "- changes must be a dict of {param_name: value}, NOT a command string\n"
+        "- values must be clean (no semicolons, no 'reload nginx')\n"
+        "- one param per recommendation for nginx, may batch sysctls\n\n"
         f"Benchmark Context:\n{context_prompt}\n\n"
         f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
         f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
@@ -2505,13 +2530,27 @@ def _coerce_records(value: Any, deps: AgentDeps | None = None) -> list[dict[str,
         cause = str(item.get("cause", "")).strip()
         description = str(item.get("description", "")).strip()
         impact = str(item.get("impact", "")).strip()
-        symptom = str(item.get("symptom", "")).strip() or issue or cause or description
+        # Fallback: LLM may use {component, setting, current, target, impact}
+        setting = str(item.get("setting", "")).strip()
+        current = str(item.get("current", "")).strip()
+        target = str(item.get("target", "")).strip()
+        # Build symptom from setting+current if standard fields are missing
+        setting_symptom = ""
+        if setting and current:
+            setting_symptom = f"{setting}={current}" + (f" (target {target})" if target else "")
+        elif setting:
+            setting_symptom = setting
+        symptom = (
+            str(item.get("symptom", "")).strip() or issue or setting_symptom or cause or description
+        )
         root_cause = str(item.get("root_cause", "")).strip()
         if not root_cause:
             if impact:
                 root_cause = impact
-            else:
-                root_cause = cause or description
+            elif cause:
+                root_cause = cause
+            elif description:
+                root_cause = description
         recommendation = str(item.get("recommendation", "")).strip()
         if not recommendation:
             recommendation = impact or "no recommendation"
@@ -2629,9 +2668,39 @@ def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any
     if isinstance(changes, dict) and changes:
         return normalized
 
-    rec_type = str(item.get("type", "")).strip().lower()
-    if rec_type in {"nginx", "system", "irq"}:
-        normalized["scope"] = "system" if rec_type in {"system", "irq"} else "nginx"
+    # Fallback: map 'category' to 'scope' (LLM may use {category, description, command})
+    category = str(item.get("category", "")).strip().lower()
+    rec_type = str(item.get("type", "")).strip().lower() or category
+    if rec_type in {"nginx", "webserver"}:
+        normalized["scope"] = "nginx"
+    elif rec_type in {"system", "irq", "kernel", "cgroup", "network"}:
+        normalized["scope"] = "system"
+
+    # Fallback: map {setting, recommended_value} to changes dict
+    _setting = str(item.get("setting", "")).strip()
+    _rec_val = str(item.get("recommended_value", "")).strip()
+    if _setting and _rec_val and not changes:
+        # recommended_value may be a dict (batched sysctls) or a scalar
+        raw_rv = item.get("recommended_value")
+        if isinstance(raw_rv, dict):
+            normalized["changes"] = {
+                str(k): _strip_inline_comment(str(v)) for k, v in raw_rv.items()
+            }
+        else:
+            normalized["changes"] = {_setting: _strip_inline_comment(_rec_val)}
+        normalized["title"] = (
+            normalized.get("title") or str(item.get("description", "")).strip() or f"Set {_setting}"
+        )
+        normalized["recommendation"] = (
+            normalized.get("recommendation")
+            or str(item.get("description", "")).strip()
+            or str(item.get("justification", "")).strip()
+            or f"Set {_setting} to {_rec_val}"
+        )
+        normalized["rationale"] = (
+            normalized.get("rationale") or str(item.get("justification", "")).strip() or ""
+        )
+        return normalized
 
     setting = item.get("setting")
     value = item.get("value")
@@ -2855,6 +2924,25 @@ def _extract_changes_from_commands(commands: list[Any]) -> dict[str, str]:
 
         if "irqbalance" in command and any(v in command for v in ("enable", "start")):
             extracted["irqbalance"] = "enabled"
+            continue
+
+        # sed -i 's/^worker_processes .*/worker_processes auto;/' ...
+        sed_match = re.search(
+            r"sed\s.*'s[|/].*[|/]"
+            r"(\w+)\s+([^;/|]+?)\s*;?\s*[|/]'",
+            command,
+        )
+        if sed_match:
+            extracted[sed_match.group(1)] = sed_match.group(2).strip()
+            continue
+
+        # systemctl set-property nginx.service IOWeight=100
+        prop_match = re.search(r"set-property\s+\S+\s+(\w+)=(\S+)", command)
+        if prop_match:
+            key = prop_match.group(1)
+            val = prop_match.group(2)
+            prop_map = {"IOWeight": "cgroup_io_weight", "CPUWeight": "cgroup_cpu_weight"}
+            extracted[prop_map.get(key, key)] = val
             continue
 
     return extracted

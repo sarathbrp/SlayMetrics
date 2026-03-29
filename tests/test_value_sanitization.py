@@ -1,9 +1,12 @@
-"""Tests for value sanitization fixes in agents/agent.py.
+"""Tests for value sanitization and schema fallback fixes in agents/agent.py.
 
 Covers:
 - _strip_inline_comment: semicolon stripping via split(";")[0]
 - _clean_recs_for_planner: cleaning dirty recommendation values before planner
 - apply_saved_recommendations_impl filtering (split vs rstrip)
+- _coerce_records: fallback mapping for alternative RCA schemas
+- _normalize_synthesized_recommendation: fallback for {category, setting, recommended_value}
+- _extract_changes_from_commands: sed and systemctl parsing
 """
 from __future__ import annotations
 
@@ -11,6 +14,9 @@ import pytest
 
 from agents.agent import (
     _clean_recs_for_planner,
+    _coerce_records,
+    _extract_changes_from_commands,
+    _normalize_synthesized_recommendation,
     _strip_inline_comment,
 )
 
@@ -192,3 +198,206 @@ class TestApplyFilterSanitization:
         apply_saved_recommendations_impl at lines 1583 and 1598."""
         result = str(raw_value).strip().split(";")[0].strip()
         assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# _coerce_records: fallback field mapping for alternative RCA schemas
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceRecordsFallback:
+    """Test that _coerce_records handles LLMs returning {component, setting,
+    current, target, impact} instead of {symptom, root_cause, ...}."""
+
+    def test_standard_schema_passthrough(self):
+        records = _coerce_records([
+            {
+                "symptom": "worker_processes fixed at 8",
+                "root_cause": "Most CPU cores idle",
+                "confidence": 0.95,
+                "recommendation": "Set auto",
+                "evidence": ["nginx -T"],
+            }
+        ])
+        assert len(records) == 1
+        assert records[0]["symptom"] == "worker_processes fixed at 8"
+        assert records[0]["root_cause"] == "Most CPU cores idle"
+
+    def test_component_setting_current_target_impact_schema(self):
+        """The exact schema gpt-oss-120b returns."""
+        records = _coerce_records([
+            {
+                "component": "nginx",
+                "setting": "worker_processes",
+                "current": "8",
+                "target": "auto",
+                "impact": "Most CPU cores idle, limiting parallel request handling",
+            }
+        ])
+        assert len(records) == 1
+        assert "worker_processes=8" in records[0]["symptom"]
+        assert "target auto" in records[0]["symptom"]
+        assert records[0]["root_cause"] == "Most CPU cores idle, limiting parallel request handling"
+
+    def test_setting_without_current(self):
+        records = _coerce_records([
+            {
+                "setting": "accept_mutex",
+                "impact": "Serialises accept() calls",
+            }
+        ])
+        assert len(records) == 1
+        assert "accept_mutex" in records[0]["symptom"]
+
+    def test_kernel_setting(self):
+        records = _coerce_records([
+            {
+                "component": "kernel.network",
+                "setting": "net.core.somaxconn",
+                "current": "1024",
+                "target": "65535",
+                "impact": "Limits pending connections",
+            }
+        ])
+        assert len(records) == 1
+        assert "somaxconn=1024" in records[0]["symptom"]
+        assert records[0]["root_cause"] == "Limits pending connections"
+
+    def test_empty_item_still_dropped(self):
+        records = _coerce_records([{}])
+        assert len(records) == 0
+
+    def test_mixed_schemas(self):
+        records = _coerce_records([
+            {"symptom": "high latency", "root_cause": "bad config"},
+            {
+                "component": "nginx",
+                "setting": "worker_connections",
+                "current": "2048",
+                "target": "65536",
+                "impact": "Caps concurrency",
+            },
+        ])
+        assert len(records) == 2
+
+
+# ---------------------------------------------------------------------------
+# _normalize_synthesized_recommendation: fallback for alternative schemas
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeRecommendationFallback:
+    def test_standard_changes_dict_passthrough(self):
+        item = {"scope": "nginx", "changes": {"worker_processes": "auto"}}
+        result = _normalize_synthesized_recommendation(item)
+        assert result["changes"] == {"worker_processes": "auto"}
+
+    def test_category_maps_to_scope(self):
+        item = {
+            "category": "nginx",
+            "setting": "worker_processes",
+            "recommended_value": "auto",
+        }
+        result = _normalize_synthesized_recommendation(item)
+        assert result.get("scope") == "nginx"
+        assert result["changes"] == {"worker_processes": "auto"}
+
+    def test_kernel_category_maps_to_system_scope(self):
+        item = {
+            "category": "kernel",
+            "setting": "vm.swappiness",
+            "recommended_value": "10",
+        }
+        result = _normalize_synthesized_recommendation(item)
+        assert result.get("scope") == "system"
+        assert result["changes"] == {"vm.swappiness": "10"}
+
+    def test_cgroup_category_maps_to_system_scope(self):
+        item = {
+            "category": "cgroup",
+            "setting": "IOWeight",
+            "recommended_value": "100",
+        }
+        result = _normalize_synthesized_recommendation(item)
+        assert result.get("scope") == "system"
+
+    def test_recommended_value_dict_batched(self):
+        """When recommended_value is a dict of sysctls."""
+        item = {
+            "category": "kernel",
+            "setting": "sysctls",
+            "recommended_value": {
+                "net.core.somaxconn": "65535",
+                "net.ipv4.tcp_max_syn_backlog": "65535",
+            },
+        }
+        result = _normalize_synthesized_recommendation(item)
+        assert result["changes"]["net.core.somaxconn"] == "65535"
+        assert result["changes"]["net.ipv4.tcp_max_syn_backlog"] == "65535"
+
+    def test_recommended_value_strips_semicolons(self):
+        item = {
+            "category": "nginx",
+            "setting": "worker_processes",
+            "recommended_value": "auto; reload nginx",
+        }
+        result = _normalize_synthesized_recommendation(item)
+        assert result["changes"]["worker_processes"] == "auto"
+
+
+# ---------------------------------------------------------------------------
+# _extract_changes_from_commands: sed and systemctl parsing
+# ---------------------------------------------------------------------------
+
+
+class TestExtractChangesFromCommands:
+    def test_sysctl_extraction(self):
+        result = _extract_changes_from_commands(
+            ["sysctl -w vm.swappiness=10 vm.vfs_cache_pressure=50"]
+        )
+        assert result["vm.swappiness"] == "10"
+        assert result["vm.vfs_cache_pressure"] == "50"
+
+    def test_sed_nginx_directive(self):
+        result = _extract_changes_from_commands(
+            ["sed -i 's/^worker_processes .*/worker_processes auto;/' /etc/nginx/nginx.conf"]
+        )
+        assert result.get("worker_processes") == "auto"
+
+    def test_sed_worker_connections(self):
+        result = _extract_changes_from_commands(
+            ["sed -i 's/^worker_connections .*/worker_connections 65536;/' /etc/nginx/nginx.conf"]
+        )
+        assert result.get("worker_connections") == "65536"
+
+    def test_systemctl_set_property_ioweight(self):
+        result = _extract_changes_from_commands(
+            ["systemctl set-property nginx.service IOWeight=100"]
+        )
+        assert result.get("cgroup_io_weight") == "100"
+
+    def test_systemctl_set_property_cpuweight(self):
+        result = _extract_changes_from_commands(
+            ["systemctl set-property nginx.service CPUWeight=100"]
+        )
+        assert result.get("cgroup_cpu_weight") == "100"
+
+    def test_setenforce(self):
+        result = _extract_changes_from_commands(["setenforce 0"])
+        assert result.get("selinux") == "permissive"
+
+    def test_thp_never(self):
+        result = _extract_changes_from_commands(
+            ["echo never > /sys/kernel/mm/transparent_hugepage/enabled"]
+        )
+        assert result.get("transparent_hugepage") == "never"
+
+    def test_irqbalance(self):
+        result = _extract_changes_from_commands(
+            ["systemctl enable --now irqbalance"]
+        )
+        assert result.get("irqbalance") == "enabled"
+
+    def test_empty_commands(self):
+        assert _extract_changes_from_commands([]) == {}
+        assert _extract_changes_from_commands([""]) == {}
