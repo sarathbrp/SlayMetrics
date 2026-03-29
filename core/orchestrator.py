@@ -326,16 +326,6 @@ async def run(model, deps: AgentDeps) -> str:
         if bench_tool == "hackathon":
             logger.step(f"Step 5.{iteration}: Running post-iteration benchmark (all workloads)...")
             iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
-            for workload in HACKATHON_WORKLOADS:
-                data = iteration_finals.get(workload, {})
-                if data:
-                    logger.benchmark(
-                        f"iter{iteration} ({workload})",
-                        data.get("rps", 0),
-                        data.get("p99", 0),
-                        0,
-                        0,
-                    )
 
         # Check exit criteria: all workloads within 1% of baseline
         should_stop, regressions = _check_iteration_exit(baselines, iteration_finals)
