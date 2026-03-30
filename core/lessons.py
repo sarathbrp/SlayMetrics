@@ -25,29 +25,39 @@ def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
 
     Each entry: {session_id, small_rps, medium_rps, large_rps, tokens, iterations}
     Only includes runs where medium >= threshold AND large >= threshold.
+
+    Reads from context table (type='benchmark', source like 'iterN_workload')
+    since the agent stores benchmark results there, not in the benchmarks table.
+    Uses the highest iteration number per session as the final result.
     """
     with memory._cursor() as cur:
+        # Extract RPS from JSON content in context table, using the last
+        # iteration's results per session per workload.
         cur.execute(
             """
             SELECT
-                s.id                                        AS session_id,
-                s.total_tokens                              AS tokens,
-                s.fixes_applied                             AS iterations,
-                MAX(CASE WHEN b.payload_size='small'  THEN b.rps END) AS small_rps,
-                MAX(CASE WHEN b.payload_size='medium' THEN b.rps END) AS medium_rps,
-                MAX(CASE WHEN b.payload_size='large'  THEN b.rps END) AS large_rps,
-                s.completed_at
-            FROM sessions s
-            JOIN benchmarks b ON b.session_id = s.id AND b.phase = 'final'
-            WHERE s.status = 'completed'
-              AND (%s IS NULL OR s.system_id = %s)
-            GROUP BY s.id, s.total_tokens, s.fixes_applied, s.completed_at
-            HAVING MAX(CASE WHEN b.payload_size='medium' THEN b.rps END) >= %s
-               AND MAX(CASE WHEN b.payload_size='large'  THEN b.rps END) >= %s
-            ORDER BY small_rps DESC
+                c.session_id,
+                s.total_tokens AS tokens,
+                MAX(CAST(SUBSTRING_INDEX(c.source, '_', 1) AS UNSIGNED)) AS iterations,
+                MAX(CASE WHEN c.source LIKE '%%_small'
+                    THEN JSON_EXTRACT(c.content, '$.rps') END) AS small_rps,
+                MAX(CASE WHEN c.source LIKE '%%_medium'
+                    THEN JSON_EXTRACT(c.content, '$.rps') END) AS medium_rps,
+                MAX(CASE WHEN c.source LIKE '%%_large'
+                    THEN JSON_EXTRACT(c.content, '$.rps') END) AS large_rps
+            FROM context c
+            JOIN sessions s ON s.id = c.session_id
+            WHERE c.type = 'benchmark'
+              AND c.source NOT LIKE 'baseline%%'
+              AND s.status = 'completed'
+            GROUP BY c.session_id, s.total_tokens
+            HAVING small_rps IS NOT NULL
+               AND CAST(medium_rps AS DECIMAL(20,2)) >= %s
+               AND CAST(large_rps AS DECIMAL(20,2)) >= %s
+            ORDER BY CAST(small_rps AS DECIMAL(20,2)) DESC
             LIMIT %s
             """,
-            (system_id, system_id, QUALIFY_MEDIUM_RPS, QUALIFY_LARGE_RPS, LEADERBOARD_SIZE),
+            (QUALIFY_MEDIUM_RPS, QUALIFY_LARGE_RPS, LEADERBOARD_SIZE),
         )
         rows = cur.fetchall()
 
