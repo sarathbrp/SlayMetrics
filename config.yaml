@@ -83,7 +83,7 @@ rhel:
     - kernel_version
 
 agent:
-  planner_mode: hybrid              # debate | deterministic | hybrid
+  planner_mode: debate        # debate | deterministic | hybrid
   improvement_threshold_pct: 5
   max_iterations: 3
   max_phase: 4
