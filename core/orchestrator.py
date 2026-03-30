@@ -414,6 +414,38 @@ async def run(model, deps: AgentDeps) -> str:
         should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
 
         if should_stop:
+            # Check if we should continue to delta iteration despite no regressions
+            # If iter1 didn't beat #1 and we have proven params, iter2 delta can help
+            current_small = float(iteration_finals.get("small", {}).get("rps", 0) or 0)
+            best_small = top_runs[0]["small_rps"] if top_runs else 0
+            if (
+                iteration == 1
+                and has_top_runs
+                and current_small < best_small * 0.95
+                and iteration < max_iterations
+            ):
+                decision = (
+                    f"All workloads OK but small={current_small:.0f} < "
+                    f"best={best_small:.0f} — continuing to delta iteration"
+                )
+                logger.status("iteration", f"Iteration {iteration}: {decision}")
+                diagnosis_agent.save_iteration_summary(
+                    deps,
+                    iteration=iteration,
+                    baselines=baselines,
+                    results=iteration_finals,
+                    regressions=regressions,
+                    decision=decision,
+                    diagnosis=diagnosis,
+                )
+                iteration_feedback = _build_iteration_feedback(
+                    iteration=iteration,
+                    baselines=baselines,
+                    current_results=iteration_finals,
+                    regressions=regressions,
+                )
+                continue
+
             decision = f"All workloads OK — stopping after iteration {iteration}"
             logger.status("iteration", f"Iteration {iteration}: {decision}")
             diagnosis_agent.save_iteration_summary(
