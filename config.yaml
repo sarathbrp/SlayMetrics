@@ -92,7 +92,7 @@ agent:
   persist_hypotheses: true
   benchmark_after_every_fix: true
   optimization:
-    enabled: false
+    enabled: true
     top_runs: 3
     min_small_gain_pct: 1.0
     leaderboard_gap_pct: 3.0
