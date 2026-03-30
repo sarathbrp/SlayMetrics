@@ -68,6 +68,8 @@ def build_apply_plan(
 
         # 2. Problems (resource_limits, network, storage) → use config targets
         for problem in cat_inspection.get("problems") or []:
+            if not isinstance(problem, dict):
+                continue
             param = str(problem.get("param") or problem.get("setting", "")).strip()
             if param and param in targets and param not in cat_plan:
                 target = str(targets[param]).strip()
