@@ -1788,15 +1788,18 @@ def build(model, config=None) -> DiagnosisWorkflow:
         for cat in ("resource_limits", "network", "storage"):
             cat_problems = inspection.get(cat, {}).get("problems", [])
             problem_text = "; ".join(str(p) for p in cat_problems[:3]) if cat_problems else ""
-            for action in results.get(cat, {}).get("actions", []):
-                findings.append(
-                    {
-                        "parameter": f"{cat}",
-                        "before_value": "",
-                        "after_value": action,
-                        "reasoning": problem_text or "config-driven fix",
-                    }
-                )
+            cat_result = results.get(cat, {})
+            applied = cat_result.get("applied", {})
+            if isinstance(applied, dict):
+                for param, value in applied.items():
+                    findings.append(
+                        {
+                            "parameter": f"{cat}.{param}",
+                            "before_value": "",
+                            "after_value": str(value),
+                            "reasoning": problem_text or "config-driven fix",
+                        }
+                    )
 
         if findings:
             save_findings_impl(deps, findings)
