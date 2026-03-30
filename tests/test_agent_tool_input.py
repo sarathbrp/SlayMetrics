@@ -590,7 +590,7 @@ def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
         memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
         session_id="s1",
         token_counter=TokenCounter(),
-        config={"agent": {"planner_mode": "single"}},
+        config={"agent": {"planner_mode": "custom"}},
     )
 
     class FakeRunResult:
@@ -632,7 +632,7 @@ def test_run_does_not_double_count_usage(monkeypatch):
         memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
         session_id="s1",
         token_counter=TokenCounter(),
-        config={"agent": {"planner_mode": "single"}},
+        config={"agent": {"planner_mode": "custom"}},
     )
 
     class FakeRunResult:
@@ -708,6 +708,50 @@ def test_run_uses_debate_planner_mode(monkeypatch):
     assert output.notes == "Debate complete."
     assert deps.token_counter.input_tokens == 4
     assert deps.token_counter.output_tokens == 3
+
+
+def test_run_normalizes_single_planner_mode_to_deterministic(monkeypatch):
+    deps = SimpleNamespace(
+        memory=SimpleNamespace(get_profile=lambda session_id: {"baseline_rps": 100.0}),
+        session_id="s1",
+        token_counter=TokenCounter(),
+        config={"agent": {"planner_mode": "single", "max_phase": 3}},
+    )
+
+    class FakeAgent:
+        _slaymetrics_state = {
+            "nginx_applied": False,
+            "system_applied": False,
+            "after_rps": 0.0,
+            "findings": [],
+            "rca_records": [],
+            "recommendations": [],
+        }
+
+    class FakeRunResult:
+        output = "Deterministic complete."
+
+        def usage(self):
+            return SimpleNamespace(input_tokens=5, output_tokens=1)
+
+        def all_messages(self):
+            return []
+
+    monkeypatch.setattr(diagnosis_agent, "build", lambda model, config=None: FakeAgent())
+    monkeypatch.setattr(
+        diagnosis_agent,
+        "_run_rules_engine",
+        lambda agent, model, deps, context_prompt, agent_state=None, hybrid=False: asyncio.sleep(0, result=FakeRunResult()),
+    )
+    monkeypatch.setattr(diagnosis_agent, "llm_call", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "tokens", lambda *a, **k: None)
+    monkeypatch.setattr(diagnosis_agent, "log", lambda *a, **k: None)
+
+    output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
+
+    assert output.notes == "Deterministic complete."
+    assert deps.token_counter.input_tokens == 5
+    assert deps.token_counter.output_tokens == 1
 
 
 def test_coerce_records_drops_malformed_synthesized_items():
@@ -877,7 +921,7 @@ def test_coerce_recommendations_accepts_setting_value_lists():
 
 def test_run_applies_saved_recommendations(monkeypatch):
     deps = _ctx().deps
-    deps.config["agent"]["planner_mode"] = "single"
+    deps.config["agent"]["planner_mode"] = "custom"
 
     class FakeRunResult:
         output = "Plan complete."

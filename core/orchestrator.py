@@ -40,7 +40,7 @@ async def run(model, deps: AgentDeps) -> str:
             metadata={
                 "session_id": session_id,
                 "service": cfg["service"]["name"],
-                "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "single"),
+                "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "deterministic"),
                 "max_phase": max_phase,
             },
         )

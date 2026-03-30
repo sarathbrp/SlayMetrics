@@ -295,7 +295,7 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         },
         "target": {"host": "localhost"},
         "service": {"name": "nginx"},
-        "agent": {},
+        "agent": {"planner_mode": "hybrid", "baseline_mode": "fresh", "max_phase": 4},
         "telemetry": {"langfuse": {"enabled": True}},
     }
     monkeypatch.setattr(main, "load_config", lambda p: cfg_main)
@@ -359,6 +359,88 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     assert any(call[0] == "trace" for call in langfuse_calls)
     assert ("flush",) in langfuse_calls
     assert ("shutdown",) in langfuse_calls
+
+
+def test_main_preserves_config_planner_mode_when_cli_omitted(monkeypatch):
+    cfg_main = {
+        "llm": {
+            "active_profile": "v",
+            "profiles": {"v": {"backend": "ollama", "model": "m", "base_url": "u"}},
+        },
+        "target": {"host": "localhost"},
+        "service": {"name": "nginx"},
+        "agent": {"planner_mode": "hybrid", "baseline_mode": "reuse", "max_phase": 4},
+        "telemetry": {"langfuse": {"enabled": False}},
+    }
+    monkeypatch.setattr(main, "load_config", lambda p: cfg_main)
+    monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
+    monkeypatch.setattr(main, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main, "embedder_from_config", lambda cfg: "embed")
+    monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: FakeMemory())
+    monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
+    fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
+    monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)
+    monkeypatch.setattr(main, "load_adapter", lambda cfg, ssh, bench=None: "adapter")
+    monkeypatch.setattr(main, "get_model", lambda cfg: "model")
+    monkeypatch.setattr(main.logger, "status", lambda *a, **k: None)
+    monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
+    monkeypatch.setattr(main.logger, "close", lambda: None)
+    monkeypatch.setattr(
+        main.LangfuseClient,
+        "from_env",
+        lambda metadata=None, enabled=True: SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "core.orchestrator",
+        SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
+    )
+
+    asyncio.run(main.main("cfg.yaml", None, False, None, None, None))
+
+    assert cfg_main["agent"]["planner_mode"] == "hybrid"
+    assert cfg_main["agent"]["baseline_mode"] == "reuse"
+    assert cfg_main["agent"]["max_phase"] == 4
+
+
+def test_main_normalizes_single_planner_mode_alias(monkeypatch):
+    cfg_main = {
+        "llm": {
+            "active_profile": "v",
+            "profiles": {"v": {"backend": "ollama", "model": "m", "base_url": "u"}},
+        },
+        "target": {"host": "localhost"},
+        "service": {"name": "nginx"},
+        "agent": {},
+        "telemetry": {"langfuse": {"enabled": False}},
+    }
+    monkeypatch.setattr(main, "load_config", lambda p: cfg_main)
+    monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
+    monkeypatch.setattr(main, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main, "embedder_from_config", lambda cfg: "embed")
+    monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: FakeMemory())
+    monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
+    fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
+    monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)
+    monkeypatch.setattr(main, "load_adapter", lambda cfg, ssh, bench=None: "adapter")
+    monkeypatch.setattr(main, "get_model", lambda cfg: "model")
+    monkeypatch.setattr(main.logger, "status", lambda *a, **k: None)
+    monkeypatch.setattr(main.logger, "log", lambda *a, **k: None)
+    monkeypatch.setattr(main.logger, "close", lambda: None)
+    monkeypatch.setattr(
+        main.LangfuseClient,
+        "from_env",
+        lambda metadata=None, enabled=True: SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "core.orchestrator",
+        SimpleNamespace(run=lambda model, deps: asyncio.sleep(0, result="report.md")),
+    )
+
+    asyncio.run(main.main("cfg.yaml", None, False, None, "single", None))
+
+    assert cfg_main["agent"]["planner_mode"] == "deterministic"
 
 
 def test_load_knowledge_skip_when_hash_unchanged(tmp_path, monkeypatch):

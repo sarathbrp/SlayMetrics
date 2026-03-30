@@ -10,7 +10,7 @@ An autonomous AI agent that diagnoses and remediates performance issues on RHEL 
 2. **System fingerprint** — collects CPU, RAM, NIC speed, disk throughput
 3. **Baseline benchmarks** — all 5 workloads (homepage, small, medium, large, mixed)
 4. **5-category inspection** — webserver, kernel, resource limits, network, storage
-5. **Debate pipeline** — nginx expert + RHEL expert (parallel) → synthesizer → apply planner
+5. **Planner pipeline** — deterministic, hybrid, or debate planning from the same inspection data
 6. **Batch apply** — grouped by category, one SSH call per category
 7. **Post-apply verification** — re-reads DUT state to confirm changes took effect
 8. **Iteration loop** — benchmarks all workloads, detects per-workload regressions, self-corrects (max 3 iterations)
@@ -30,9 +30,8 @@ Pre-flight → Baseline benchmarks → Iteration loop:
   │   network: iptables, conntrack, tc                      │
   │   storage: I/O scheduler, readahead, I/O hogs           │
   ├─────────────────────────────────────────────────────────┤
-  │ nginx_expert ──┐                                        │
-  │                ├→ synthesizer → apply_planner            │
-  │ rhel_expert  ──┘                                        │
+  │ deterministic/hybrid: rules_engine → validator(optional)│
+  │ debate: nginx_expert + rhel_expert → synth → planner    │
   ├─────────────────────────────────────────────────────────┤
   │ Batch apply per category → Verify on DUT → Benchmark    │
   │ Check: all workloads within 1% of baseline? → stop/loop │
@@ -83,10 +82,11 @@ target:
 ### Run
 
 ```bash
-python3 main.py              # default (debate mode, 3 iterations max)
-python3 main.py -v           # verbose (show all tool calls)
-python3 main.py --max-phase 3  # stop after planning (no apply)
-python3 main.py --session <id> # resume previous session
+python3 main.py                 # use planner_mode from config.yaml
+python3 main.py -v              # verbose (show all tool calls)
+python3 main.py --planner-mode hybrid
+python3 main.py --max-phase 3   # stop after planning (no apply)
+python3 main.py --session <id>  # resume previous session
 ```
 
 ### Reset Between Runs

@@ -167,18 +167,28 @@ async def main(
     config_path: str,
     session_id: str | None,
     verbose: bool = False,
-    max_phase: int = 4,
-    planner_mode: str = "debate",
-    baseline_mode: str = "fresh",
+    max_phase: int | None = None,
+    planner_mode: str | None = None,
+    baseline_mode: str | None = None,
 ) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
     load_dotenv()
 
     cfg = load_config(config_path)
     cfg.setdefault("agent", {})
-    cfg["agent"]["max_phase"] = max_phase
-    cfg["agent"]["planner_mode"] = planner_mode
-    cfg["agent"]["baseline_mode"] = baseline_mode
+    if max_phase is not None:
+        cfg["agent"]["max_phase"] = max_phase
+    if planner_mode is not None:
+        normalized_planner_mode = planner_mode.strip().lower()
+        if normalized_planner_mode == "single":
+            normalized_planner_mode = "deterministic"
+        cfg["agent"]["planner_mode"] = normalized_planner_mode
+    if baseline_mode is not None:
+        cfg["agent"]["baseline_mode"] = baseline_mode
+
+    resolved_max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
+    resolved_planner_mode = str((cfg.get("agent") or {}).get("planner_mode", "debate")).strip()
+    resolved_baseline_mode = str((cfg.get("agent") or {}).get("baseline_mode", "fresh")).strip()
 
     # Session ID — generate or reuse
     if session_id is None:
@@ -233,9 +243,9 @@ async def main(
         {
             "session_id": session_id,
             "service": cfg["service"]["name"],
-            "planner_mode": planner_mode,
-            "max_phase": max_phase,
-            "baseline_mode": baseline_mode,
+            "planner_mode": resolved_planner_mode,
+            "max_phase": resolved_max_phase,
+            "baseline_mode": resolved_baseline_mode,
             "llm_profile": profile_name,
             "dut_host": host,
             "bench_host": bench_host,
@@ -315,19 +325,19 @@ if __name__ == "__main__":
         "--max-phase",
         type=int,
         choices=[3, 4],
-        default=4,
+        default=None,
         help="Maximum phase to run: 3 stops after RCA/recommendations, 4 runs remediation",
     )
     parser.add_argument(
         "--planner-mode",
-        choices=["single", "debate"],
-        default="debate",
-        help="Planning path: single planner or nginx-vs-rhel debate with synthesis",
+        choices=["single", "deterministic", "hybrid", "debate"],
+        default=None,
+        help="Planning path override: deterministic, hybrid, debate, or legacy single alias",
     )
     parser.add_argument(
         "--baseline-mode",
         choices=["fresh", "reuse"],
-        default="fresh",
+        default=None,
         help=(
             "Baseline acquisition: run a fresh baseline or reuse "
             "the latest stored one for this host"

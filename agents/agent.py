@@ -2171,6 +2171,9 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     state = getattr(agent, "_slaymetrics_state", {})
     config = getattr(deps, "config", {}) or {}
     planner_mode = str((config.get("agent") or {}).get("planner_mode", "debate")).strip().lower()
+    if planner_mode == "single":
+        planner_mode = "deterministic"
+    llm_call("agent", f"Planner mode: {planner_mode!r}")
     if planner_mode in ("deterministic", "hybrid"):
         result = await _run_rules_engine(
             agent,
