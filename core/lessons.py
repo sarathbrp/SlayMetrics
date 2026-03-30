@@ -52,7 +52,7 @@ def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
         )
         rows = cur.fetchall()
 
-    return [
+    results = [
         {
             "session_id": r["session_id"],
             "small_rps": float(r["small_rps"] or 0),
@@ -63,6 +63,19 @@ def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
         }
         for r in rows
     ]
+    for i, r in enumerate(results):
+        log.info(
+            "leaderboard #%d: %s small=%.0f med=%.0f large=%.0f tokens=%d",
+            i + 1,
+            r["session_id"],
+            r["small_rps"],
+            r["medium_rps"],
+            r["large_rps"],
+            r["tokens"],
+        )
+    if not results:
+        log.info("leaderboard: empty — no qualifying runs")
+    return results
 
 
 def get_best_run_params(memory, system_id: str | None = None) -> dict[str, str]:
@@ -269,9 +282,23 @@ def compute_delta(
     that #1 had but current session is missing or has different values.
     Used for deterministic iter2 — apply only what LLM missed.
     """
+    top = get_top_runs(memory, system_id)
+    if not top:
+        log.info("compute_delta: no top runs — nothing to compare")
+        return {}
+
+    best_session = top[0]["session_id"]
     proven = get_best_run_params(memory, system_id)
     if not proven:
+        log.info("compute_delta: no proven params for #1 (%s)", best_session)
         return {}
+
+    log.info(
+        "compute_delta: #1=%s has %d proven params, comparing to session %s",
+        best_session,
+        len(proven),
+        current_session_id,
+    )
 
     # Get current session's applied params
     with memory._cursor() as cur:
@@ -290,19 +317,37 @@ def compute_delta(
         rows = cur.fetchall()
 
     current = {r["parameter"]: r["after_value"] for r in rows}
+    log.info(
+        "compute_delta: current session %s has %d applied params",
+        current_session_id,
+        len(current),
+    )
 
     # Diff: params in proven but missing or different in current
     delta: dict[str, dict[str, str]] = {}
     for full_key, proven_value in proven.items():
         current_value = current.get(full_key)
-        if current_value is None or current_value != proven_value:
+        if current_value is None:
             parts = full_key.split(".", 1)
-            if len(parts) == 2:
-                cat, param = parts
-            else:
-                cat, param = "kernel", full_key
+            cat, param = parts if len(parts) == 2 else ("kernel", full_key)
             delta.setdefault(cat, {})[param] = proven_value
+            log.info("  delta MISSING: %s (proven=%s)", full_key, proven_value)
+        elif current_value != proven_value:
+            parts = full_key.split(".", 1)
+            cat, param = parts if len(parts) == 2 else ("kernel", full_key)
+            delta.setdefault(cat, {})[param] = proven_value
+            log.info(
+                "  delta DIFFERS: %s current=%s proven=%s",
+                full_key,
+                current_value,
+                proven_value,
+            )
 
+    log.info(
+        "compute_delta: %d params differ (%s)",
+        sum(len(v) for v in delta.values()),
+        ", ".join(f"{c}={len(v)}" for c, v in delta.items()),
+    )
     return delta
 
 
