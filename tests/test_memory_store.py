@@ -476,6 +476,60 @@ def test_save_fact_fix_reuses_existing_knowledge_row(monkeypatch):
     assert any("INSERT INTO validations" in q for q in queries)
 
 
+def test_save_optimization_validation_reverted_keeps_fact_active(monkeypatch):
+    store, conn = _setup(monkeypatch)
+    store._system_id_cache["s1"] = "sys-1"
+    conn.fetchone_queue.append({"service_type": "nginx", "service": "nginx"})
+    conn.fetchone_queue.append(None)
+
+    kid = store.save_optimization_validation(
+        session_id="s1",
+        parameter="webserver.limit_rate",
+        before_value="0",
+        after_value="0",
+        outcome="contradicted",
+        reasoning="optimization group logging_and_rate_limits",
+        before_rps=400000.0,
+        after_rps=360000.0,
+        impact_pct=-10.0,
+        notes="Reverted optimization group logging_and_rate_limits",
+    )
+
+    assert isinstance(kid, str)
+    insert = next(e for e in conn.executed if "INSERT INTO knowledge" in e[0])
+    assert "'active'" in insert[0]
+    validation = next(e for e in conn.executed if "INSERT INTO validations" in e[0])
+    assert validation[1][4] == "contradicted"
+    assert validation[1][8] == "Reverted optimization group logging_and_rate_limits"
+
+
+def test_save_optimization_validation_reuses_existing_active_fact(monkeypatch):
+    store, conn = _setup(monkeypatch)
+    store._system_id_cache["s1"] = "sys-1"
+    conn.fetchone_queue.append({"service_type": "nginx", "service": "nginx"})
+    conn.fetchone_queue.append({"id": "kid-existing"})
+
+    kid = store.save_optimization_validation(
+        session_id="s1",
+        parameter="webserver.keepalive_requests",
+        before_value="1000",
+        after_value="10000",
+        outcome="confirmed",
+        reasoning="optimization group http_connection_reuse",
+        before_rps=400000.0,
+        after_rps=480000.0,
+        impact_pct=20.0,
+        notes="Kept optimization group http_connection_reuse",
+    )
+
+    assert kid == "kid-existing"
+    queries = [q for q, _ in conn.executed]
+    assert not any("INSERT INTO knowledge" in q for q in queries)
+    assert any("UPDATE knowledge" in q for q in queries)
+    validation = next(e for e in conn.executed if "INSERT INTO validations" in e[0])
+    assert validation[1][4] == "confirmed"
+
+
 def test_get_facts_filtered(monkeypatch):
     store, conn = _setup(monkeypatch)
     conn.fetchall_queue.append([{"type": "fix"}])

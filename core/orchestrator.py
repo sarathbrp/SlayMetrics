@@ -1165,24 +1165,34 @@ def _save_optimization_outcome(
         decision,
     )
 
-    # Persist to knowledge table for cross-session learning.
-    # Kept → validated as 'confirmed'; Reverted → validated as 'contradicted'.
-    # get_ranked_optimization_groups() penalizes contradictions on future runs.
+    # Persist optimization outcomes as validations on the logical fix identity.
+    # This keeps the knowledge row stable and lets future ranking learn from
+    # confirmed/contradicted history without deprecating the fact itself.
     group_changes = candidate.get("changes", {}) or {}
-    fact_status = "applied" if kept else "reverted"
     group_name = candidate.get("name", "unknown")
+    baseline_small = float(baseline_results.get("small", {}).get("rps", 0) or 0)
+    benchmark_small = float(benchmark_results.get("small", {}).get("rps", 0) or 0)
+    small_delta_pct = (
+        ((benchmark_small - baseline_small) / baseline_small * 100) if baseline_small else None
+    )
+    validation_outcome = "confirmed" if kept else "contradicted"
     for category, params in group_changes.items():
         if not isinstance(params, dict):
             continue
         for param, value in params.items():
-            memory.save_fact(
+            full_param = f"{category}.{param}"
+            current_values = candidate.get("current", {}) or {}
+            memory.save_optimization_validation(
                 session_id=session_id,
-                type="fix",
-                parameter=f"{category}.{param}",
-                reasoning=f"optimization group '{group_name}': {decision}",
-                before_value="",
+                parameter=full_param,
+                reasoning=f"optimization group '{group_name}'",
+                before_value=str(current_values.get(full_param, "")),
                 after_value=str(value),
-                status=fact_status,
+                outcome=validation_outcome,
+                before_rps=baseline_small or None,
+                after_rps=benchmark_small or None,
+                impact_pct=small_delta_pct,
+                notes=decision,
             )
 
 

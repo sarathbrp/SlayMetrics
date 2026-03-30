@@ -33,6 +33,9 @@ class FakeMemory:
     def save_fact(self, **kwargs):
         self.saved.append(("fact", kwargs))
 
+    def save_optimization_validation(self, **kwargs):
+        self.saved.append(("optimization_validation", kwargs))
+
     def get_facts(self, session_id, type=None):
         if type == "fix":
             return []
@@ -577,3 +580,8 @@ def test_orchestrator_optimization_mode_reverts_failed_group(monkeypatch, tmp_pa
     assert reverted["called"] is True
     complete = [item for item in deps.memory.saved if item[0] == "complete_session"][-1]
     assert complete[2]["rps_end"] == 500.0
+    optimization_validations = [
+        item for item in deps.memory.saved if item[0] == "optimization_validation"
+    ]
+    assert optimization_validations
+    assert optimization_validations[0][1]["outcome"] == "contradicted"

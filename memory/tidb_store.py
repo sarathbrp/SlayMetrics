@@ -608,6 +608,120 @@ class TiDBStore:
                 ),
             )
 
+    def save_optimization_validation(
+        self,
+        *,
+        session_id: str,
+        parameter: str,
+        before_value: str = "",
+        after_value: str = "",
+        outcome: str,
+        reasoning: str = "",
+        before_rps: float | None = None,
+        after_rps: float | None = None,
+        impact_pct: float | None = None,
+        notes: str | None = None,
+        scope: str = "system",
+        confidence: float = 0.5,
+    ) -> str | None:
+        """Persist optimization evidence without deprecating the logical fix fact.
+
+        Optimization outcomes belong in the validations history. The knowledge row
+        remains the stable fix identity; contradicted attempts add negative
+        evidence without removing the row from future evidence queries.
+        """
+        system_id = self._system_id_for_session(session_id)
+        if not system_id:
+            return None
+
+        service_type = None
+        sys_row = self.get_system(system_id)
+        if sys_row:
+            service_type = sys_row.get("service_type") or sys_row.get("service")
+
+        knowledge_id = self._find_fix_fact_by_identity(
+            system_id=system_id,
+            parameter=parameter,
+            before_value=before_value,
+            after_value=after_value,
+        )
+        if not knowledge_id:
+            kid = str(uuid.uuid4())
+            text = f"{parameter} {reasoning} {before_value} {after_value}"
+            embedding = self._embedder.embed(text)
+            with self._cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO knowledge
+                        (id, discovered_by, system_id, service_type, scope, type,
+                         parameter, condition, before_value, after_value,
+                         impact_pct, confidence, status, reasoning,
+                         embedding)
+                    VALUES (%s,%s,%s,%s,%s,'fix',%s,NULL,%s,%s,%s,%s,'active',%s,%s)
+                    """,
+                    (
+                        kid,
+                        session_id,
+                        system_id,
+                        service_type,
+                        scope,
+                        parameter,
+                        before_value,
+                        after_value,
+                        _coerce_optional_float(impact_pct),
+                        confidence,
+                        reasoning,
+                        json.dumps(embedding),
+                    ),
+                )
+            knowledge_id = kid
+        else:
+            self._refresh_existing_fix_fact(
+                knowledge_id=knowledge_id,
+                impact_pct=impact_pct,
+                confidence=confidence,
+                status="active",
+            )
+
+        self.save_validation(
+            knowledge_id=knowledge_id,
+            session_id=session_id,
+            system_id=system_id,
+            outcome=outcome,
+            before_rps=before_rps,
+            after_rps=after_rps,
+            impact_pct=impact_pct,
+            notes=notes,
+        )
+        return knowledge_id
+
+    def _find_fix_fact_by_identity(
+        self,
+        *,
+        system_id: str,
+        parameter: str,
+        before_value: str,
+        after_value: str,
+    ) -> str | None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM knowledge
+                WHERE system_id = %s
+                  AND type = 'fix'
+                  AND status = 'active'
+                  AND parameter = %s
+                  AND COALESCE(before_value, '') = %s
+                  AND COALESCE(after_value, '') = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (system_id, parameter, before_value, after_value),
+            )
+            row = cur.fetchone()
+        return row["id"] if row else None
+
     def get_facts(self, session_id: str, type: str | None = None) -> list[dict]:
         """Backward-compatible: get knowledge entries for this session."""
         with self._cursor() as cur:
