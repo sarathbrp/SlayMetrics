@@ -11,6 +11,7 @@ import core.reporter as reporter
 import rhel.system_checks as system_checks
 from agents import AgentDeps
 from core import log as logger
+from core.lessons import check_leaderboard, get_top_runs
 from telemetry import (
     collect_snapshot,
     persist_sampler_result,
@@ -548,6 +549,26 @@ async def run(model, deps: AgentDeps) -> str:
         )
         logger.status(
             "stability", f"Result: mean={mean_rps:.1f}  stdev={stdev_rps:.1f}  CV={cv:.1f}%"
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 7.5: Leaderboard check (query TiDB — no LLM)
+    # ══════════════════════════════════════════════════════════════════════════
+    leaderboard = check_leaderboard(memory, finals)
+    if leaderboard.get("qualifies") and leaderboard.get("rank"):
+        rank = leaderboard["rank"]
+        logger.status(
+            "leaderboard",
+            f"This run ranks #{rank} with small={leaderboard['current_small']:.0f} RPS",
+        )
+        if leaderboard.get("beats_best"):
+            logger.status("leaderboard", "NEW BEST RUN!")
+    else:
+        top = get_top_runs(memory)
+        floor = top[-1]["small_rps"] if top else 0
+        logger.status(
+            "leaderboard",
+            f"Did not qualify (floor: small>{floor:.0f}, medium>={1300}, large>={180})",
         )
 
     # ══════════════════════════════════════════════════════════════════════════
