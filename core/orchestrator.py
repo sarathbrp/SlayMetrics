@@ -479,6 +479,21 @@ async def run(model, deps: AgentDeps) -> str:
         best_rps = final_small_rps
     memory.update_profile(session_id, best_rps=best_rps)
 
+    # Persist final results to benchmarks table (permanent, not session-scoped)
+    for workload in ("homepage", "small", "medium", "large", "mixed"):
+        wl_data = finals.get(workload, {})
+        if wl_data.get("rps"):
+            memory.save_benchmark(
+                session_id=session_id,
+                iteration_num=iteration,
+                phase="final",
+                payload_size=workload,
+                rps=wl_data.get("rps"),
+                latency_p99_ms=wl_data.get("p99"),
+                cpu_pct=wl_data.get("cpu_pct"),
+                mem_pct=wl_data.get("mem_mb"),
+            )
+
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6.5: Capture system throughput limits (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════

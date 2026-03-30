@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS benchmarks (
     system_id       VARCHAR(64)     NOT NULL,
     iteration_num   INT             NOT NULL,
     phase           ENUM('baseline', 'post_fix', 'final', 'stability', 'scheduled') NOT NULL,
-    payload_size    ENUM('small', 'medium', 'large') NOT NULL,
+    payload_size    ENUM('homepage', 'small', 'medium', 'large', 'mixed') NOT NULL,
     rps             FLOAT,
     latency_avg_ms  FLOAT,
     latency_p99_ms  FLOAT,
