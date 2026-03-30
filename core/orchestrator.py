@@ -1165,6 +1165,26 @@ def _save_optimization_outcome(
         decision,
     )
 
+    # Persist to knowledge table for cross-session learning.
+    # Kept → validated as 'confirmed'; Reverted → validated as 'contradicted'.
+    # get_ranked_optimization_groups() penalizes contradictions on future runs.
+    group_changes = candidate.get("changes", {}) or {}
+    fact_status = "applied" if kept else "reverted"
+    group_name = candidate.get("name", "unknown")
+    for category, params in group_changes.items():
+        if not isinstance(params, dict):
+            continue
+        for param, value in params.items():
+            memory.save_fact(
+                session_id=session_id,
+                type="fix",
+                parameter=f"{category}.{param}",
+                reasoning=f"optimization group '{group_name}': {decision}",
+                before_value="",
+                after_value=str(value),
+                status=fact_status,
+            )
+
 
 def _format_group_changes(changes: dict[str, dict[str, str]]) -> str:
     parts: list[str] = []
