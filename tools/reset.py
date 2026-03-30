@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Reset target system to clean state before a fresh agent run.
 
-Reverts nginx config to default, clears sysctl changes, and optionally
-clears TiDB session data.
+Reverts nginx config to default, clears sysctl/cgroup/iptables/tc changes,
+and optionally clears TiDB session data.
 
 Usage:
     python3 tools/reset.py                      # reset system only
-    python3 tools/reset.py --clear-db           # also clear TiDB sessions
-    python3 tools/reset.py --host 192.168.1.100 # remote target
+    python3 tools/reset.py --clear-db           # clear sessions (keep knowledge)
+    python3 tools/reset.py --clear-leaderboard  # clear leaderboard + knowledge + sessions
+    python3 tools/reset.py --reset-all          # clear EVERYTHING
 """
 
 from __future__ import annotations
@@ -76,6 +77,15 @@ SYSCTL_DEFAULTS = {
     "net.ipv4.tcp_autocorking": "1",
     "net.core.rmem_max": "212992",
     "net.core.wmem_max": "212992",
+    "net.core.rmem_default": "212992",
+    "net.core.wmem_default": "212992",
+    "net.ipv4.tcp_fin_timeout": "60",
+    "net.ipv4.tcp_slow_start_after_idle": "1",
+    "net.ipv4.ip_local_port_range": "32768 60999",
+    "vm.swappiness": "30",
+    "vm.dirty_ratio": "20",
+    "vm.dirty_background_ratio": "10",
+    "vm.vfs_cache_pressure": "100",
 }
 
 
@@ -114,6 +124,38 @@ def reset_system(client) -> None:
         "tuned-adm profile throughput-performance 2>/dev/null || "
         "tuned-adm profile virtual-guest 2>/dev/null || true"
     )
+
+    # 6. Remove systemd drop-ins and cgroup limits
+    print("  [cgroup] Removing systemd drop-ins and cgroup limits...")
+    client.execute("rm -rf /etc/systemd/system/nginx.service.d/")
+    client.execute(
+        "systemctl set-property nginx.service "
+        "CPUQuota= CPUWeight= IOWeight= MemoryMax= 2>/dev/null || true"
+    )
+    client.execute("systemctl daemon-reload")
+
+    # 7. Flush iptables and nftables
+    print("  [firewall] Flushing iptables and nftables...")
+    client.execute("iptables -F 2>/dev/null || true")
+    client.execute("nft flush ruleset 2>/dev/null || true")
+
+    # 8. Remove tc traffic shaping
+    print("  [tc] Removing traffic shaping rules...")
+    nic = client.execute(
+        "ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \\K\\S+' || echo eth0"
+    ).stdout.strip()
+    client.execute(f"tc qdisc del dev {nic} root 2>/dev/null || true")
+
+    # 9. Enable irqbalance
+    print("  [irq] Enabling irqbalance...")
+    client.execute("systemctl enable irqbalance 2>/dev/null || true")
+    client.execute("systemctl start irqbalance 2>/dev/null || true")
+
+    # 10. Kill background hog processes
+    print("  [hogs] Killing background hog processes...")
+    client.execute("pkill -f 'dd if=/dev/zero' 2>/dev/null || true")
+    client.execute("killall stress-ng fio sysbench iperf 2>/dev/null || true")
+    client.execute("rm -f /dev/shm/pressure /tmp/io_pressure 2>/dev/null || true")
 
     # 6. Verify
     print("\n  Verifying...")
@@ -165,6 +207,41 @@ def clear_db(cfg: dict) -> None:
     print("  [tidb] Cleared all sessions (knowledge base and systems preserved)")
 
 
+def clear_leaderboard(cfg: dict) -> None:
+    """Clear benchmarks table (leaderboard data) and associated knowledge.
+
+    Use this for a fresh start of the lessons-learned system while
+    keeping the system identity intact.
+    """
+    import pymysql
+
+    m = cfg["memory"]
+    conn = pymysql.connect(
+        host=m["host"],
+        port=int(m.get("port", 4000)),
+        user=m["user"],
+        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
+        database=m["database"],
+        autocommit=True,
+    )
+    tables_to_clear = [
+        "validations",
+        "benchmarks",
+        "context",
+        "hypothesis_queue",
+        "knowledge",
+        "sessions",
+    ]
+    with conn.cursor() as cur:
+        for table in tables_to_clear:
+            try:
+                cur.execute(f"DELETE FROM {table}")
+            except pymysql.err.ProgrammingError:
+                pass
+    conn.close()
+    print("  [tidb] Cleared leaderboard, knowledge, and all session data (systems preserved)")
+
+
 def reset_all_db(cfg: dict) -> None:
     import pymysql
 
@@ -213,6 +290,11 @@ def main():
     parser.add_argument(
         "--reset-all", action="store_true", help="Clear EVERYTHING in TiDB including knowledge base"
     )
+    parser.add_argument(
+        "--clear-leaderboard",
+        action="store_true",
+        help="Clear leaderboard + knowledge + sessions (fresh lessons-learned start)",
+    )
     args = parser.parse_args()
 
     # Load .env so DUT_HOST resolves in config
@@ -252,6 +334,8 @@ def main():
                 print("  Aborted.")
                 return
             reset_all_db(cfg)
+        elif args.clear_leaderboard:
+            clear_leaderboard(cfg)
         elif args.clear_db:
             clear_db(cfg)
     finally:
