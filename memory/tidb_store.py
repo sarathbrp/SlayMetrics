@@ -462,7 +462,6 @@ class TiDBStore:
         confidence: float = 0.5,
     ) -> str:
         """Save a knowledge entry. Backward-compatible signature with new optional params."""
-        kid = str(uuid.uuid4())
         system_id = self._system_id_for_session(session_id)
 
         # Determine service_type from system
@@ -479,6 +478,37 @@ class TiDBStore:
         k_status = "active"
         if status in ("reverted", "regressed", "negative"):
             k_status = "deprecated"
+
+        # Reuse an existing logical fix for the same system so validations accrue
+        # to one knowledge row instead of duplicating the fact on every run.
+        if system_id and type == "fix":
+            existing_id = self._find_existing_fix_fact(
+                system_id=system_id,
+                parameter=parameter,
+                before_value=before_value,
+                after_value=after_value,
+                reasoning=reasoning,
+            )
+            if existing_id:
+                outcome = "confirmed" if status == "applied" else "contradicted"
+                self._refresh_existing_fix_fact(
+                    knowledge_id=existing_id,
+                    impact_pct=impact_pct,
+                    confidence=confidence,
+                    status=k_status,
+                )
+                self.save_validation(
+                    knowledge_id=existing_id,
+                    session_id=session_id,
+                    system_id=system_id,
+                    outcome=outcome,
+                    before_rps=before_rps,
+                    after_rps=after_rps,
+                    impact_pct=impact_pct,
+                )
+                return existing_id
+
+        kid = str(uuid.uuid4())
 
         with self._cursor() as cur:
             cur.execute(
@@ -523,6 +553,60 @@ class TiDBStore:
             )
 
         return kid
+
+    def _find_existing_fix_fact(
+        self,
+        *,
+        system_id: str,
+        parameter: str,
+        before_value: str,
+        after_value: str,
+        reasoning: str,
+    ) -> str | None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM knowledge
+                WHERE system_id = %s
+                  AND type = 'fix'
+                  AND status = 'active'
+                  AND parameter = %s
+                  AND COALESCE(before_value, '') = %s
+                  AND COALESCE(after_value, '') = %s
+                  AND COALESCE(reasoning, '') = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (system_id, parameter, before_value, after_value, reasoning),
+            )
+            row = cur.fetchone()
+        return row["id"] if row else None
+
+    def _refresh_existing_fix_fact(
+        self,
+        *,
+        knowledge_id: str,
+        impact_pct: float | None = None,
+        confidence: float | None = None,
+        status: str = "active",
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE knowledge
+                SET impact_pct = COALESCE(%s, impact_pct),
+                    confidence = GREATEST(confidence, %s),
+                    status = %s
+                WHERE id = %s
+                """,
+                (
+                    _coerce_optional_float(impact_pct),
+                    _coerce_optional_float(confidence) or 0.0,
+                    status,
+                    knowledge_id,
+                ),
+            )
 
     def get_facts(self, session_id: str, type: str | None = None) -> list[dict]:
         """Backward-compatible: get knowledge entries for this session."""

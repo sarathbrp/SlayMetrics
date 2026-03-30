@@ -384,6 +384,7 @@ def test_save_fact_fix_type_creates_validation(monkeypatch):
     store, conn = _setup(monkeypatch)
     store._system_id_cache["s1"] = "sys-1"
     conn.fetchone_queue.append({"service_type": "nginx", "service": "nginx"})
+    conn.fetchone_queue.append(None)
     store.save_fact("s1", "fix", "worker_connections", "raise limit",
                     before_rps=100.0, after_rps=150.0)
     queries = [q for q, _ in conn.executed]
@@ -395,6 +396,7 @@ def test_save_fact_fix_confirmed_when_applied(monkeypatch):
     store, conn = _setup(monkeypatch)
     store._system_id_cache["s1"] = "sys-1"
     conn.fetchone_queue.append({"service_type": "nginx", "service": "nginx"})
+    conn.fetchone_queue.append(None)
     store.save_fact("s1", "fix", "param", "reason", status="applied")
     insert = next(e for e in conn.executed if "INSERT INTO validations" in e[0])
     assert insert[1][4] == "confirmed"  # outcome
@@ -404,6 +406,7 @@ def test_save_fact_fix_contradicted_when_reverted(monkeypatch):
     store, conn = _setup(monkeypatch)
     store._system_id_cache["s1"] = "sys-1"
     conn.fetchone_queue.append({"service_type": "nginx", "service": "nginx"})
+    conn.fetchone_queue.append(None)
     store.save_fact("s1", "fix", "param", "reason", status="reverted")
     insert = next(e for e in conn.executed if "INSERT INTO validations" in e[0])
     assert insert[1][4] == "contradicted"
@@ -442,9 +445,35 @@ def test_save_fact_coerces_impact_pct(monkeypatch):
     store = _store()
     store.connect()
     conn.fetchone_queue.append(None)
+    conn.fetchone_queue.append(None)
     store.save_fact("s1", "fix", "param", "reason", impact_pct="N/A (reset)")
     insert = next(e for e in conn.executed if "INSERT INTO knowledge" in e[0])
     assert insert[1][10] is None  # impact_pct coerced to None
+
+
+def test_save_fact_fix_reuses_existing_knowledge_row(monkeypatch):
+    store, conn = _setup(monkeypatch)
+    store._system_id_cache["s1"] = "sys-1"
+    conn.fetchone_queue.append({"service_type": "nginx", "service": "nginx"})
+    conn.fetchone_queue.append({"id": "kid-existing"})
+
+    kid = store.save_fact(
+        "s1",
+        "fix",
+        "worker_connections",
+        "raise limit",
+        before_value="512",
+        after_value="65536",
+        before_rps=100.0,
+        after_rps=150.0,
+        impact_pct=50.0,
+    )
+
+    assert kid == "kid-existing"
+    queries = [q for q, _ in conn.executed]
+    assert not any("INSERT INTO knowledge" in q for q in queries)
+    assert any("UPDATE knowledge" in q for q in queries)
+    assert any("INSERT INTO validations" in q for q in queries)
 
 
 def test_get_facts_filtered(monkeypatch):
@@ -857,6 +886,7 @@ def test_tidb_store_methods(monkeypatch):
     assert store.get_profile("s1") == {"session_id": "s1"}
 
     conn.fetchone_queue.append({"service_type": None, "service": "nginx"})  # get_system in save_fact
+    conn.fetchone_queue.append(None)  # _find_existing_fix_fact
     fid = store.save_fact(
         "s1", "fix", "param", "reason", before_value="a", after_value="b", impact_pct=1.5
     )

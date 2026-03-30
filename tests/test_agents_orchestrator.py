@@ -47,6 +47,9 @@ class FakeMemory:
     def update_profile(self, *args, **kwargs):
         self.saved.append(("update", args, kwargs))
 
+    def complete_session(self, *args, **kwargs):
+        self.saved.append(("complete_session", args, kwargs))
+
     def get_token_history(self):
         return []
 
@@ -432,3 +435,4 @@ def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
     report = asyncio.run(orchestrator.run("model", deps))
 
     assert report.endswith("report.md")
+    assert any(item[0] == "complete_session" for item in deps.memory.saved)

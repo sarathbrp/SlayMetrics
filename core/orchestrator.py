@@ -510,8 +510,15 @@ async def run(model, deps: AgentDeps) -> str:
 
     if max_phase <= 3:
         logger.status("main", "Stopping after Phase 3 planning (RCA + recommendations)")
-        memory.update_profile(session_id, status="completed")
         _save_token_usage(memory, session_id, deps.token_counter)
+        fixes_applied_count = len(memory.get_facts(session_id, type="fix") or [])
+        memory.complete_session(
+            session_id,
+            total_tokens=deps.token_counter.total,
+            fixes_applied=fixes_applied_count,
+            rps_start=baseline_rps,
+            rps_end=baseline_rps,
+        )
         token_history = memory.get_token_history()
         report_path = reporter.generate(
             session_id,
@@ -705,8 +712,14 @@ async def run(model, deps: AgentDeps) -> str:
     logger.step("Step 8: Generating report...")
 
     _save_token_usage(memory, session_id, deps.token_counter)
-
-    memory.update_profile(session_id, status="completed")
+    fixes_applied_count = len(memory.get_facts(session_id, type="fix") or [])
+    memory.complete_session(
+        session_id,
+        total_tokens=deps.token_counter.total,
+        fixes_applied=fixes_applied_count,
+        rps_start=baseline_rps,
+        rps_end=best_rps,
+    )
 
     token_history = memory.get_token_history()
 
