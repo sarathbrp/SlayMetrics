@@ -1801,6 +1801,19 @@ def build(model, config=None) -> DiagnosisWorkflow:
                         }
                     )
 
+        # Normalize values to canonical forms before saving
+        _VALUE_ALIASES = {
+            "enabled": "active",
+            "on": "active",
+            "true": "active",
+            "True": "active",
+            "30s": "30",
+        }
+        for f in findings:
+            val = f.get("after_value", "")
+            if val in _VALUE_ALIASES:
+                f["after_value"] = _VALUE_ALIASES[val]
+
         if findings:
             save_findings_impl(deps, findings)
 
