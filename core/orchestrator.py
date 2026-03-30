@@ -11,7 +11,7 @@ import core.reporter as reporter
 import rhel.system_checks as system_checks
 from agents import AgentDeps
 from core import log as logger
-from core.lessons import check_leaderboard, get_top_runs
+from core.lessons import check_leaderboard, get_best_run_params, get_top_runs, merge_targets
 from telemetry import (
     collect_snapshot,
     persist_sampler_result,
@@ -91,6 +91,42 @@ async def run(model, deps: AgentDeps) -> str:
         f"{rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB"
     )
     logger.status("system", f"RHEL: {deps.system_fingerprint}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 1.6: Load lessons learned — merge proven params from best run
+    # ══════════════════════════════════════════════════════════════════════════
+    top_runs = get_top_runs(memory)
+    if top_runs:
+        best = top_runs[0]
+        logger.status(
+            "lessons",
+            f"Best prior run: {best['session_id']} "
+            f"(small={best['small_rps']:.0f} RPS, {best['tokens']} tokens)",
+        )
+        proven = get_best_run_params(memory)
+        if proven:
+            tuning = cfg.get("tuning") or {}
+            config_targets = {
+                "webserver": tuning.get("webserver_targets") or {},
+                "kernel": tuning.get("kernel_targets") or {},
+                "resource_limits": tuning.get("resource_limits_targets") or {},
+                "network": tuning.get("network_targets") or {},
+                "storage": tuning.get("storage_targets") or {},
+            }
+            merged = merge_targets(config_targets, proven)
+            # Write merged targets back into config so all downstream code uses them
+            for cat, key in (
+                ("webserver", "webserver_targets"),
+                ("kernel", "kernel_targets"),
+                ("resource_limits", "resource_limits_targets"),
+                ("network", "network_targets"),
+                ("storage", "storage_targets"),
+            ):
+                if cat in merged:
+                    tuning[key] = merged[cat]
+            logger.status("lessons", f"Merged {len(proven)} proven params into targets")
+    else:
+        logger.status("lessons", "No prior qualifying runs — using config.yaml defaults")
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1.7: Pre-flight validation (LLM-assisted)

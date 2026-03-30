@@ -1718,10 +1718,27 @@ def build(model, config=None) -> DiagnosisWorkflow:
             system_applied=kern_applied,
         )
 
-        # Build findings from all categories
+        # Build findings from all categories, enriched with RCA context
         inspection = state.get("inspection") or {}
         web_current = inspection.get("webserver", {}).get("current") or {}
         kern_current = inspection.get("kernel", {}).get("current") or {}
+
+        # Build RCA lookup: map parameter names to their root cause + evidence
+        rca_records = state.get("rca_records") or []
+        rca_by_param: dict[str, str] = {}
+        for rca in rca_records:
+            symptom = rca.get("symptom", "")
+            root_cause = rca.get("root_cause", "")
+            evidence = rca.get("evidence", [])
+            evidence_str = "; ".join(str(e) for e in evidence[:3]) if evidence else ""
+            rca_text = f"{root_cause}"
+            if evidence_str:
+                rca_text += f" [evidence: {evidence_str[:200]}]"
+            # Match RCA to params by checking if param name appears in symptom/cause
+            for param in list(web_current.keys()) + list(kern_current.keys()):
+                if param in symptom or param in root_cause:
+                    rca_by_param[param] = rca_text
+
         findings: list[dict[str, Any]] = []
         for param in web_applied if isinstance(web_applied, list) else web_applied.keys():
             findings.append(
@@ -1729,7 +1746,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     "parameter": f"webserver.{param}",
                     "before_value": web_current.get(param, ""),
                     "after_value": web_changes.get(param, ""),
-                    "reasoning": "config-driven tuning",
+                    "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
             )
         for param, value in kern_applied.items():
@@ -1738,17 +1755,19 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     "parameter": f"kernel.{param}",
                     "before_value": kern_current.get(param, ""),
                     "after_value": value,
-                    "reasoning": "config-driven tuning",
+                    "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
             )
         for cat in ("resource_limits", "network", "storage"):
+            cat_problems = inspection.get(cat, {}).get("problems", [])
+            problem_text = "; ".join(str(p) for p in cat_problems[:3]) if cat_problems else ""
             for action in results.get(cat, {}).get("actions", []):
                 findings.append(
                     {
                         "parameter": f"{cat}",
                         "before_value": "",
                         "after_value": action,
-                        "reasoning": "config-driven fix",
+                        "reasoning": problem_text or "config-driven fix",
                     }
                 )
 
