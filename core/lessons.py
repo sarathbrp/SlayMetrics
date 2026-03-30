@@ -256,3 +256,104 @@ def check_leaderboard(
         "top_runs": top,
         "current_small": current_small,
     }
+
+
+def compute_delta(
+    memory,
+    current_session_id: str,
+    system_id: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Compare current session's applied params vs #1's params.
+
+    Returns categorized delta: {category: {param: value}} for params
+    that #1 had but current session is missing or has different values.
+    Used for deterministic iter2 — apply only what LLM missed.
+    """
+    proven = get_best_run_params(memory, system_id)
+    if not proven:
+        return {}
+
+    # Get current session's applied params
+    with memory._cursor() as cur:
+        cur.execute(
+            """
+            SELECT parameter, after_value
+            FROM knowledge
+            WHERE discovered_by = %s
+              AND type = 'fix'
+              AND status = 'active'
+              AND parameter IS NOT NULL
+              AND after_value IS NOT NULL
+            """,
+            (current_session_id,),
+        )
+        rows = cur.fetchall()
+
+    current = {r["parameter"]: r["after_value"] for r in rows}
+
+    # Diff: params in proven but missing or different in current
+    delta: dict[str, dict[str, str]] = {}
+    for full_key, proven_value in proven.items():
+        current_value = current.get(full_key)
+        if current_value is None or current_value != proven_value:
+            parts = full_key.split(".", 1)
+            if len(parts) == 2:
+                cat, param = parts
+            else:
+                cat, param = "kernel", full_key
+            delta.setdefault(cat, {})[param] = proven_value
+
+    return delta
+
+
+def apply_delta(deps, delta: dict[str, dict[str, str]]) -> dict[str, Any]:
+    """Apply only the delta params deterministically — no LLM, 0 tokens.
+
+    Reuses existing apply functions from agents/tools_apply.py.
+    """
+    from agents.tools_apply import apply_kernel, apply_network, apply_resource_limits, apply_storage
+    from core import log as logger
+
+    ssh = deps.ssh
+    results: dict[str, Any] = {}
+
+    # Webserver (nginx) — apply via adapter
+    web_delta = delta.get("webserver", {})
+    if web_delta:
+        logger.status("delta", f"Applying {len(web_delta)} nginx delta params")
+        applied, failed = [], []
+        for param, value in web_delta.items():
+            if deps.adapter.apply_config(param, value):
+                applied.append(param)
+            else:
+                failed.append(param)
+        # Reload nginx
+        reload_result = ssh.execute("nginx -t 2>&1 && nginx -s reload 2>&1")
+        reload_ok = "syntax is ok" in reload_result.stdout or reload_result.exit_code == 0
+        results["webserver"] = {"applied": applied, "failed": failed, "reload": reload_ok}
+
+    # Kernel (sysctls + THP + SELinux + IRQ + governor)
+    kern_delta = delta.get("kernel", {})
+    if kern_delta:
+        logger.status("delta", f"Applying {len(kern_delta)} kernel delta params")
+        results["kernel"] = apply_kernel(ssh, kern_delta)
+
+    # Resource limits
+    res_delta = delta.get("resource_limits", {})
+    if res_delta:
+        logger.status("delta", f"Applying {len(res_delta)} resource_limits delta params")
+        results["resource_limits"] = apply_resource_limits(ssh, res_delta)
+
+    # Network
+    net_delta = delta.get("network", {})
+    if net_delta:
+        logger.status("delta", f"Applying {len(net_delta)} network delta params")
+        results["network"] = apply_network(ssh, net_delta)
+
+    # Storage
+    stor_delta = delta.get("storage", {})
+    if stor_delta:
+        logger.status("delta", f"Applying {len(stor_delta)} storage delta params")
+        results["storage"] = apply_storage(ssh, stor_delta)
+
+    return results

@@ -12,7 +12,9 @@ import rhel.system_checks as system_checks
 from agents import AgentDeps
 from core import log as logger
 from core.lessons import (
+    apply_delta,
     check_leaderboard,
+    compute_delta,
     get_best_run_params,
     get_prior_knowledge_text,
     get_top_runs,
@@ -310,46 +312,80 @@ async def run(model, deps: AgentDeps) -> str:
     diagnosis = None
     iteration_finals: dict[str, Any] = {}
 
+    has_top_runs = bool(top_runs)
+
     for iteration in range(1, max_iterations + 1):
-        logger.step(
-            f"Step 5: Iteration {iteration}/{max_iterations} — RCA and recommendation planning..."
-        )
-        # Pass iteration number to agent for per-iteration hypothesis files
         deps.iteration = iteration  # type: ignore[attr-defined]
 
-        context_prompt = _build_context_prompt(
-            rhel_ver=rhel_ver,
-            kernel_ver=kernel_ver,
-            cpu_cores=cpu_cores,
-            ram_gb=ram_gb,
-            checks_summary=checks_summary,
-            benchmark_evidence_text=benchmark_evidence_text,
-            prior_fixes=prior_fixes,
-            prior_knowledge=prior_knowledge_text,
-        )
-        if iteration_feedback:
-            context_prompt += f"\n{iteration_feedback}\n"
+        if iteration == 1 or not has_top_runs:
+            # ── ITERATION 1: LLM debate — give it a chance ──
+            logger.step(f"Step 5: Iteration {iteration}/{max_iterations} — LLM debate...")
 
-        logger.log(
-            "orchestrator",
-            f"Context prompt: {len(context_prompt)} chars (iteration {iteration})",
-            "info",
-        )
-
-        with (
-            langfuse.span(
-                "diagnosis_planning",
-                input={
-                    "context_prompt_length": len(context_prompt),
-                    "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "debate"),
-                    "iteration": iteration,
-                },
-                metadata={"session_id": session_id},
+            context_prompt = _build_context_prompt(
+                rhel_ver=rhel_ver,
+                kernel_ver=kernel_ver,
+                cpu_cores=cpu_cores,
+                ram_gb=ram_gb,
+                checks_summary=checks_summary,
+                benchmark_evidence_text=benchmark_evidence_text,
+                prior_fixes=prior_fixes,
+                prior_knowledge=prior_knowledge_text,
             )
-            if langfuse
-            else nullcontext()
-        ):
-            diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
+            if iteration_feedback:
+                context_prompt += f"\n{iteration_feedback}\n"
+
+            logger.log(
+                "orchestrator",
+                f"Context prompt: {len(context_prompt)} chars (iteration {iteration})",
+                "info",
+            )
+
+            with (
+                langfuse.span(
+                    "diagnosis_planning",
+                    input={
+                        "context_prompt_length": len(context_prompt),
+                        "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "debate"),
+                        "iteration": iteration,
+                    },
+                    metadata={"session_id": session_id},
+                )
+                if langfuse
+                else nullcontext()
+            ):
+                diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
+        else:
+            # ── ITERATION 2+: Deterministic delta — apply what LLM missed ──
+            logger.step(
+                f"Step 5: Iteration {iteration}/{max_iterations} — deterministic delta from #1..."
+            )
+            delta = compute_delta(memory, session_id)
+            if not delta:
+                logger.status("delta", "No delta — LLM already matched #1")
+                break
+            total_delta = sum(len(v) for v in delta.values())
+            logger.status(
+                "delta",
+                f"Applying {total_delta} params that differ from #1",
+            )
+            apply_delta(deps, delta)
+            # Create a minimal diagnosis-like object so downstream code works
+            diagnosis = type(
+                "DeltaDiagnosis",
+                (),
+                {
+                    "nginx_applied": bool(delta.get("webserver")),
+                    "system_applied": bool(
+                        delta.get("kernel")
+                        or delta.get("resource_limits")
+                        or delta.get("network")
+                        or delta.get("storage")
+                    ),
+                    "output": "Deterministic delta applied from #1",
+                    "notes": f"Applied {total_delta} delta params from best run",
+                    "summary": f"Applied {total_delta} delta params from best run",
+                },
+            )()
 
         # Check if any changes were applied
         nginx_applied = getattr(diagnosis, "nginx_applied", False)
