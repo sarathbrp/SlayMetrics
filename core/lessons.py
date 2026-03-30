@@ -10,6 +10,7 @@ Top 3 leaderboard is a SQL query, not a separate table.
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -18,6 +19,110 @@ log = logging.getLogger(__name__)
 QUALIFY_MEDIUM_RPS = 1300.0
 QUALIFY_LARGE_RPS = 180.0
 LEADERBOARD_SIZE = 3
+
+OPTIMIZATION_GROUPS: dict[str, dict[str, Any]] = {
+    "accept_path": {
+        "description": "Connection admission and queue depth",
+        "risk": "low",
+        "params": (
+            "webserver.worker_connections",
+            "webserver.listen_backlog",
+            "kernel.net.core.somaxconn",
+            "kernel.net.ipv4.tcp_max_syn_backlog",
+            "kernel.net.core.netdev_max_backlog",
+        ),
+    },
+    "nginx_worker_model": {
+        "description": "Worker parallelism and accept loop behavior",
+        "risk": "low",
+        "params": (
+            "webserver.worker_processes",
+            "webserver.worker_cpu_affinity",
+            "webserver.multi_accept",
+            "webserver.accept_mutex",
+        ),
+    },
+    "http_connection_reuse": {
+        "description": "Keepalive and request lifecycle tuning",
+        "risk": "low",
+        "params": (
+            "webserver.keepalive_requests",
+            "webserver.keepalive_timeout",
+            "webserver.tcp_nodelay",
+            "webserver.tcp_nopush",
+            "webserver.reset_timedout_connection",
+        ),
+    },
+    "fd_and_file_cache": {
+        "description": "Descriptor limits and static file cache",
+        "risk": "low",
+        "params": (
+            "webserver.worker_rlimit_nofile",
+            "webserver.open_file_cache",
+            "webserver.open_file_cache_valid",
+            "webserver.open_file_cache_min_uses",
+        ),
+    },
+    "logging_and_rate_limits": {
+        "description": "Request-path overhead and throttling controls",
+        "risk": "medium",
+        "params": (
+            "webserver.access_log",
+            "webserver.error_log_level",
+            "webserver.limit_req",
+            "webserver.limit_conn",
+            "webserver.limit_rate",
+            "webserver.limit_rate_after",
+        ),
+    },
+    "socket_buffers": {
+        "description": "Socket buffer sizing for high-throughput connections",
+        "risk": "medium",
+        "params": (
+            "kernel.net.core.rmem_max",
+            "kernel.net.core.wmem_max",
+            "kernel.net.core.rmem_default",
+            "kernel.net.core.wmem_default",
+            "kernel.net.ipv4.tcp_rmem",
+            "kernel.net.ipv4.tcp_wmem",
+        ),
+    },
+    "tcp_lifecycle": {
+        "description": "TCP connection turnover and idle behavior",
+        "risk": "medium",
+        "params": (
+            "kernel.net.ipv4.tcp_tw_reuse",
+            "kernel.net.ipv4.tcp_fin_timeout",
+            "kernel.net.ipv4.tcp_max_tw_buckets",
+            "kernel.net.ipv4.tcp_slow_start_after_idle",
+            "kernel.net.ipv4.tcp_max_orphans",
+        ),
+    },
+    "memory_writeback": {
+        "description": "Memory pressure and writeback tuning",
+        "risk": "medium",
+        "params": (
+            "kernel.vm.swappiness",
+            "kernel.vm.vfs_cache_pressure",
+            "kernel.vm.dirty_ratio",
+            "kernel.vm.dirty_background_ratio",
+            "kernel.vm.dirty_expire_centisecs",
+            "kernel.vm.dirty_writeback_centisecs",
+        ),
+    },
+    "platform_latency": {
+        "description": "Platform-level latency knobs",
+        "risk": "high",
+        "params": (
+            "kernel.irqbalance",
+            "kernel.transparent_hugepage",
+            "kernel.cpu_governor",
+            "kernel.selinux",
+        ),
+    },
+}
+
+GROUP_RISK_PENALTY = {"low": 1.0, "medium": 3.0, "high": 5.0}
 
 
 def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
@@ -81,7 +186,8 @@ def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
 def get_best_run_params(memory, system_id: str | None = None) -> dict[str, str]:
     """Return the applied params snapshot from the #1 best run.
 
-    Reads from knowledge table: all 'fix' entries from the best session.
+    Reads from validations + knowledge so reused logical fix facts still map
+    back to the session where they were confirmed.
     Returns {parameter: after_value} dict.
     """
     top = get_top_runs(memory, system_id)
@@ -92,13 +198,15 @@ def get_best_run_params(memory, system_id: str | None = None) -> dict[str, str]:
     with memory._cursor() as cur:
         cur.execute(
             """
-            SELECT parameter, after_value
-            FROM knowledge
-            WHERE discovered_by = %s
-              AND type = 'fix'
-              AND status = 'active'
-              AND parameter IS NOT NULL
-              AND after_value IS NOT NULL
+            SELECT k.parameter, k.after_value
+            FROM validations v
+            JOIN knowledge k ON k.id = v.knowledge_id
+            WHERE v.session_id = %s
+              AND v.outcome IN ('confirmed', 'partial')
+              AND k.type = 'fix'
+              AND k.status = 'active'
+              AND k.parameter IS NOT NULL
+              AND k.after_value IS NOT NULL
             """,
             (best_session,),
         )
@@ -253,7 +361,6 @@ def check_leaderboard(
     current_small = float(results.get("small", {}).get("rps", 0) or 0)
     top = get_top_runs(memory, system_id)
 
-    # Determine rank
     rank = None
     for i, run in enumerate(top):
         if current_small > run["small_rps"]:
@@ -269,6 +376,216 @@ def check_leaderboard(
         "top_runs": top,
         "current_small": current_small,
     }
+
+
+def get_ranked_optimization_groups(
+    memory,
+    current_state: dict[str, str],
+    *,
+    system_id: str | None = None,
+    top_n: int = LEADERBOARD_SIZE,
+) -> list[dict[str, Any]]:
+    """Rank optimization groups using top-run prevalence and validation history."""
+    top_runs = get_top_runs(memory, system_id)[:top_n]
+    if not top_runs:
+        return []
+
+    session_ids = [run["session_id"] for run in top_runs]
+    session_weight = {run["session_id"]: max(top_n - idx, 1) for idx, run in enumerate(top_runs)}
+    evidence = _get_fix_evidence_for_sessions(memory, session_ids)
+    evidence_by_param: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in evidence:
+        evidence_by_param[row["parameter"]].append(row)
+
+    ranked: list[dict[str, Any]] = []
+    for name, spec in OPTIMIZATION_GROUPS.items():
+        candidate_params: dict[str, str] = {}
+        current_params: dict[str, str] = {}
+        reasons: list[str] = []
+        score = 0.0
+        evidence_params = 0
+        matched_params = 0
+        support_hits = 0
+        confirm_total = 0
+        contradict_total = 0
+        prevalence_bucket = {3: 0, 2: 0, 1: 0}
+
+        for full_param in spec["params"]:
+            param_rows = evidence_by_param.get(full_param) or []
+            if not param_rows:
+                continue
+            evidence_params += 1
+            choice = _choose_param_value(param_rows, session_weight)
+            if not choice:
+                continue
+
+            current_value = current_state.get(full_param, "unknown")
+            current_params[full_param] = current_value
+            normalized_current = _normalize_value(current_value)
+            normalized_target = _normalize_value(choice["value"])
+
+            if normalized_current == normalized_target:
+                matched_params += 1
+                continue
+
+            candidate_params[full_param] = choice["value"]
+            prevalence = int(choice["session_count"])
+            support_hits += prevalence
+            confirm_total += int(choice["confirmed"])
+            contradict_total += int(choice["contradicted"])
+            prevalence_bucket[prevalence] = prevalence_bucket.get(prevalence, 0) + 1
+            score += _prevalence_score(prevalence, top_n)
+            score += min(float(choice["confirmed"]), 5.0)
+            score -= float(choice["contradicted"]) * 2.0
+            score += 1.0
+
+        if not candidate_params:
+            continue
+
+        completeness = (
+            (matched_params + len(candidate_params)) / evidence_params if evidence_params else 0
+        )
+        if completeness >= 0.8:
+            score += 3.0
+        elif completeness >= 0.5:
+            score += 1.5
+        if len(candidate_params) == 1:
+            score -= 1.0
+
+        risk = spec["risk"]
+        score -= GROUP_RISK_PENALTY.get(risk, 0.0)
+        reasons.append(f"{len(candidate_params)} params differ from the current healthy state")
+        reasons.append(
+            f"top-run prevalence: {prevalence_bucket.get(3, 0)} core, "
+            f"{prevalence_bucket.get(2, 0)} conditional, {prevalence_bucket.get(1, 0)} experimental"
+        )
+        reasons.append(
+            f"validation strength: {confirm_total} confirmations, {contradict_total} contradictions"
+        )
+        reasons.append(f"group completeness after apply: {completeness:.0%}")
+        reasons.append(f"risk penalty: {risk}")
+
+        ranked.append(
+            {
+                "name": name,
+                "description": spec["description"],
+                "risk": risk,
+                "score": round(score, 2),
+                "reasons": reasons,
+                "changes": _categorize_changes(candidate_params),
+                "current": current_params,
+                "evidence_params": evidence_params,
+                "support_hits": support_hits,
+            }
+        )
+
+    ranked.sort(key=lambda item: (-item["score"], item["name"]))
+    return ranked
+
+
+def _get_fix_evidence_for_sessions(memory, session_ids: list[str]) -> list[dict[str, Any]]:
+    if not session_ids:
+        return []
+    placeholders = ",".join(["%s"] * len(session_ids))
+    with memory._cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                v.session_id AS session_id,
+                k.parameter AS parameter,
+                k.after_value AS after_value,
+                SUM(CASE WHEN v_all.outcome = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_count,
+                SUM(CASE WHEN v_all.outcome = 'contradicted'
+                    THEN 1 ELSE 0 END) AS contradicted_count
+            FROM validations v
+            JOIN knowledge k ON k.id = v.knowledge_id
+            LEFT JOIN validations v_all ON v_all.knowledge_id = k.id
+            WHERE v.session_id IN ({placeholders})
+              AND v.outcome IN ('confirmed', 'partial')
+              AND k.type = 'fix'
+              AND k.status = 'active'
+              AND k.parameter IS NOT NULL
+              AND k.after_value IS NOT NULL
+            GROUP BY v.session_id, k.id, k.parameter, k.after_value
+            """,
+            tuple(session_ids),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "session_id": row["session_id"],
+            "parameter": row["parameter"],
+            "after_value": row["after_value"],
+            "confirmed_count": int(row["confirmed_count"] or 0),
+            "contradicted_count": int(row["contradicted_count"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def _choose_param_value(
+    rows: list[dict[str, Any]], session_weight: dict[str, int]
+) -> dict[str, Any] | None:
+    by_value: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        value = str(row["after_value"])
+        entry = by_value.setdefault(
+            value,
+            {
+                "value": value,
+                "sessions": set(),
+                "rank_weight": 0,
+                "confirmed": 0,
+                "contradicted": 0,
+            },
+        )
+        session_id = row["session_id"]
+        entry["sessions"].add(session_id)
+        entry["rank_weight"] += session_weight.get(session_id, 1)
+        entry["confirmed"] += int(row["confirmed_count"] or 0)
+        entry["contradicted"] += int(row["contradicted_count"] or 0)
+    if not by_value:
+        return None
+
+    chosen = sorted(
+        by_value.values(),
+        key=lambda item: (
+            -len(item["sessions"]),
+            -item["rank_weight"],
+            -(item["confirmed"] - item["contradicted"]),
+            item["value"],
+        ),
+    )[0]
+    return {
+        "value": chosen["value"],
+        "session_count": len(chosen["sessions"]),
+        "confirmed": chosen["confirmed"],
+        "contradicted": chosen["contradicted"],
+    }
+
+
+def _prevalence_score(prevalence: int, top_n: int) -> float:
+    if prevalence >= top_n:
+        return 5.0
+    if prevalence >= 2:
+        return 2.0
+    return 0.5
+
+
+def _categorize_changes(changes: dict[str, str]) -> dict[str, dict[str, str]]:
+    categorized: dict[str, dict[str, str]] = {}
+    for full_param, value in changes.items():
+        if "." not in full_param:
+            continue
+        category, param = full_param.split(".", 1)
+        categorized.setdefault(category, {})[param] = value
+    return categorized
+
+
+def _normalize_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return " ".join(str(value).strip().lower().split())
 
 
 def compute_delta(

@@ -15,6 +15,8 @@ def generate(
     output_dir: str = "report",
     baselines: dict | None = None,
     finals: dict | None = None,
+    best_results: dict | None = None,
+    best_iteration: int | None = None,
     stability: dict | None = None,
     throughput: dict | None = None,
     token_history: list | None = None,
@@ -25,6 +27,9 @@ def generate(
     facts = memory.get_facts(session_id)
     rca_entries = memory.get_contexts(session_id, type="rca")
     recommendation_entries = memory.get_contexts(session_id, type="recommendation")
+    optimization_entries = memory.get_contexts(
+        session_id, type="command_output", source_prefix="optimization_"
+    )
     queue = memory.get_queue(session_id)
 
     fixes = [f for f in facts if f.get("type") == "fix"]
@@ -33,6 +38,8 @@ def generate(
 
     baseline_rps = profile.get("baseline_rps", 0.0) or 0.0
     best_rps = profile.get("best_rps", 0.0) or 0.0
+    best_results = best_results or finals or {}
+    final_small_rps = (finals or {}).get("small", {}).get("rps", 0.0) or 0.0
     total_improvement = ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
 
     # ── Markdown report ──────────────────────────────────────────────────────
@@ -44,15 +51,19 @@ def generate(
         queue,
         baseline_rps,
         best_rps,
+        final_small_rps,
         total_improvement,
         token_counter,
         baselines=baselines,
         finals=finals,
+        best_results=best_results,
+        best_iteration=best_iteration,
         stability=stability,
         throughput=throughput,
         token_history=token_history,
         rca_entries=rca_entries,
         recommendation_entries=recommendation_entries,
+        optimization_entries=optimization_entries,
     )
 
     # ── JSON report ──────────────────────────────────────────────────────────
@@ -62,9 +73,12 @@ def generate(
         "profile": {k: v for k, v in profile.items() if k != "id"},
         "baseline_rps": baseline_rps,
         "best_rps": best_rps,
+        "final_small_rps": final_small_rps,
         "total_improvement_pct": round(total_improvement, 2),
         "baselines_by_size": baselines or {},
         "finals_by_size": finals or {},
+        "best_results_by_size": best_results or {},
+        "best_iteration": best_iteration,
         "stability": stability or {},
         "throughput": throughput or {},
         "fixes_applied": [_clean(f) for f in fixes],
@@ -72,6 +86,7 @@ def generate(
         "negatives": [_clean(f) for f in negatives],
         "rca": [_clean(_clean_rca_entry(entry)) for entry in rca_entries],
         "recommendations": [_clean(_clean_rca_entry(entry)) for entry in recommendation_entries],
+        "optimization": [_clean(_clean_rca_entry(entry)) for entry in optimization_entries],
         "hypothesis_queue": [_clean(q) for q in queue],
         "tokens": {
             "input": token_counter.input_tokens,
@@ -110,15 +125,19 @@ def _md_report(
     queue,
     baseline_rps,
     best_rps,
+    final_small_rps,
     total_improvement,
     token_counter,
     baselines=None,
     finals=None,
+    best_results=None,
+    best_iteration=None,
     stability=None,
     throughput=None,
     token_history=None,
     rca_entries=None,
     recommendation_entries=None,
+    optimization_entries=None,
 ) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     service = profile.get("service", "unknown")
@@ -139,7 +158,9 @@ def _md_report(
         "|--|--|",
         f"| Service | {service} on {host} |",
         f"| Baseline RPS (small) | {baseline_rps:.1f} |",
-        f"| Best RPS (small) | {best_rps:.1f} |",
+        f"| Best Achieved RPS (small) | {best_rps:.1f} |",
+        f"| Final State RPS (small) | {final_small_rps:.1f} |",
+        f"| Best iteration | {best_iteration or 'n/a'} |",
         f"| Total improvement | **{total_improvement:+.1f}%** |",
         f"| Fixes applied | {len(fixes)} |",
         f"| LLM profile | {llm} |",
@@ -163,17 +184,18 @@ def _md_report(
         lines += [
             "## Benchmark Results by Payload Size",
             "",
-            "| Payload | Baseline RPS | Baseline p99 | Final RPS | Final p99 | Improvement |",
-            "|---------|-------------|-------------|-----------|-----------|-------------|",
+            "| Payload | Baseline RPS | Best RPS | Final RPS | Final p99 | Improvement |",
+            "|---------|-------------|----------|-----------|-----------|-------------|",
         ]
         for size in ["small", "medium", "large"]:
             b = (baselines or {}).get(size, {})
+            best = (best_results or {}).get(size, {})
             f = (finals or {}).get(size, {})
             b_rps = b.get("rps", 0)
             f_rps = f.get("rps", 0)
             imp = ((f_rps - b_rps) / b_rps * 100) if b_rps else 0
             lines.append(
-                f"| {size} | {b_rps:.1f} | {b.get('p99', 0):.1f}ms "
+                f"| {size} | {b_rps:.1f} | {best.get('rps', 0):.1f} "
                 f"| {f_rps:.1f} | {f.get('p99', 0):.1f}ms | **{imp:+.1f}%** |"
             )
         lines += ["", "---", ""]
@@ -319,6 +341,24 @@ def _md_report(
                 f"- Expected benefit: {data.get('expected_benefit', 'No expected benefit')}",
                 f"- Risk level: {data.get('risk_level', 'unknown')}",
                 f"- Validation: {data.get('validation', 'No validation method')}",
+                "",
+            ]
+        lines += ["---", ""]
+
+    if optimization_entries:
+        lines += ["## Optimization Decisions", ""]
+        for entry in optimization_entries:
+            data = _clean_rca_entry(entry)
+            if "group" not in data:
+                continue
+            reasons = data.get("reasons", [])
+            reason_text = "; ".join(str(reason) for reason in reasons) if reasons else "n/a"
+            lines += [
+                f"### {data.get('group', 'unknown')}",
+                f"- Decision: {data.get('decision', 'n/a')}",
+                f"- Score: {data.get('score', 0)}",
+                f"- Risk: {data.get('risk', 'unknown')}",
+                f"- Reasons: {reason_text}",
                 "",
             ]
         lines += ["---", ""]

@@ -4,6 +4,7 @@ import json
 import os
 import statistics
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any
 
 import agents.agent as diagnosis_agent
@@ -12,11 +13,10 @@ import rhel.system_checks as system_checks
 from agents import AgentDeps
 from core import log as logger
 from core.lessons import (
-    apply_delta,
     check_leaderboard,
-    compute_delta,
     get_best_run_params,
     get_prior_knowledge_text,
+    get_ranked_optimization_groups,
     get_top_runs,
     merge_targets,
 )
@@ -308,17 +308,81 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 5: RCA + recommendations (ITERATION LOOP)
     # ══════════════════════════════════════════════════════════════════════════
     max_iterations = int((cfg.get("agent") or {}).get("max_iterations", 3))
+    optimization_cfg = ((cfg.get("agent") or {}).get("optimization") or {}).copy()
+    optimization_enabled = bool(optimization_cfg.get("enabled", False))
+    optimization_top_n = int(optimization_cfg.get("top_runs", 3) or 3)
+    optimization_min_gain_pct = float(optimization_cfg.get("min_small_gain_pct", 1.0) or 1.0)
+    optimization_gap_pct = float(optimization_cfg.get("leaderboard_gap_pct", 3.0) or 3.0)
     iteration_feedback = ""
-    diagnosis = None
+    diagnosis: Any = None
     iteration_finals: dict[str, Any] = {}
-
+    healthy_results: dict[str, Any] = {}
+    final_results: dict[str, Any] = {}
+    best_results = dict(baselines)
+    best_iteration = 0
+    rejected_optimization_groups: set[str] = set()
+    in_optimization_mode = False
     has_top_runs = bool(top_runs)
 
     for iteration in range(1, max_iterations + 1):
         deps.iteration = iteration  # type: ignore[attr-defined]
 
-        if iteration == 1 or not has_top_runs:
-            # ── ITERATION 1: LLM debate — give it a chance ──
+        if in_optimization_mode:
+            logger.step(f"Step 5: Iteration {iteration}/{max_iterations} — ranked optimization...")
+            current_state = _collect_current_state(deps)
+            ranked_groups = [
+                group
+                for group in get_ranked_optimization_groups(
+                    memory,
+                    current_state,
+                    top_n=optimization_top_n,
+                )
+                if group["name"] not in rejected_optimization_groups
+            ]
+            _save_optimization_considered(memory, session_id, iteration, ranked_groups)
+            if not ranked_groups:
+                decision = "No ranked optimization groups remain — stopping"
+                logger.status("optimization", decision)
+                diagnosis_agent.save_iteration_summary(
+                    deps,
+                    iteration=iteration,
+                    baselines=baselines,
+                    results=healthy_results or final_results or baselines,
+                    regressions=[],
+                    decision=decision,
+                    diagnosis=SimpleNamespace(
+                        nginx_applied=False,
+                        system_applied=False,
+                        recommendations=[],
+                    ),
+                )
+                break
+
+            candidate = ranked_groups[0]
+            logger.status(
+                "optimization",
+                f"Selected group {candidate['name']} score={candidate['score']:.2f}",
+            )
+            snapshot = _snapshot_optimization_state(deps, candidate)
+            apply_result = _apply_optimization_group(deps, candidate)
+            total_changes = sum(len(values) for values in candidate.get("changes", {}).values())
+            diagnosis = SimpleNamespace(
+                nginx_applied=bool(candidate.get("changes", {}).get("webserver")),
+                system_applied=bool(candidate.get("changes", {}).get("kernel")),
+                output=f"Optimization group {candidate['name']} applied",
+                notes=f"Applied optimization group {candidate['name']} ({total_changes} params)",
+                summary=f"Applied optimization group {candidate['name']} ({total_changes} params)",
+                recommendations=[
+                    {
+                        "title": candidate["name"],
+                        "scope": "optimization",
+                        "changes": candidate["changes"],
+                    }
+                ],
+                optimization_group=candidate,
+                optimization_apply=apply_result,
+            )
+        else:
             logger.step(f"Step 5: Iteration {iteration}/{max_iterations} — LLM debate...")
 
             context_prompt = _build_context_prompt(
@@ -354,40 +418,7 @@ async def run(model, deps: AgentDeps) -> str:
                 else nullcontext()
             ):
                 diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
-        else:
-            # ── ITERATION 2+: Deterministic delta — apply what LLM missed ──
-            logger.step(
-                f"Step 5: Iteration {iteration}/{max_iterations} — deterministic delta from #1..."
-            )
-            delta = compute_delta(memory, session_id)
-            if not delta:
-                logger.status("delta", "No delta — LLM already matched #1")
-                break
-            total_delta = sum(len(v) for v in delta.values())
-            logger.status(
-                "delta",
-                f"Applying {total_delta} params that differ from #1",
-            )
-            apply_delta(deps, delta)
-            # Create a minimal diagnosis-like object so downstream code works
-            diagnosis = type(
-                "DeltaDiagnosis",
-                (),
-                {
-                    "nginx_applied": bool(delta.get("webserver")),
-                    "system_applied": bool(
-                        delta.get("kernel")
-                        or delta.get("resource_limits")
-                        or delta.get("network")
-                        or delta.get("storage")
-                    ),
-                    "output": "Deterministic delta applied from #1",
-                    "notes": f"Applied {total_delta} delta params from best run",
-                    "summary": f"Applied {total_delta} delta params from best run",
-                },
-            )()
 
-        # Check if any changes were applied
         nginx_applied = getattr(diagnosis, "nginx_applied", False)
         system_applied = getattr(diagnosis, "system_applied", False)
         if not nginx_applied and not system_applied:
@@ -397,36 +428,86 @@ async def run(model, deps: AgentDeps) -> str:
                 deps,
                 iteration=iteration,
                 baselines=baselines,
-                results=iteration_finals or baselines,
+                results=iteration_finals or healthy_results or baselines,
                 regressions=[],
                 decision=decision,
                 diagnosis=diagnosis,
             )
             break
 
-        # Benchmark ALL workloads to check for regressions
         if bench_tool == "hackathon":
             logger.step(f"Step 5.{iteration}: Running post-iteration benchmark (all workloads)...")
             iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
 
-        # Check exit criteria: all workloads within 1% of baseline
         healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
         should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
 
+        if in_optimization_mode:
+            candidate = getattr(diagnosis, "optimization_group", None) or {}
+            current_small = float(iteration_finals.get("small", {}).get("rps", 0) or 0)
+            prior_results = dict(healthy_results or baselines)
+            prior_small = float(prior_results.get("small", {}).get("rps", 0) or 0)
+            gain_pct = ((current_small - prior_small) / prior_small * 100) if prior_small else 0.0
+            keep_group = should_stop and gain_pct >= optimization_min_gain_pct
+            decision = (
+                f"Kept optimization group {candidate.get('name')} (small {gain_pct:+.1f}%)"
+                if keep_group
+                else f"Reverted optimization group {candidate.get('name')} (small {gain_pct:+.1f}%)"
+            )
+            if keep_group:
+                healthy_results = dict(iteration_finals)
+                final_results = dict(iteration_finals)
+                if current_small > float(best_results.get("small", {}).get("rps", 0) or 0):
+                    best_results = dict(iteration_finals)
+                    best_iteration = iteration
+            else:
+                _revert_optimization_group(deps, snapshot)
+                rejected_optimization_groups.add(candidate.get("name", "unknown"))
+                final_results = dict(healthy_results or baselines)
+
+            _save_optimization_outcome(
+                memory,
+                session_id,
+                iteration,
+                candidate,
+                decision=decision,
+                kept=keep_group,
+                baseline_results=prior_results,
+                benchmark_results=iteration_finals,
+                applied=getattr(diagnosis, "optimization_apply", {}),
+                reverted=not keep_group,
+            )
+            logger.status("iteration", f"Iteration {iteration}: {decision}")
+            diagnosis_agent.save_iteration_summary(
+                deps,
+                iteration=iteration,
+                baselines=baselines,
+                results=iteration_finals,
+                regressions=regressions,
+                decision=decision,
+                diagnosis=diagnosis,
+            )
+            if iteration >= max_iterations:
+                break
+            continue
+
         if should_stop:
-            # Check if we should continue to delta iteration despite no regressions
-            # If iter1 didn't beat #1 and we have proven params, iter2 delta can help
             current_small = float(iteration_finals.get("small", {}).get("rps", 0) or 0)
             best_small = top_runs[0]["small_rps"] if top_runs else 0
+            healthy_results = dict(iteration_finals)
+            final_results = dict(iteration_finals)
+            if current_small > float(best_results.get("small", {}).get("rps", 0) or 0):
+                best_results = dict(iteration_finals)
+                best_iteration = iteration
             if (
-                iteration == 1
+                optimization_enabled
                 and has_top_runs
-                and current_small < best_small * 0.95
+                and current_small < best_small * (1 - (optimization_gap_pct / 100.0))
                 and iteration < max_iterations
             ):
                 decision = (
                     f"All workloads OK but small={current_small:.0f} < "
-                    f"best={best_small:.0f} — continuing to delta iteration"
+                    f"best={best_small:.0f} — entering optimization mode"
                 )
                 logger.status("iteration", f"Iteration {iteration}: {decision}")
                 diagnosis_agent.save_iteration_summary(
@@ -438,12 +519,7 @@ async def run(model, deps: AgentDeps) -> str:
                     decision=decision,
                     diagnosis=diagnosis,
                 )
-                iteration_feedback = _build_iteration_feedback(
-                    iteration=iteration,
-                    baselines=baselines,
-                    current_results=iteration_finals,
-                    regressions=regressions,
-                )
+                in_optimization_mode = True
                 continue
 
             decision = f"All workloads OK — stopping after iteration {iteration}"
@@ -473,7 +549,6 @@ async def run(model, deps: AgentDeps) -> str:
             )
             break
 
-        # Continuing to next iteration
         decision = f"{len(regressions)} regressions — continuing to iteration {iteration + 1}"
         logger.status("iteration", f"Iteration {iteration}: {decision}")
         diagnosis_agent.save_iteration_summary(
@@ -541,23 +616,16 @@ async def run(model, deps: AgentDeps) -> str:
         )
         return report_path
 
-    # Update best RPS from agent's result
-    best_rps = baseline_rps
-    diagnosis_after_rps = getattr(diagnosis, "after_rps", None)
-    if diagnosis_after_rps is None:
-        fixes_applied = getattr(diagnosis, "fixes_applied", []) or []
-        diagnosis_after_rps = max((fix.get("after_rps", 0) for fix in fixes_applied), default=0)
-    if diagnosis_after_rps > best_rps:
-        best_rps = diagnosis_after_rps
+    best_rps = float(best_results.get("small", {}).get("rps", baseline_rps) or baseline_rps)
     memory.update_profile(session_id, best_rps=best_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6: Final benchmarks (direct — no LLM)
     # Reuse last iteration results if available; otherwise run fresh.
     # ══════════════════════════════════════════════════════════════════════════
-    if iteration_finals:
+    if final_results:
         logger.step("Step 6: Using last iteration benchmark as final results...")
-        finals = iteration_finals
+        finals = final_results
         # Run telemetry capture for the final state
         _capture_telemetry(deps, scope="final", source="post")
     elif bench_tool == "hackathon":
@@ -593,10 +661,7 @@ async def run(model, deps: AgentDeps) -> str:
                 runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Final", session_id),
             )
 
-    # Update best_rps from actual final benchmarks
     final_small_rps = finals.get("small", {}).get("rps", finals.get("homepage", {}).get("rps", 0))
-    if final_small_rps > best_rps:
-        best_rps = final_small_rps
     memory.update_profile(session_id, best_rps=best_rps)
 
     # Persist final results to benchmarks table (permanent, not session-scoped)
@@ -718,7 +783,7 @@ async def run(model, deps: AgentDeps) -> str:
         total_tokens=deps.token_counter.total,
         fixes_applied=fixes_applied_count,
         rps_start=baseline_rps,
-        rps_end=best_rps,
+        rps_end=final_small_rps,
     )
 
     token_history = memory.get_token_history()
@@ -729,6 +794,8 @@ async def run(model, deps: AgentDeps) -> str:
         deps.token_counter,
         baselines=baselines,
         finals=finals,
+        best_results=best_results,
+        best_iteration=best_iteration,
         stability=stability_data,
         throughput=throughput_info,
         token_history=token_history,
@@ -743,7 +810,8 @@ async def run(model, deps: AgentDeps) -> str:
         "SlayMetricsAgent Complete",
         f"Session: {session_id}\n"
         f"Baseline (small): {baseline_rps:.1f} req/sec\n"
-        f"Best (small):     {best_rps:.1f} req/sec\n"
+        f"Best achieved (small): {best_rps:.1f} req/sec\n"
+        f"Final state (small):   {final_small_rps:.1f} req/sec\n"
         f"Improvement: {total_improvement:+.1f}%\n"
         f"Nginx applied: {nginx_applied}, System applied: {system_applied}\n"
         f"Tokens used: {deps.token_counter.summary()}\n"
@@ -947,6 +1015,151 @@ def _build_iteration_feedback(
             "Do NOT revert changes that improved other workloads."
         )
     return "\n".join(lines)
+
+
+def _collect_current_state(deps: AgentDeps) -> dict[str, str]:
+    from agents.tools_inspect import inspect_all
+
+    inspection = inspect_all(deps.ssh, deps.config)
+    current: dict[str, str] = {}
+    for category in ("webserver", "kernel"):
+        category_current = (inspection.get(category) or {}).get("current") or {}
+        for param, value in category_current.items():
+            current[f"{category}.{param}"] = str(value)
+    return current
+
+
+def _snapshot_optimization_state(deps: AgentDeps, candidate: dict[str, Any]) -> dict[str, Any]:
+    changes = candidate.get("changes", {}) or {}
+    snapshot: dict[str, Any] = {
+        "kernel": dict(candidate.get("current", {}) or {}),
+        "nginx_backup_dir": None,
+    }
+    if changes.get("webserver"):
+        config_path = deps.config["service"]["config_path"]
+        backup_dir = f"/tmp/slay_opt_{deps.session_id}_{getattr(deps, 'iteration', 0)}"
+        deps.ssh.execute(
+            "mkdir -p {dir}/conf.d && "
+            "cp {config} {dir}/nginx.conf && "
+            "cp -a /etc/nginx/conf.d/. {dir}/conf.d/ 2>/dev/null || true".format(
+                dir=backup_dir,
+                config=config_path,
+            ),
+            timeout=20,
+        )
+        snapshot["nginx_backup_dir"] = backup_dir
+    return snapshot
+
+
+def _apply_optimization_group(deps: AgentDeps, candidate: dict[str, Any]) -> dict[str, Any]:
+    from agents.tools_apply import apply_kernel
+
+    changes = candidate.get("changes", {}) or {}
+    results: dict[str, Any] = {}
+    web_changes = changes.get("webserver") or {}
+    if web_changes:
+        applied: list[str] = []
+        failed: list[str] = []
+        for param, value in web_changes.items():
+            if deps.adapter.apply_config(param, value):
+                applied.append(param)
+            else:
+                failed.append(param)
+        reload_result = deps.ssh.execute("nginx -t 2>&1 && nginx -s reload 2>&1", timeout=20)
+        results["webserver"] = {
+            "applied": applied,
+            "failed": failed,
+            "reload_ok": reload_result.exit_code == 0,
+        }
+    kernel_changes = changes.get("kernel") or {}
+    if kernel_changes:
+        results["kernel"] = apply_kernel(deps.ssh, kernel_changes)
+    return results
+
+
+def _revert_optimization_group(deps: AgentDeps, snapshot: dict[str, Any]) -> None:
+    from agents.tools_apply import apply_kernel
+
+    backup_dir = snapshot.get("nginx_backup_dir")
+    if backup_dir:
+        config_path = deps.config["service"]["config_path"]
+        deps.ssh.execute(
+            "cp {dir}/nginx.conf {config} && "
+            "rm -rf /etc/nginx/conf.d && mkdir -p /etc/nginx/conf.d && "
+            "cp -a {dir}/conf.d/. /etc/nginx/conf.d/ 2>/dev/null || true && "
+            "nginx -t 2>&1 && nginx -s reload 2>&1".format(
+                dir=backup_dir,
+                config=config_path,
+            ),
+            timeout=30,
+        )
+    kernel_snapshot = {}
+    for full_param, value in (snapshot.get("kernel") or {}).items():
+        if not full_param.startswith("kernel."):
+            continue
+        param = full_param.split(".", 1)[1]
+        if value and value not in ("unknown", "not set"):
+            kernel_snapshot[param] = value
+    if kernel_snapshot:
+        apply_kernel(deps.ssh, kernel_snapshot)
+
+
+def _save_optimization_considered(
+    memory, session_id: str, iteration: int, groups: list[dict[str, Any]]
+):
+    payload = [
+        {
+            "name": group["name"],
+            "score": group["score"],
+            "risk": group["risk"],
+            "reasons": group["reasons"],
+            "changes": group["changes"],
+        }
+        for group in groups
+    ]
+    memory.save_context(
+        session_id,
+        "command_output",
+        f"optimization_considered_iter{iteration}",
+        json.dumps(payload),
+        f"optimization iter {iteration}: considered {len(groups)} groups",
+    )
+
+
+def _save_optimization_outcome(
+    memory,
+    session_id: str,
+    iteration: int,
+    candidate: dict[str, Any],
+    *,
+    decision: str,
+    kept: bool,
+    baseline_results: dict[str, Any],
+    benchmark_results: dict[str, Any],
+    applied: dict[str, Any],
+    reverted: bool,
+) -> None:
+    memory.save_context(
+        session_id,
+        "command_output",
+        f"optimization_decision_iter{iteration}_{candidate.get('name', 'unknown')}",
+        json.dumps(
+            {
+                "group": candidate.get("name"),
+                "score": candidate.get("score"),
+                "risk": candidate.get("risk"),
+                "reasons": candidate.get("reasons", []),
+                "changes": candidate.get("changes", {}),
+                "decision": decision,
+                "kept": kept,
+                "reverted": reverted,
+                "baseline_results": baseline_results,
+                "benchmark_results": benchmark_results,
+                "applied": applied,
+            }
+        ),
+        decision,
+    )
 
 
 def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, Any]:

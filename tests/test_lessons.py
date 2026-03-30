@@ -7,6 +7,8 @@ from core.lessons import (
     QUALIFY_LARGE_RPS,
     QUALIFY_MEDIUM_RPS,
     check_leaderboard,
+    get_best_run_params,
+    get_ranked_optimization_groups,
     merge_targets,
     qualifies,
 )
@@ -177,15 +179,25 @@ class _MockCursorCtx:
 class _MockCursor:
     def __init__(self, rows):
         self._rows = rows
+        self._query = ""
 
-    def execute(self, *args):
-        pass
+    def execute(self, query, *args):
+        del args
+        self._query = query
 
     def fetchall(self):
+        if isinstance(self._rows, dict):
+            if "FROM validations v" in self._query and "GROUP BY v.session_id" in self._query:
+                return self._rows.get("evidence", [])
+            if "FROM validations v" in self._query and "WHERE v.session_id =" in self._query:
+                return self._rows.get("best_params", [])
+            if "FROM sessions s" in self._query:
+                return self._rows.get("top_runs", [])
         return self._rows
 
     def fetchone(self):
-        return self._rows[0] if self._rows else None
+        rows = self.fetchall()
+        return rows[0] if rows else None
 
 
 class TestCheckLeaderboard:
@@ -253,3 +265,126 @@ class TestCheckLeaderboard:
 
     def test_leaderboard_size_constant(self):
         assert LEADERBOARD_SIZE == 3
+
+
+class TestLessonsRanking:
+    def test_get_best_run_params_uses_validations(self):
+        memory = _MockMemory(
+            {
+                "top_runs": [
+                    {
+                        "session_id": "best",
+                        "small_rps": 900000,
+                        "medium_rps": 1400,
+                        "large_rps": 186,
+                        "tokens": 10,
+                        "iterations": 2,
+                    }
+                ],
+                "best_params": [
+                    {"parameter": "webserver.worker_processes", "after_value": "auto"},
+                    {"parameter": "kernel.net.core.somaxconn", "after_value": "65535"},
+                ],
+            }
+        )
+        assert get_best_run_params(memory) == {
+            "webserver.worker_processes": "auto",
+            "kernel.net.core.somaxconn": "65535",
+        }
+
+    def test_ranked_groups_prefer_shared_core_group(self):
+        memory = _MockMemory(
+            {
+                "top_runs": [
+                    {
+                        "session_id": "run1",
+                        "small_rps": 1300000,
+                        "medium_rps": 1400,
+                        "large_rps": 186,
+                        "tokens": 10,
+                        "iterations": 2,
+                    },
+                    {
+                        "session_id": "run2",
+                        "small_rps": 1200000,
+                        "medium_rps": 1400,
+                        "large_rps": 186,
+                        "tokens": 11,
+                        "iterations": 2,
+                    },
+                    {
+                        "session_id": "run3",
+                        "small_rps": 1100000,
+                        "medium_rps": 1400,
+                        "large_rps": 186,
+                        "tokens": 12,
+                        "iterations": 2,
+                    },
+                ],
+                "evidence": [
+                    {
+                        "session_id": "run1",
+                        "parameter": "webserver.worker_connections",
+                        "after_value": "65536",
+                        "confirmed_count": 4,
+                        "contradicted_count": 0,
+                    },
+                    {
+                        "session_id": "run2",
+                        "parameter": "webserver.worker_connections",
+                        "after_value": "65536",
+                        "confirmed_count": 4,
+                        "contradicted_count": 0,
+                    },
+                    {
+                        "session_id": "run3",
+                        "parameter": "webserver.worker_connections",
+                        "after_value": "65536",
+                        "confirmed_count": 4,
+                        "contradicted_count": 0,
+                    },
+                    {
+                        "session_id": "run1",
+                        "parameter": "kernel.net.core.somaxconn",
+                        "after_value": "65535",
+                        "confirmed_count": 3,
+                        "contradicted_count": 0,
+                    },
+                    {
+                        "session_id": "run2",
+                        "parameter": "kernel.net.core.somaxconn",
+                        "after_value": "65535",
+                        "confirmed_count": 3,
+                        "contradicted_count": 0,
+                    },
+                    {
+                        "session_id": "run3",
+                        "parameter": "kernel.net.core.somaxconn",
+                        "after_value": "65535",
+                        "confirmed_count": 3,
+                        "contradicted_count": 0,
+                    },
+                    {
+                        "session_id": "run1",
+                        "parameter": "kernel.transparent_hugepage",
+                        "after_value": "never",
+                        "confirmed_count": 1,
+                        "contradicted_count": 0,
+                    },
+                ],
+            }
+        )
+
+        ranked = get_ranked_optimization_groups(
+            memory,
+            current_state={
+                "webserver.worker_connections": "4096",
+                "kernel.net.core.somaxconn": "4096",
+                "kernel.transparent_hugepage": "always",
+            },
+        )
+
+        assert ranked[0]["name"] == "accept_path"
+        assert ranked[0]["changes"]["webserver"]["worker_connections"] == "65536"
+        assert ranked[0]["changes"]["kernel"]["net.core.somaxconn"] == "65535"
+        assert ranked[-1]["name"] == "platform_latency"

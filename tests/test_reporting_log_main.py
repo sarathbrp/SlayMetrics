@@ -62,6 +62,20 @@ class FakeMemory:
                     )
                 }
             ]
+        if type == "command_output":
+            return [
+                {
+                    "content": json.dumps(
+                        {
+                            "group": "accept_path",
+                            "decision": "Kept optimization group accept_path",
+                            "score": 12.5,
+                            "risk": "low",
+                            "reasons": ["3 params differ", "3 core params"],
+                        }
+                    )
+                }
+            ]
         return []
 
     def get_queue(self, session_id):
@@ -91,6 +105,8 @@ def test_reporter_generate_and_clean(tmp_path):
         output_dir=str(tmp_path),
         baselines={"small": {"rps": 100, "p99": 1, "cpu_pct": 1, "mem_mb": 1}},
         finals={"small": {"rps": 120, "p99": 1, "cpu_pct": 2, "mem_mb": 2}},
+        best_results={"small": {"rps": 140}},
+        best_iteration=2,
         throughput={"nic_speed": "1g", "disk_write": "100MB/s", "small_throughput_mb_s": 10},
         token_history=[
             {
@@ -107,9 +123,12 @@ def test_reporter_generate_and_clean(tmp_path):
     md = Path(path).read_text()
     assert "Token Attribution by Tool" in md
     assert "## Recommendations" in md
+    assert "## Optimization Decisions" in md
+    assert "Best iteration | 2" in md
     report_json = json.loads((tmp_path / "report.json").read_text())
     assert report_json["tokens"]["by_tool"][0]["tool"] == "inspect"
     assert report_json["recommendations"][0]["title"] == "Raise connection limits"
+    assert report_json["best_results_by_size"]["small"]["rps"] == 140
     assert _clean({"a": 1, "embedding": [1]}) == {"a": 1}
 
     class EmptyMemory(FakeMemory):

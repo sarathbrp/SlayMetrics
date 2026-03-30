@@ -91,6 +91,11 @@ agent:
   debug_planner_payloads: true
   persist_hypotheses: true
   benchmark_after_every_fix: true
+  optimization:
+    enabled: false
+    top_runs: 3
+    min_small_gain_pct: 1.0
+    leaderboard_gap_pct: 3.0
   stability:
     enabled: false
     duration_sec: 1800

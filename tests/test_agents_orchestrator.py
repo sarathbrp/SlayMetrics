@@ -436,3 +436,144 @@ def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
 
     assert report.endswith("report.md")
     assert any(item[0] == "complete_session" for item in deps.memory.saved)
+
+
+def test_orchestrator_optimization_mode_reverts_failed_group(monkeypatch, tmp_path):
+    deps = _deps()
+    deps.config["agent"]["max_iterations"] = 2
+    deps.config["agent"]["optimization"] = {
+        "enabled": True,
+        "top_runs": 3,
+        "min_small_gain_pct": 1.0,
+        "leaderboard_gap_pct": 3.0,
+    }
+
+    monkeypatch.setattr(orchestrator.system_checks, "run_all", lambda ssh, checks: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "get_top_runs",
+        lambda memory: [
+            {
+                "session_id": "best",
+                "small_rps": 1000.0,
+                "medium_rps": 1400.0,
+                "large_rps": 186.0,
+                "tokens": 10,
+                "iterations": 1,
+            }
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "get_best_run_params", lambda memory: {})
+    monkeypatch.setattr(orchestrator, "get_prior_knowledge_text", lambda memory: "")
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run",
+        lambda model, deps, context_prompt: asyncio.sleep(
+            0,
+            result=SimpleNamespace(
+                notes="planned",
+                recommendations=[],
+                rca_records=[],
+                nginx_applied=True,
+                system_applied=False,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator.diagnosis_agent,
+        "run_preflight",
+        lambda model, deps: asyncio.sleep(
+            0, result={"status": "ok", "problems": [], "fixes": [], "diagnostics": {}}
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator.reporter, "generate", lambda *a, **k: str(tmp_path / "report.md")
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_hackathon_benchmark",
+        lambda deps, cfg, label, session_id: {
+            "baseline": {
+                "small": {"rps": 100.0, "p99": 1.0},
+                "medium": {"rps": 1300.0, "p99": 1.0},
+                "large": {"rps": 180.0, "p99": 1.0},
+            },
+            "iter1": {
+                "small": {"rps": 500.0, "p99": 1.0},
+                "medium": {"rps": 1400.0, "p99": 1.0},
+                "large": {"rps": 186.0, "p99": 1.0},
+            },
+            "iter2": {
+                "small": {"rps": 500.4, "p99": 1.0},
+                "medium": {"rps": 1400.0, "p99": 1.0},
+                "large": {"rps": 186.0, "p99": 1.0},
+            },
+        }[label],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_collect_current_state",
+        lambda deps: {
+            "webserver.worker_connections": "4096",
+            "kernel.net.core.somaxconn": "4096",
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "get_ranked_optimization_groups",
+        lambda memory, current_state, top_n=3: [
+            {
+                "name": "accept_path",
+                "score": 10.0,
+                "risk": "low",
+                "reasons": ["core group"],
+                "changes": {
+                    "webserver": {"worker_connections": "65536"},
+                    "kernel": {"net.core.somaxconn": "65535"},
+                },
+                "current": {
+                    "webserver.worker_connections": "4096",
+                    "kernel.net.core.somaxconn": "4096",
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "_snapshot_optimization_state", lambda deps, candidate: {})
+    monkeypatch.setattr(
+        orchestrator,
+        "_apply_optimization_group",
+        lambda deps, candidate: {"webserver": {"applied": ["worker_connections"]}},
+    )
+    reverted = {"called": False}
+    monkeypatch.setattr(
+        orchestrator,
+        "_revert_optimization_group",
+        lambda deps, snapshot: reverted.__setitem__("called", True),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "collect_snapshot",
+        lambda *a, **k: {"scope": k["scope"], "source": k["source"], "summary": {}, "sections": {}},
+    )
+    monkeypatch.setattr(orchestrator, "start_sampler", lambda *a, **k: {"scope": k["scope"]})
+    monkeypatch.setattr(
+        orchestrator,
+        "stop_sampler",
+        lambda *a, **k: {
+            "scope": k["scope"],
+            "ok": True,
+            "csv_content": "",
+            "summary": {"sample_count": 0, "first_sample": {}, "last_sample": {}},
+        },
+    )
+    monkeypatch.setattr(orchestrator, "persist_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "persist_sampler_result", lambda *a, **k: None)
+    for name in ["panel", "step", "check", "status", "benchmark", "log"]:
+        monkeypatch.setattr(orchestrator.logger, name, lambda *a, **k: None)
+
+    report = asyncio.run(orchestrator.run("model", deps))
+
+    assert report.endswith("report.md")
+    assert reverted["called"] is True
+    complete = [item for item in deps.memory.saved if item[0] == "complete_session"][-1]
+    assert complete[2]["rps_end"] == 500.0
