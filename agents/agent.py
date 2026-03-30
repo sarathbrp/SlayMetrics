@@ -1759,10 +1759,22 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 if param in symptom or param in root_cause:
                     rca_by_param[param] = rca_text
 
+        # Normalize values to canonical forms for comparison and storage
+        _VALUE_ALIASES = {
+            "enabled": "active",
+            "on": "active",
+            "true": "active",
+            "True": "active",
+            "30s": "30",
+        }
+
+        def _normalize(v: str) -> str:
+            return _VALUE_ALIASES.get(v, v)
+
         findings: list[dict[str, Any]] = []
         for param in web_applied if isinstance(web_applied, list) else web_applied.keys():
-            before = web_current.get(param, "")
-            after = web_changes.get(param, "")
+            before = _normalize(web_current.get(param, ""))
+            after = _normalize(web_changes.get(param, ""))
             if before == after:
                 continue  # no change — don't save duplicate
             findings.append(
@@ -1774,14 +1786,15 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 }
             )
         for param, value in kern_applied.items():
-            before = kern_current.get(param, "")
-            if before == value:
+            before = _normalize(kern_current.get(param, ""))
+            after = _normalize(value)
+            if before == after:
                 continue  # no change — don't save duplicate
             findings.append(
                 {
                     "parameter": f"kernel.{param}",
                     "before_value": before,
-                    "after_value": value,
+                    "after_value": after,
                     "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
             )
@@ -1800,19 +1813,6 @@ def build(model, config=None) -> DiagnosisWorkflow:
                             "reasoning": problem_text or "config-driven fix",
                         }
                     )
-
-        # Normalize values to canonical forms before saving
-        _VALUE_ALIASES = {
-            "enabled": "active",
-            "on": "active",
-            "true": "active",
-            "True": "active",
-            "30s": "30",
-        }
-        for f in findings:
-            val = f.get("after_value", "")
-            if val in _VALUE_ALIASES:
-                f["after_value"] = _VALUE_ALIASES[val]
 
         if findings:
             save_findings_impl(deps, findings)
