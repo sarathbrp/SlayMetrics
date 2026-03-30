@@ -359,9 +359,11 @@ async def run(model, deps: AgentDeps) -> str:
                 break
 
             candidate = ranked_groups[0]
+            candidate_params = _format_group_changes(candidate.get("changes", {}) or {})
             logger.status(
                 "optimization",
-                f"Selected group {candidate['name']} score={candidate['score']:.2f}",
+                f"Selected group {candidate['name']} score={candidate['score']:.2f} "
+                f"params={candidate_params}",
             )
             snapshot = _snapshot_optimization_state(deps, candidate)
             apply_result = _apply_optimization_group(deps, candidate)
@@ -1114,6 +1116,7 @@ def _save_optimization_considered(
             "risk": group["risk"],
             "reasons": group["reasons"],
             "changes": group["changes"],
+            "params_text": _format_group_changes(group["changes"]),
         }
         for group in groups
     ]
@@ -1150,6 +1153,7 @@ def _save_optimization_outcome(
                 "risk": candidate.get("risk"),
                 "reasons": candidate.get("reasons", []),
                 "changes": candidate.get("changes", {}),
+                "params_text": _format_group_changes(candidate.get("changes", {})),
                 "decision": decision,
                 "kept": kept,
                 "reverted": reverted,
@@ -1160,6 +1164,14 @@ def _save_optimization_outcome(
         ),
         decision,
     )
+
+
+def _format_group_changes(changes: dict[str, dict[str, str]]) -> str:
+    parts: list[str] = []
+    for category in ("webserver", "kernel", "resource_limits", "network", "storage"):
+        for param, value in (changes.get(category) or {}).items():
+            parts.append(f"{param}={value}")
+    return ", ".join(parts) if parts else "none"
 
 
 def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, Any]:
