@@ -94,11 +94,12 @@ def get_best_run_params(memory, system_id: str | None = None) -> dict[str, str]:
     return {r["parameter"]: r["after_value"] for r in rows}
 
 
-def get_prior_knowledge_text(memory, system_id: str | None = None, limit: int = 15) -> str:
-    """Build a text summary of the best run's fixes with reasoning.
+def get_prior_knowledge_text(memory, system_id: str | None = None, limit: int = 10) -> str:
+    """Build a text summary of past fixes — what worked AND what didn't.
 
-    Returns a compact string for injection into the LLM context prompt,
-    showing what was changed, why, and what impact it had.
+    Framed as historical context, NOT prescription. The LLM should use its
+    own inspection of the CURRENT system state to decide what to apply.
+    Prior knowledge helps avoid known mistakes but does not lock values.
     """
     top = get_top_runs(memory, system_id)
     if not top:
@@ -108,6 +109,7 @@ def get_prior_knowledge_text(memory, system_id: str | None = None, limit: int = 
     best_session = best["session_id"]
 
     with memory._cursor() as cur:
+        # What worked (from best run)
         cur.execute(
             """
             SELECT parameter, before_value, after_value, reasoning, impact_pct
@@ -122,27 +124,53 @@ def get_prior_knowledge_text(memory, system_id: str | None = None, limit: int = 
             """,
             (best_session, limit),
         )
-        rows = cur.fetchall()
+        good_rows = cur.fetchall()
 
-    if not rows:
+        # What caused regressions (from ANY session — deprecated/negative fixes)
+        cur.execute(
+            """
+            SELECT parameter, before_value, after_value, reasoning
+            FROM knowledge
+            WHERE type IN ('fix', 'negative')
+              AND status = 'deprecated'
+              AND parameter IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 5
+            """,
+        )
+        bad_rows = cur.fetchall()
+
+    if not good_rows and not bad_rows:
         return ""
 
     lines = [
-        f"Prior knowledge (best run {best_session}, small={best['small_rps']:.0f} RPS):",
+        "Historical context (reference only — diagnose the CURRENT system, "
+        "do not blindly copy past values):",
+        f"Best prior run: {best_session} (small={best['small_rps']:.0f} RPS)",
+        "What worked:",
     ]
-    for r in rows:
+    for r in good_rows:
         param = r["parameter"]
         before = r["before_value"] or "?"
         after = r["after_value"] or "?"
         reasoning = r["reasoning"] or ""
-        # Truncate long reasoning to save tokens
         if len(reasoning) > 120:
             reasoning = reasoning[:117] + "..."
         impact = r["impact_pct"]
         impact_str = f" ({impact:+.0f}%)" if impact else ""
         lines.append(f"  {param}: {before}→{after}{impact_str}")
         if reasoning and reasoning != "config-driven tuning":
-            lines.append(f"    why: {reasoning}")
+            lines.append(f"    context: {reasoning}")
+
+    if bad_rows:
+        lines.append("What caused regressions (AVOID):")
+        for r in bad_rows:
+            param = r["parameter"]
+            after = r["after_value"] or "?"
+            reasoning = r["reasoning"] or ""
+            if len(reasoning) > 100:
+                reasoning = reasoning[:97] + "..."
+            lines.append(f"  {param}={after} — {reasoning}")
 
     return "\n".join(lines)
 
