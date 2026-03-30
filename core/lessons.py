@@ -94,6 +94,59 @@ def get_best_run_params(memory, system_id: str | None = None) -> dict[str, str]:
     return {r["parameter"]: r["after_value"] for r in rows}
 
 
+def get_prior_knowledge_text(memory, system_id: str | None = None, limit: int = 15) -> str:
+    """Build a text summary of the best run's fixes with reasoning.
+
+    Returns a compact string for injection into the LLM context prompt,
+    showing what was changed, why, and what impact it had.
+    """
+    top = get_top_runs(memory, system_id)
+    if not top:
+        return ""
+
+    best = top[0]
+    best_session = best["session_id"]
+
+    with memory._cursor() as cur:
+        cur.execute(
+            """
+            SELECT parameter, before_value, after_value, reasoning, impact_pct
+            FROM knowledge
+            WHERE discovered_by = %s
+              AND type = 'fix'
+              AND status = 'active'
+              AND parameter IS NOT NULL
+              AND after_value IS NOT NULL
+            ORDER BY ABS(COALESCE(impact_pct, 0)) DESC
+            LIMIT %s
+            """,
+            (best_session, limit),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return ""
+
+    lines = [
+        f"Prior knowledge (best run {best_session}, small={best['small_rps']:.0f} RPS):",
+    ]
+    for r in rows:
+        param = r["parameter"]
+        before = r["before_value"] or "?"
+        after = r["after_value"] or "?"
+        reasoning = r["reasoning"] or ""
+        # Truncate long reasoning to save tokens
+        if len(reasoning) > 120:
+            reasoning = reasoning[:117] + "..."
+        impact = r["impact_pct"]
+        impact_str = f" ({impact:+.0f}%)" if impact else ""
+        lines.append(f"  {param}: {before}→{after}{impact_str}")
+        if reasoning and reasoning != "config-driven tuning":
+            lines.append(f"    why: {reasoning}")
+
+    return "\n".join(lines)
+
+
 def merge_targets(
     config_targets: dict[str, dict[str, str]],
     proven_params: dict[str, str],

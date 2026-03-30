@@ -11,7 +11,13 @@ import core.reporter as reporter
 import rhel.system_checks as system_checks
 from agents import AgentDeps
 from core import log as logger
-from core.lessons import check_leaderboard, get_best_run_params, get_top_runs, merge_targets
+from core.lessons import (
+    check_leaderboard,
+    get_best_run_params,
+    get_prior_knowledge_text,
+    get_top_runs,
+    merge_targets,
+)
 from telemetry import (
     collect_snapshot,
     persist_sampler_result,
@@ -96,6 +102,7 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 1.6: Load lessons learned — merge proven params from best run
     # ══════════════════════════════════════════════════════════════════════════
     top_runs = get_top_runs(memory)
+    prior_knowledge_text = ""
     if top_runs:
         best = top_runs[0]
         logger.status(
@@ -103,6 +110,7 @@ async def run(model, deps: AgentDeps) -> str:
             f"Best prior run: {best['session_id']} "
             f"(small={best['small_rps']:.0f} RPS, {best['tokens']} tokens)",
         )
+        prior_knowledge_text = get_prior_knowledge_text(memory)
         proven = get_best_run_params(memory)
         if proven:
             tuning = cfg.get("tuning") or {}
@@ -317,6 +325,7 @@ async def run(model, deps: AgentDeps) -> str:
             checks_summary=checks_summary,
             benchmark_evidence_text=benchmark_evidence_text,
             prior_fixes=prior_fixes,
+            prior_knowledge=prior_knowledge_text,
         )
         if iteration_feedback:
             context_prompt += f"\n{iteration_feedback}\n"
@@ -703,6 +712,7 @@ def _build_context_prompt(
     checks_summary,
     benchmark_evidence_text,
     prior_fixes=None,
+    prior_knowledge: str = "",
 ) -> str:
     checks_text = "\n".join(checks_summary)
 
@@ -712,11 +722,13 @@ def _build_context_prompt(
         prior_text += ", ".join(f"{pf['parameter']}" for pf in prior_fixes)
         prior_text += "\n"
 
+    knowledge_text = f"\n{prior_knowledge}\n" if prior_knowledge else ""
+
     return f"""{rhel_ver} | {kernel_ver} | {cpu_cores} CPU | {ram_gb}GB
 Checks: {checks_text}
 Benchmark Evidence:
 {benchmark_evidence_text}
-{prior_text}
+{prior_text}{knowledge_text}
 Inspect, apply proven fixes, benchmark after, save_findings.
 """
 
