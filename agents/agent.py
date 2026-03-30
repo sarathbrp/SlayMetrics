@@ -1741,19 +1741,26 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         findings: list[dict[str, Any]] = []
         for param in web_applied if isinstance(web_applied, list) else web_applied.keys():
+            before = web_current.get(param, "")
+            after = web_changes.get(param, "")
+            if before == after:
+                continue  # no change — don't save duplicate
             findings.append(
                 {
                     "parameter": f"webserver.{param}",
-                    "before_value": web_current.get(param, ""),
-                    "after_value": web_changes.get(param, ""),
+                    "before_value": before,
+                    "after_value": after,
                     "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
             )
         for param, value in kern_applied.items():
+            before = kern_current.get(param, "")
+            if before == value:
+                continue  # no change — don't save duplicate
             findings.append(
                 {
                     "parameter": f"kernel.{param}",
-                    "before_value": kern_current.get(param, ""),
+                    "before_value": before,
                     "after_value": value,
                     "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
