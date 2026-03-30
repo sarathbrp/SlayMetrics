@@ -225,6 +225,7 @@ def clear_leaderboard(cfg: dict) -> None:
         autocommit=True,
     )
     tables_to_clear = [
+        "apply_failures",
         "validations",
         "benchmarks",
         "context",
@@ -255,6 +256,7 @@ def reset_all_db(cfg: dict) -> None:
         autocommit=True,
     )
     tables = [
+        "apply_failures",
         "validations",
         "benchmarks",
         "context",

@@ -1045,6 +1045,21 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 tool_result(
                     "recommend", f"skipped recommendation_{idx}: no allowed performance changes"
                 )
+                # Record rejected recommendation for lessons-learned tracking
+                from core.apply_failures import REASON_RECOMMEND_REJECTED, record_failure
+
+                _iter = getattr(deps, "iteration", 0)
+                for _rp, _rv in (changes or {}).items():
+                    record_failure(
+                        deps.memory,
+                        session_id=deps.session_id,
+                        iteration=_iter,
+                        category=scope or "unknown",
+                        parameter=_rp,
+                        attempted_value=str(_rv),
+                        failure_reason=REASON_RECOMMEND_REJECTED,
+                        llm_param_name=_rp,
+                    )
                 continue
             normalized = {
                 "title": str(item.get("title", "")).strip() or f"recommendation_{idx}",
@@ -1284,6 +1299,11 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 json.dumps({"mismatches": mismatches, "fixed": fixed}),
                 f"verification: {len(mismatches)} mismatches, {len(fixed)} conf.d fixes",
             )
+            # Record verify failures for lessons-learned tracking
+            from core.apply_failures import record_verify_mismatches
+
+            _iter = getattr(deps, "iteration", 0)
+            record_verify_mismatches(deps.memory, deps.session_id, _iter, mismatches)
         else:
             tool_result("verify", "all changes verified on DUT")
             deps.memory.save_context(

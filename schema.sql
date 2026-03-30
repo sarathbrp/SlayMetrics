@@ -162,6 +162,23 @@ CREATE TABLE IF NOT EXISTS hypothesis_queue (
     FOREIGN KEY (knowledge_ref) REFERENCES knowledge(id)
 );
 
+-- ─── Apply Failures ─────────────────────────────────────────────────────────
+-- Tracks parameters that fail to apply. Persists across sessions.
+-- Review periodically to fix param name mismatches, missing handlers, etc.
+CREATE TABLE IF NOT EXISTS apply_failures (
+    id              VARCHAR(64)     PRIMARY KEY,
+    session_id      VARCHAR(64)     NOT NULL,
+    iteration       INT             NOT NULL,
+    category        VARCHAR(32)     NOT NULL,       -- webserver, kernel, etc.
+    parameter       VARCHAR(256)    NOT NULL,
+    attempted_value TEXT,
+    failure_reason  VARCHAR(64)     NOT NULL,       -- verify_mismatch, apply_failed, recommend_rejected, blocked
+    llm_param_name  VARCHAR(256),                   -- what the LLM called it
+    config_param_name VARCHAR(256),                 -- what config.yaml calls it
+    created_at      TIMESTAMP       DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 -- ─── Indexes ────────────────────────────────────────────────────────────────
 
 -- Systems
