@@ -177,7 +177,7 @@ tuning:
     cgroup_memory: "max"
     cgroup_io_weight: "100"
     cgroup_cpu_weight: "100"
-    numa_policy: "bind_nic"
+    numa_policy: "remove"
     kill_background_hogs: "true"
 
   # Category 4: network — firewall, conntrack, tc
