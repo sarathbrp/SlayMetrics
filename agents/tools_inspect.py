@@ -8,6 +8,7 @@ into one call to reduce token usage.
 from __future__ import annotations
 
 import re
+from math import ceil
 from typing import Any
 
 from tools.ssh import LocalClient, SSHClient
@@ -291,6 +292,17 @@ def inspect_network(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
     ).stdout.strip()
     findings["nftables_has_drops"] = bool(nft)
 
+    firewalld_state = ssh.execute(
+        "systemctl is-active firewalld 2>/dev/null || echo inactive",
+        timeout=5,
+    ).stdout.strip()
+    findings["firewalld_state"] = firewalld_state or "unknown"
+    findings["firewall_provenance"] = {
+        "iptables": bool(iptables),
+        "nftables": bool(nft),
+        "firewalld": firewalld_state not in ("unknown", ""),
+    }
+
     problems: list[str] = []
     if iptables:
         problems.append(f"iptables DROP/limit rules found: {iptables[:80]}")
@@ -363,8 +375,10 @@ def inspect_storage(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
 def inspect_all(ssh: LocalClient | SSHClient, config: dict[str, Any]) -> dict[str, Any]:
     """Compound inspect: run all 5 categories and return unified result."""
     tuning = config.get("tuning") or {}
+    system = inspect_system_metadata(ssh)
 
     results = {
+        "system": system,
         "webserver": inspect_webserver(ssh, tuning.get("webserver_targets") or {}),
         "kernel": inspect_kernel(ssh, tuning.get("kernel_targets") or {}),
         "resource_limits": inspect_resource_limits(
@@ -381,8 +395,75 @@ def inspect_all(ssh: LocalClient | SSHClient, config: dict[str, Any]) -> dict[st
         "by_category": {
             k: len(v.get("needs_fixing", v.get("problems", {})))
             for k, v in results.items()
-            if k != "summary"
+            if k not in {"summary", "system"}
         },
     }
 
     return results
+
+
+def inspect_system_metadata(ssh: LocalClient | SSHClient) -> dict[str, Any]:
+    os_cpu_raw = ssh.execute("nproc 2>/dev/null || echo 0", timeout=5).stdout.strip()
+    cpu_max_raw = ssh.execute(
+        "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null || echo 'max 100000'",
+        timeout=5,
+    ).stdout.strip()
+    cpuset_raw = ssh.execute(
+        "cat /sys/fs/cgroup/system.slice/nginx.service/cpuset.cpus.effective 2>/dev/null || "
+        "cat /sys/fs/cgroup/system.slice/nginx.service/cpuset.cpus 2>/dev/null || echo ''",
+        timeout=5,
+    ).stdout.strip()
+
+    os_cpu_count = int(os_cpu_raw) if os_cpu_raw.isdigit() else 0
+    cgroup_cpu_quota_cores = _cpu_quota_to_cores(cpu_max_raw)
+    cpuset_cpu_count = _count_cpuset_cpus(cpuset_raw)
+
+    return {
+        "os_cpu_count": os_cpu_count,
+        "cgroup_cpu_quota_cores": cgroup_cpu_quota_cores,
+        "cpuset_cpu_count": cpuset_cpu_count,
+        "cpu_quota_source": cpu_max_raw,
+        "cpuset_source": cpuset_raw,
+    }
+
+
+def _cpu_quota_to_cores(cpu_max: str) -> int | None:
+    parts = cpu_max.split()
+    if len(parts) < 2 or parts[0] == "max":
+        return None
+    try:
+        quota = int(parts[0])
+        period = int(parts[1])
+    except ValueError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return max(1, ceil(quota / period))
+
+
+def _count_cpuset_cpus(cpuset: str) -> int | None:
+    cpuset = cpuset.strip()
+    if not cpuset:
+        return None
+    total = 0
+    for part in cpuset.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            try:
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError:
+                return None
+            if end < start:
+                return None
+            total += end - start + 1
+        else:
+            try:
+                int(part)
+            except ValueError:
+                return None
+            total += 1
+    return total or None
