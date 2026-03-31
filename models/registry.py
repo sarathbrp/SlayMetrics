@@ -43,7 +43,7 @@ def create_model(cfg: dict):
 
         api_key_env = profile.get("api_key_env", "OPENAI_API_KEY")
         api_key = os.environ.get(api_key_env)
-        base_url = profile.get("base_url", "").strip()
+        base_url = str(profile.get("base_url") or "").strip()
         if not api_key:
             logger.log("main", f"{api_key_env} not set", "error")
             sys.exit(1)

@@ -402,10 +402,23 @@ def main(argv: list[str] | None = None) -> int:
         memory = tidb_from_config(cfg, embedder)
         memory.connect()
         bundle = build_case_bundle_from_session(memory, args.session, iteration=args.iteration)
-        model = create_model(cfg)
+        try:
+            model = create_model(cfg)
+        except SystemExit:
+            from core import log as logger
 
-        def synth_judge(payload: dict[str, Any]) -> dict[str, Any]:
-            return llm_synth_judge(model, payload)
+            logger.log(
+                "eval",
+                (
+                    "Synthesizer judge unavailable; continuing with "
+                    "deterministic nginx/rhel evals only."
+                ),
+                "warn",
+            )
+        else:
+
+            def synth_judge(payload: dict[str, Any]) -> dict[str, Any]:
+                return llm_synth_judge(model, payload)
 
     result = evaluate_case_bundle(bundle, synth_judge=synth_judge)
     payload = json.dumps(result, indent=2, ensure_ascii=False)
