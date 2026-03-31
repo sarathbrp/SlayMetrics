@@ -1,6 +1,6 @@
 llm:
   active_profile: gpt-oss-api           # change this one line to switch LLM
-  request_timeout_sec: 60
+  request_timeout_sec: 300
 
   profiles:
     granite-api:                       # Granite 4 via Ollama API
@@ -98,7 +98,7 @@ agent:
     min_small_gain_pct: 1.0
     leaderboard_gap_pct: 3.0
   eval:
-    synth_timeout_sec: 60
+    synth_timeout_sec: 300
   stability:
     enabled: false
     duration_sec: 1800

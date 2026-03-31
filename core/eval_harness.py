@@ -385,7 +385,7 @@ def llm_synth_judge(
     model,
     bundle: dict[str, Any],
     *,
-    timeout_sec: float = 20.0,
+    timeout_sec: float = 300.0,
 ) -> dict[str, Any]:
     prompt = (
         "You are grading a synthesis artifact. Return strict JSON with keys "
@@ -461,7 +461,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             judge_timeout_sec = float(
-                ((cfg.get("agent") or {}).get("eval") or {}).get("synth_timeout_sec", 20.0) or 20.0
+                ((cfg.get("agent") or {}).get("eval") or {}).get("synth_timeout_sec", 300.0)
+                or 300.0
             )
 
             def synth_judge(payload: dict[str, Any]) -> dict[str, Any]:
