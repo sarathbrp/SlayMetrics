@@ -1404,9 +1404,9 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
     contestant = f"{name}-{label}"
     results_dir = "/root/hackathon-results"
 
-    # Healthcheck: verify nginx is alive before benchmarking
-    ssh = deps.ssh
-    health = ssh.execute(
+    # Healthcheck: verify nginx is alive before benchmarking.
+    # Run from bench host (System 2) using the same target_host the benchmark uses.
+    health = deps.bench.execute(
         f"curl -s -o /dev/null -w '%{{http_code}}' http://{target_host}/ 2>/dev/null",
         timeout=10,
     )
@@ -1415,15 +1415,20 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
             "benchmark",
             f"nginx healthcheck FAILED (HTTP {health.stdout.strip()}) — restarting",
         )
-        ssh.execute("nginx -t 2>&1 && systemctl restart nginx 2>&1", timeout=15)
-        # Re-check after restart
-        health2 = ssh.execute(
+        # Restart on the DUT via SSH
+        deps.ssh.execute("nginx -t 2>&1 && systemctl restart nginx 2>&1", timeout=15)
+        import time
+
+        time.sleep(2)
+        # Re-check from bench host
+        health2 = deps.bench.execute(
             f"curl -s -o /dev/null -w '%{{http_code}}' http://{target_host}/ 2>/dev/null",
             timeout=10,
         )
         if health2.stdout.strip() != "200":
             logger.status(
-                "benchmark", f"nginx still down after restart (HTTP {health2.stdout.strip()})"
+                "benchmark",
+                f"nginx still down after restart (HTTP {health2.stdout.strip()})",
             )
 
     # Remove stale JSON files to prevent reading cached results from prior runs
