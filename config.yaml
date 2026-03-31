@@ -217,7 +217,7 @@ tuning:
 slack:
   enabled: true
   token_env: SLACK_AUTH_TOKEN        # pragma: allowlist secret
-  channel: C0AJTB22VNU              # #slaymetrics channel
+  channel: D0AQGJMEBFB              # SlayMetrics DM channel
   notify_on:
     - run_start                      # agent session started
     - baseline_complete              # baseline benchmark done
