@@ -76,16 +76,16 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
 
     actions: list[str] = []
 
-    # Remove cgroup CPU cap
-    if changes.get("cgroup_cpu") == "max":
+    # Remove cgroup CPU cap (any value means "remove the cap" — LLM may say "max", "100%", etc.)
+    if changes.get("cgroup_cpu"):
         ssh.execute(
             "systemctl set-property nginx.service CPUQuota= 2>/dev/null || true",
             timeout=10,
         )
         actions.append("removed cgroup CPU cap")
 
-    # Remove cgroup memory cap
-    if changes.get("cgroup_memory") == "max":
+    # Remove cgroup memory cap (any value means "remove the cap" — LLM may say "4G", "max", etc.)
+    if changes.get("cgroup_memory"):
         ssh.execute(
             "systemctl set-property nginx.service MemoryMax=infinity 2>/dev/null || true",
             timeout=10,

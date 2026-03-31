@@ -1654,6 +1654,18 @@ def build(model, config=None) -> DiagnosisWorkflow:
                         _cfg,
                     )
                 }
+                # Apply forced_values guardrail — override LLM values
+                forced = _tuning.get("forced_values") or {}
+                for param in filtered:
+                    if param in forced:
+                        original = filtered[param]
+                        filtered[param] = str(forced[param])
+                        if original != filtered[param]:
+                            tool_result(
+                                "guardrail",
+                                f"forced {param}: '{original}' -> '{filtered[param]}'",
+                            )
+
                 if filtered:
                     changes_by_cat[cat] = filtered
 
@@ -1697,35 +1709,38 @@ def build(model, config=None) -> DiagnosisWorkflow:
         results: dict[str, Any] = {}
         ssh = deps.ssh
 
-        # Apply webserver (nginx) changes
-        web_changes = changes_by_cat.get("webserver", {})
-        if web_changes:
-            results["webserver"] = _batch_apply_nginx(deps, web_changes)
-            state["nginx_applied"] = True
+        # ── Apply order matters: remove cgroup/resource caps BEFORE restarting
+        # nginx with more workers, otherwise nginx OOM-kills instantly.
 
-        # Apply kernel changes
-        kern_changes = changes_by_cat.get("kernel", {})
-        if kern_changes:
-            results["kernel"] = apply_kernel(ssh, kern_changes)
-            state["system_applied"] = True
-
-        # Apply resource limits
+        # 1. Resource limits first (remove cgroup CPU/memory caps)
         res_changes = changes_by_cat.get("resource_limits", {})
         if res_changes:
             results["resource_limits"] = apply_resource_limits(ssh, res_changes)
             state["system_applied"] = True
 
-        # Apply network fixes
+        # 2. Kernel (sysctls, THP, SELinux, IRQ)
+        kern_changes = changes_by_cat.get("kernel", {})
+        if kern_changes:
+            results["kernel"] = apply_kernel(ssh, kern_changes)
+            state["system_applied"] = True
+
+        # 3. Network (firewall, conntrack, tc)
         net_changes = changes_by_cat.get("network", {})
         if net_changes:
             results["network"] = apply_network(ssh, net_changes)
             state["system_applied"] = True
 
-        # Apply storage fixes
+        # 4. Storage (I/O scheduler, readahead)
         stor_changes = changes_by_cat.get("storage", {})
         if stor_changes:
             results["storage"] = apply_storage(ssh, stor_changes)
             state["system_applied"] = True
+
+        # 5. Webserver LAST (restarts nginx — all caps must be lifted first)
+        web_changes = changes_by_cat.get("webserver", {})
+        if web_changes:
+            results["webserver"] = _batch_apply_nginx(deps, web_changes)
+            state["nginx_applied"] = True
 
         # Log results per category
         for cat, result in results.items():

@@ -202,6 +202,14 @@ tuning:
   blocked_values:
     aio: ["threads", "on"]
 
+  # Guardrails: values that are ALWAYS overridden to the forced value,
+  # regardless of what the LLM suggests. Use for params where only one
+  # correct value exists (e.g. cgroup caps must be removed, not adjusted).
+  # Format: param_name: forced_value
+  forced_values:
+    cgroup_cpu: "max"
+    cgroup_memory: "max"
+
   # Backward compatibility aliases
   nginx_targets: {}
   system_targets: {}
