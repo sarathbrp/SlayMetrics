@@ -781,8 +781,19 @@ def test_observational_debate_eval_logs_and_persists(monkeypatch):
             "rhel_score": 0.7,
             "synthesizer_score": 1.0,
             "findings": [
-                {"agent": "nginx", "rule_id": "nginx.fd_capacity", "severity": "fail"},
+                {
+                    "agent": "nginx",
+                    "rule_id": "nginx.fd_capacity",
+                    "severity": "fail",
+                    "correction": "Set worker_rlimit_nofile to 135168.",
+                },
                 {"agent": "rhel", "rule_id": "rhel.sysctl_range", "severity": "warn"},
+                {
+                    "agent": "synthesizer",
+                    "rule_id": "synthesizer.critical_omission",
+                    "severity": "fail",
+                    "message": "Synthesizer omitted the critical nginx FD recommendation.",
+                },
             ],
         }
 
@@ -810,14 +821,20 @@ def test_observational_debate_eval_logs_and_persists(monkeypatch):
     assert result["action"] == "recommended_improvements"
     assert result["by_agent"]["nginx"]["verdict"] == "fail"
     assert result["by_agent"]["rhel"]["verdict"] == "warning"
-    assert result["by_agent"]["synthesizer"]["verdict"] == "pass"
+    assert result["by_agent"]["synthesizer"]["verdict"] == "fail"
+    assert result["by_agent"]["nginx"]["severity_counts"] == "1 fail"
+    assert result["by_agent"]["rhel"]["severity_counts"] == "1 warn"
+    assert result["by_agent"]["nginx"]["corrections"] == "Set worker_rlimit_nofile to 135168."
+    assert "critical nginx FD recommendation" in result["by_agent"]["synthesizer"]["details"]
     assert captured["model"] == "model"
     assert captured["timeout_sec"] == 42
     assert captured["bundle"]["requested_format"] == "json"
     assert any(tool == "eval" and "score=0.62" in msg for tool, msg in logged)
-    assert any(tool == "eval" and "nginx score=0.40" in msg for tool, msg in logged)
-    assert any(tool == "eval" and "rhel score=0.70" in msg for tool, msg in logged)
-    assert any(tool == "eval" and "synthesizer score=1.00" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "nginx score=0.40" in msg and "counts=1 fail" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "rhel score=0.70" in msg and "counts=1 warn" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "synthesizer score=1.00" in msg and "counts=1 fail" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "nginx corrections=Set worker_rlimit_nofile to 135168." in msg for tool, msg in logged)
+    assert any(tool == "eval" and "synthesizer details=Synthesizer omitted the critical nginx FD recommendation." in msg for tool, msg in logged)
     assert any(row[2] == "iter1_debate_eval" for row in deps.memory.saved)
 
 

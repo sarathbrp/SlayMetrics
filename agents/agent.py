@@ -3366,6 +3366,19 @@ def _run_observational_debate_eval(
             return "warning"
         return "pass"
 
+    def _agent_severity_counts(agent_findings: list[dict[str, Any]]) -> str:
+        counts = Counter(
+            str(item.get("severity"))
+            for item in agent_findings
+            if isinstance(item, dict) and item.get("severity")
+        )
+        parts = []
+        for level in ("fail", "warn", "info"):
+            count = counts.get(level, 0)
+            if count:
+                parts.append(f"{count} {level}")
+        return ", ".join(parts) or "clean"
+
     def _agent_finding_summary(agent_findings: list[dict[str, Any]]) -> str:
         counts = Counter(
             str(item.get("rule_id"))
@@ -3380,6 +3393,30 @@ def _run_observational_debate_eval(
             or "clean"
         )
 
+    def _agent_correction_summary(agent_name: str, agent_findings: list[dict[str, Any]]) -> str:
+        if agent_name != "nginx":
+            return ""
+        corrections = []
+        for item in agent_findings:
+            if not isinstance(item, dict):
+                continue
+            correction = str(item.get("correction") or "").strip()
+            if correction:
+                corrections.append(correction)
+        return "; ".join(corrections[:2])
+
+    def _agent_detail_summary(agent_name: str, agent_findings: list[dict[str, Any]]) -> str:
+        if agent_name != "synthesizer":
+            return ""
+        details = []
+        for item in agent_findings:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message") or "").strip()
+            if message:
+                details.append(message)
+        return "; ".join(details[:2])
+
     agent_scores = {
         "nginx": float(result.get("nginx_score", 0.0)),
         "rhel": float(result.get("rhel_score", 0.0)),
@@ -3389,8 +3426,11 @@ def _run_observational_debate_eval(
         agent_name: {
             "score": agent_scores.get(agent_name, 0.0),
             "verdict": _agent_verdict(agent_findings),
+            "severity_counts": _agent_severity_counts(agent_findings),
             "findings": agent_findings,
             "summary": _agent_finding_summary(agent_findings),
+            "corrections": _agent_correction_summary(agent_name, agent_findings),
+            "details": _agent_detail_summary(agent_name, agent_findings),
         }
         for agent_name, agent_findings in by_agent.items()
     }
@@ -3410,9 +3450,14 @@ def _run_observational_debate_eval(
             (
                 f"{agent_name} score={float(agent_view.get('score', 0.0)):.2f} "
                 f"verdict={agent_view.get('verdict', 'unknown')} "
+                f"counts={agent_view.get('severity_counts', 'clean')} "
                 f"findings={agent_view.get('summary', 'clean')}"
             ),
         )
+        if agent_view.get("corrections"):
+            tool_result("eval", f"{agent_name} corrections={agent_view['corrections']}")
+        if agent_view.get("details"):
+            tool_result("eval", f"{agent_name} details={agent_view['details']}")
     source = f"iter{iteration}_debate_eval" if iteration else "debate_eval"
     deps.memory.save_context(
         deps.session_id,
