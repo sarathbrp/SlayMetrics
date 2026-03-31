@@ -172,12 +172,34 @@ def inspect_resource_limits(
     cpu_weight_match = re.search(r"CPUWeight=(\d+)", svc_limits)
     findings["cgroup_cpu_weight"] = cpu_weight_match.group(1) if cpu_weight_match else "100"
 
-    # NUMA policy check
+    # NUMA policy check — detect NIC node and whether nginx is bound to it
     numa_dropin = ssh.execute(
         "cat /etc/systemd/system/nginx.service.d/numa.conf 2>/dev/null || echo 'none'",
         timeout=5,
     ).stdout.strip()
-    findings["numa_policy"] = "interleave" if "interleave" in numa_dropin else "default"
+    if "interleave" in numa_dropin:
+        findings["numa_policy"] = "interleave"
+    elif "cpunodebind" in numa_dropin:
+        findings["numa_policy"] = "bind_nic"
+    else:
+        findings["numa_policy"] = "default"
+
+    # Detect which NUMA node the primary NIC is on
+    nic_numa = ssh.execute(
+        "cat /sys/class/net/$(ip route get 8.8.8.8 2>/dev/null"
+        " | grep -oP 'dev \\K\\S+')/device/numa_node 2>/dev/null || echo -1",
+        timeout=5,
+    ).stdout.strip()
+    findings["nic_numa_node"] = nic_numa
+
+    # Check if nginx workers have memory on the wrong NUMA node
+    numa_maps = ssh.execute(
+        "cat /proc/$(pgrep -n nginx)/numa_maps 2>/dev/null"
+        " | awk '{for(i=1;i<=NF;i++) if($i~/^N[0-9]/) print $i}'"
+        " | sort | uniq -c | sort -rn | head -4",
+        timeout=5,
+    ).stdout.strip()
+    findings["numa_maps_summary"] = numa_maps[:120] if numa_maps else ""
 
     # Detect specific hogs (dd, fio, stress-ng) — bool + summary only
     hog_procs = ssh.execute(
@@ -207,8 +229,20 @@ def inspect_resource_limits(
     cpu_w = findings.get("cgroup_cpu_weight", "100")
     if cpu_w != "100" and cpu_w != targets.get("cgroup_cpu_weight", "100"):
         problems.append(f"cgroup CPUWeight={cpu_w} (below default 100)")
-    if findings.get("numa_policy") == "interleave":
+    numa_pol = findings.get("numa_policy", "default")
+    if numa_pol == "interleave":
         problems.append("NUMA interleave policy active (worst for locality)")
+    elif numa_pol == "default" and targets.get("numa_policy") == "bind_nic":
+        problems.append(f"nginx not pinned to NIC NUMA node {findings.get('nic_numa_node', '?')}")
+    # Check numa_maps for cross-node memory
+    numa_maps = findings.get("numa_maps_summary", "")
+    if numa_maps and findings.get("nic_numa_node", "-1") != "-1":
+        nic_node = findings["nic_numa_node"]
+        wrong_node = f"N{1 - int(nic_node)}" if nic_node.isdigit() else ""
+        if wrong_node and wrong_node in numa_maps:
+            problems.append(
+                f"nginx has memory on wrong NUMA node ({wrong_node}), NIC on N{nic_node}"
+            )
     if findings.get("hog_detected"):
         problems.append(f"background hogs detected: {findings.get('hog_summary', '')}")
 

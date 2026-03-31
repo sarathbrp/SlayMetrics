@@ -142,13 +142,35 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
         )
         actions.append(f"cgroup CPUWeight={cpu_w}")
 
-    # Remove NUMA interleave policy (numactl drop-in)
-    if changes.get("numa_policy") == "remove":
+    # NUMA policy
+    numa_policy = changes.get("numa_policy")
+    if numa_policy == "remove":
         ssh.execute(
             "rm -f /etc/systemd/system/nginx.service.d/numa.conf 2>/dev/null || true",
             timeout=5,
         )
         actions.append("removed NUMA interleave drop-in")
+    elif numa_policy == "bind_nic":
+        # Detect NIC's NUMA node and pin nginx to it
+        nic_node = ssh.execute(
+            "cat /sys/class/net/$(ip route get 8.8.8.8 2>/dev/null"
+            " | grep -oP 'dev \\K\\S+')/device/numa_node 2>/dev/null || echo 0",
+            timeout=5,
+        ).stdout.strip()
+        if not nic_node.isdigit():
+            nic_node = "0"
+        ssh.execute(
+            "mkdir -p /etc/systemd/system/nginx.service.d && "
+            "cat > /etc/systemd/system/nginx.service.d/numa.conf << 'EOF'\n"
+            "[Service]\n"
+            "ExecStart=\n"
+            f"ExecStart=/usr/bin/numactl --cpunodebind={nic_node}"
+            f" --membind={nic_node} /usr/sbin/nginx -g 'daemon off;'\n"
+            "Type=simple\n"
+            "EOF",
+            timeout=5,
+        )
+        actions.append(f"pinned nginx to NUMA node {nic_node} (NIC node)")
 
     # Kill background hogs (stress-ng, dd, fio, etc.)
     if changes.get("kill_background_hogs") == "true":
