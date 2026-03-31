@@ -1216,8 +1216,9 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     fixed.append(param)
 
             if fixed:
-                # Reload nginx after conf.d cleanup
-                ssh.execute("nginx -t 2>&1 && nginx -s reload 2>&1")
+                # Restart nginx after conf.d cleanup (restart, not reload,
+                # to kill any lingering workers with old debug logging)
+                ssh.execute("nginx -t 2>&1 && systemctl restart nginx 2>&1")
                 tool_result(
                     "verify",
                     f"fixed {len(fixed)} conf.d overrides: {', '.join(fixed)}",
@@ -1468,11 +1469,16 @@ def build(model, config=None) -> DiagnosisWorkflow:
             else:
                 failed.append(param)
 
-        # Reload once after all changes
+        # Reload/restart once after all changes.
+        # Use hard restart (not graceful reload) when error_log_level changed —
+        # graceful reload keeps old debug-logging workers alive, causing OOM.
         if applied:
             test = ssh.execute("nginx -t 2>&1")
             if "syntax is ok" in test.stdout or "test is successful" in test.stdout:
-                deps.adapter.reload()
+                if "error_log_level" in applied or "access_log" in applied:
+                    ssh.execute("systemctl restart nginx 2>&1")
+                else:
+                    deps.adapter.reload()
                 reload_status = "OK"
             else:
                 # Rollback everything
