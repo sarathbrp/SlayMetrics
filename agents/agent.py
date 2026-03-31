@@ -1449,8 +1449,14 @@ def build(model, config=None) -> DiagnosisWorkflow:
         # Apply via adapter (it handles upsert + conf.d cleanup)
         applied = []
         failed = []
-        # Apply worker_processes first (fundamental directive)
-        priority_order = ["worker_processes", "worker_rlimit_nofile"]
+        # Apply in priority order: kill debug logging first (prevents OOM),
+        # then worker_processes (fundamental), then file descriptors
+        priority_order = [
+            "error_log_level",
+            "access_log",
+            "worker_processes",
+            "worker_rlimit_nofile",
+        ]
         ordered_params = sorted(
             changes.keys(),
             key=lambda p: priority_order.index(p) if p in priority_order else 99,
