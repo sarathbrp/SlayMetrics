@@ -20,6 +20,66 @@ GOLDEN_RANGES = {
     "net.ipv4.tcp_max_syn_backlog": (32768, 65535),
     "net.core.netdev_max_backlog": (32768, 65535),
 }
+OPTIONAL_OMISSION_PARAMS = {"limit_conn"}
+OPTIONAL_OMISSION_PREFIXES = ("limit_req",)
+PROMOTED_CRITICAL_OMISSIONS = {
+    "limit_rate_after",
+    "selinux",
+    "systemd_nofile",
+    "net.netfilter.nf_conntrack_max",
+    "iptables_drop_rules",
+}
+KNOWN_SYNTH_KEY_ALIASES = {
+    "defaultlimitnofile": "systemd_nofile",
+    "limitnofile": "systemd_nofile",
+    "cpuweight": "cgroup_cpu_weight",
+    "ioweight": "cgroup_io_weight",
+    "selinux": "selinux",
+    "system.slice.cpuweight": "cgroup_cpu_weight",
+    "user.slice.cpuweight": "cgroup_cpu_weight",
+    "nginx.service.cpuweight": "cgroup_cpu_weight",
+    "nginx.service.ioweight": "cgroup_io_weight",
+    "conntrack_max": "net.netfilter.nf_conntrack_max",
+    "iptablesdropruleonport80": "iptables_drop_rules",
+    "iptables.port80_drop": "iptables_drop_rules",
+    "numaplacement": "numa_policy",
+    "nginx.cpuaffinity": "numa_policy",
+    "nginx.numanode": "numa_policy",
+    "tc.qdisc": "tc_rules",
+}
+DRIFT_SENSITIVE_PARAMS = {
+    "tcp_nodelay",
+    "tcp_nopush",
+    "multi_accept",
+    "open_file_cache_valid",
+    "limit_rate_after",
+}
+LOW_RISK_SYNTH_PARAMS = {
+    "worker_processes",
+    "worker_connections",
+    "worker_rlimit_nofile",
+    "tcp_nodelay",
+    "tcp_nopush",
+    "accept_mutex",
+    "multi_accept",
+    "access_log",
+    "keepalive_requests",
+    "keepalive_timeout",
+    "listen_backlog",
+    "open_file_cache",
+    "open_file_cache_valid",
+    "open_file_cache_min_uses",
+    "reset_timedout_connection",
+    "net.core.somaxconn",
+    "net.ipv4.tcp_max_syn_backlog",
+    "net.core.netdev_max_backlog",
+    "net.ipv4.tcp_tw_reuse",
+    "net.ipv4.tcp_fin_timeout",
+    "vm.swappiness",
+    "vm.vfs_cache_pressure",
+    "transparent_hugepage",
+    "irqbalance",
+}
 
 
 def load_case_bundle(path: str | Path) -> dict[str, Any]:
@@ -321,8 +381,9 @@ def evaluate_synthesizer(
     *,
     synth_judge: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    findings = _evaluate_synth_deterministic(bundle)
     if synth_judge is None:
-        return [
+        findings.append(
             _finding(
                 "synthesizer",
                 "synthesizer.judge_unavailable",
@@ -331,7 +392,8 @@ def evaluate_synthesizer(
                 "Synthesizer judge was not provided; synthesis quality was not fully evaluated.",
                 evidence_refs=["synthesizer"],
             )
-        ]
+        )
+        return findings
 
     from core import log as logger
 
@@ -340,7 +402,7 @@ def evaluate_synthesizer(
         judged = synth_judge(bundle)
     except TimeoutError:
         logger.log("eval", "Synthesizer judge timed out; falling back to warning.", "warn")
-        return [
+        findings.append(
             _finding(
                 "synthesizer",
                 "synthesizer.judge_timeout",
@@ -349,10 +411,11 @@ def evaluate_synthesizer(
                 "Synthesizer judge timed out; synthesis quality was not fully evaluated.",
                 evidence_refs=["synthesizer"],
             )
-        ]
+        )
+        return findings
     except Exception as exc:
         logger.log("eval", f"Synthesizer judge failed: {exc}", "warn")
-        return [
+        findings.append(
             _finding(
                 "synthesizer",
                 "synthesizer.judge_failed",
@@ -361,12 +424,21 @@ def evaluate_synthesizer(
                 f"Synthesizer judge failed: {exc}",
                 evidence_refs=["synthesizer"],
             )
-        ]
-    findings: list[dict[str, Any]] = []
+        )
+        return findings
+    critical_missing = _critical_missing_targets(bundle)
     for rule_id, payload in (judged or {}).items():
         passed = bool(payload.get("pass"))
         if passed:
             continue
+        if rule_id == "critical_omission":
+            if not critical_missing:
+                continue
+            message = "Synthesizer omitted actionable critical targets: " + ", ".join(
+                sorted(critical_missing)[:5]
+            )
+        else:
+            message = payload.get("message", f"Synthesizer failed {rule_id}.")
         score_delta = _default_synth_delta(rule_id)
         findings.append(
             _finding(
@@ -374,10 +446,80 @@ def evaluate_synthesizer(
                 f"synthesizer.{rule_id}",
                 "fail" if score_delta <= -0.4 else "warn",
                 score_delta,
-                payload.get("message", f"Synthesizer failed {rule_id}."),
+                message,
                 evidence_refs=list(payload.get("evidence_refs") or []),
             )
         )
+    return findings
+
+
+def _evaluate_synth_deterministic(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    synth_output = bundle.get("synthesizer") or {}
+    synth_targets = _extract_setting_targets(synth_output)
+    expert_targets = {
+        **_extract_setting_targets(bundle.get("nginx_expert") or {}),
+        **_extract_setting_targets(bundle.get("rhel_expert") or {}),
+    }
+
+    drifted = [
+        key
+        for key, expert_value in expert_targets.items()
+        if key in synth_targets
+        and _normalize_target_value(synth_targets[key]) != _normalize_target_value(expert_value)
+    ]
+    if drifted:
+        score_delta = -0.2 if any(key in DRIFT_SENSITIVE_PARAMS for key in drifted) else -0.1
+        findings.append(
+            _finding(
+                "synthesizer",
+                "synthesizer.target_drift",
+                "warn",
+                score_delta,
+                "Synthesizer changed expert target values for: " + ", ".join(sorted(drifted)[:5]),
+                evidence_refs=["nginx_expert", "rhel_expert", "synthesizer"],
+            )
+        )
+
+    bad_keys = [key for key in synth_targets if _is_bad_synth_key(key)]
+    if bad_keys:
+        findings.append(
+            _finding(
+                "synthesizer",
+                "synthesizer.change_key_normalization",
+                "warn",
+                -0.1,
+                "Synthesizer emitted unnormalized change keys: " + ", ".join(sorted(bad_keys)[:5]),
+                evidence_refs=["synthesizer.recommendations"],
+            )
+        )
+
+    high_risk_params: list[str] = []
+    for rec in synth_output.get("recommendations") or []:
+        if not isinstance(rec, dict):
+            continue
+        risk_level = str(rec.get("risk_level") or "").strip().lower()
+        if risk_level != "high":
+            continue
+        changes = rec.get("changes")
+        if not isinstance(changes, dict):
+            continue
+        for key in changes:
+            if str(key) in LOW_RISK_SYNTH_PARAMS:
+                high_risk_params.append(str(key))
+    if high_risk_params:
+        findings.append(
+            _finding(
+                "synthesizer",
+                "synthesizer.risk_calibration",
+                "warn",
+                -0.1,
+                "Synthesizer labeled likely low-risk parameters as high risk: "
+                + ", ".join(sorted(set(high_risk_params))[:5]),
+                evidence_refs=["synthesizer.recommendations"],
+            )
+        )
+
     return findings
 
 
@@ -538,6 +680,74 @@ def _extract_rhel_claimed_params(payload: dict[str, Any]) -> set[str]:
 
 def _payload_text(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False).lower()
+
+
+def _critical_missing_targets(bundle: dict[str, Any]) -> list[str]:
+    inspection = bundle.get("inspection") or {}
+    synth_targets = _extract_setting_targets(bundle.get("synthesizer") or {})
+    expert_targets = {
+        **_extract_setting_targets(bundle.get("nginx_expert") or {}),
+        **_extract_setting_targets(bundle.get("rhel_expert") or {}),
+    }
+    missing: list[str] = []
+    for key, target in expert_targets.items():
+        if key in synth_targets:
+            continue
+        current = _lookup_current_value(inspection, key)
+        if _is_critical_omission(key, current, target):
+            missing.append(key)
+    return sorted(set(missing))
+
+
+def _lookup_current_value(inspection: dict[str, Any], key: str) -> Any:
+    for section in ("webserver", "kernel", "resource_limits", "network", "storage"):
+        data = inspection.get(section) or {}
+        current = data.get("current")
+        if isinstance(current, dict) and key in current:
+            return current.get(key)
+        findings = data.get("findings")
+        if isinstance(findings, dict) and key in findings:
+            return findings.get(key)
+    return None
+
+
+def _is_critical_omission(key: str, current: Any, target: Any) -> bool:
+    normalized_key = str(key).strip()
+    canonical_key = _canonicalize_synth_key(normalized_key)
+    normalized_current = _normalize_target_value(current)
+    normalized_target = _normalize_target_value(target)
+    if canonical_key in PROMOTED_CRITICAL_OMISSIONS:
+        return True
+    if canonical_key in OPTIONAL_OMISSION_PARAMS and _is_inactive_current(normalized_current):
+        return False
+    if any(canonical_key.startswith(prefix) for prefix in OPTIONAL_OMISSION_PREFIXES):
+        return False
+    if normalized_target in {"remove", "none", "not set", "absent"}:
+        return not _is_inactive_current(normalized_current)
+    if _is_inactive_current(normalized_current):
+        return True
+    return normalized_current != normalized_target
+
+
+def _is_inactive_current(value: str) -> bool:
+    return value in {"", "not set", "none", "unknown"}
+
+
+def _normalize_target_value(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _canonicalize_synth_key(key: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_.]+", "", str(key or "").strip().lower())
+    return KNOWN_SYNTH_KEY_ALIASES.get(normalized, normalized)
+
+
+def _is_bad_synth_key(key: str) -> bool:
+    text = str(key or "")
+    if any(char.isupper() for char in text) or " " in text:
+        return True
+    canonical = _canonicalize_synth_key(text)
+    return canonical != _normalize_target_value(text)
 
 
 def _resolve_worker_processes(

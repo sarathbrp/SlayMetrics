@@ -16,7 +16,12 @@ from agents.tools_inspect import (
     inspect_network,
     inspect_system_metadata,
 )
-from core.eval_harness import build_case_bundle_from_session, evaluate_case_bundle, evaluate_nginx
+from core.eval_harness import (
+    build_case_bundle_from_session,
+    evaluate_case_bundle,
+    evaluate_nginx,
+    evaluate_synthesizer,
+)
 from tools.ssh import SSHResult
 
 
@@ -158,3 +163,163 @@ def test_inspect_network_includes_firewall_provenance():
     findings = inspect_network(ssh, {"conntrack_max": "1048576"})
     assert findings["findings"]["firewalld_state"] == "active"
     assert findings["findings"]["firewall_provenance"]["iptables"] is True
+
+
+def test_synth_critical_omission_ignores_optional_absent_control():
+    bundle = _bundle()
+    bundle["inspection"]["webserver"]["current"]["limit_conn"] = "not set"
+    bundle["nginx_expert"] = {
+        "rca_records": [{"setting": "limit_conn", "target": "remove"}],
+        "recommendations": [],
+    }
+    bundle["synthesizer"] = {"summary": "Combined view", "recommendations": []}
+
+    findings = evaluate_synthesizer(
+        bundle,
+        synth_judge=lambda payload: {
+            "hallucination": {"pass": True, "message": "", "evidence_refs": []},
+            "critical_omission": {
+                "pass": False,
+                "message": 'The synthesized artifact does not address the "limit_conn not set" issue.',
+                "evidence_refs": [],
+            },
+            "merge_fidelity": {"pass": True, "message": "", "evidence_refs": []},
+            "format_validity": {"pass": True, "message": "", "evidence_refs": []},
+        },
+    )
+
+    assert not any(f["rule_id"] == "synthesizer.critical_omission" for f in findings)
+
+
+def test_synth_deterministic_checks_flag_drift_keys_and_risk():
+    bundle = _bundle()
+    bundle["nginx_expert"] = {
+        "rca_records": [{"setting": "worker_connections", "target": "65536"}],
+        "recommendations": [],
+    }
+    bundle["synthesizer"] = {
+        "summary": "Combined view",
+        "recommendations": [
+            {
+                "title": "Drifted worker connections",
+                "scope": "nginx",
+                "changes": {"worker_connections": "8192"},
+                "risk_level": "high",
+            },
+            {
+                "title": "Bad key",
+                "scope": "system",
+                "changes": {"SELinux": "permissive"},
+                "risk_level": "medium",
+            },
+        ],
+    }
+
+    findings = evaluate_synthesizer(
+        bundle,
+        synth_judge=lambda payload: {
+            "hallucination": {"pass": True, "message": "", "evidence_refs": []},
+            "critical_omission": {"pass": True, "message": "", "evidence_refs": []},
+            "merge_fidelity": {"pass": True, "message": "", "evidence_refs": []},
+            "format_validity": {"pass": True, "message": "", "evidence_refs": []},
+        },
+    )
+
+    rule_ids = {finding["rule_id"] for finding in findings}
+    assert "synthesizer.target_drift" in rule_ids
+    assert "synthesizer.change_key_normalization" in rule_ids
+    assert "synthesizer.risk_calibration" in rule_ids
+
+
+def test_synth_promotes_limit_rate_after_omission_and_ignores_limit_req():
+    bundle = _bundle()
+    bundle["nginx_expert"] = {
+        "rca_records": [
+            {"setting": "limit_rate_after", "target": "0"},
+            {"setting": "limit_req", "target": "remove"},
+        ],
+        "recommendations": [],
+    }
+    bundle["synthesizer"] = {"summary": "Combined view", "recommendations": []}
+
+    findings = evaluate_synthesizer(
+        bundle,
+        synth_judge=lambda payload: {
+            "hallucination": {"pass": True, "message": "", "evidence_refs": []},
+            "critical_omission": {"pass": False, "message": "missed critical", "evidence_refs": []},
+            "merge_fidelity": {"pass": True, "message": "", "evidence_refs": []},
+            "format_validity": {"pass": True, "message": "", "evidence_refs": []},
+        },
+    )
+
+    omission = next(f for f in findings if f["rule_id"] == "synthesizer.critical_omission")
+    assert "limit_rate_after" in omission["message"]
+    assert "limit_req" not in omission["message"]
+
+
+def test_synth_alias_keys_are_flagged_as_normalization_issues():
+    bundle = _bundle()
+    bundle["synthesizer"] = {
+        "summary": "Combined view",
+        "recommendations": [
+            {
+                "title": "Bad aliases",
+                "scope": "system",
+                "changes": {
+                    "DefaultLimitNOFILE": "1048576",
+                    "CPUWeight": "100",
+                    "SELINUX": "permissive",
+                },
+                "risk_level": "low",
+            }
+        ],
+    }
+
+    findings = evaluate_synthesizer(
+        bundle,
+        synth_judge=lambda payload: {
+            "hallucination": {"pass": True, "message": "", "evidence_refs": []},
+            "critical_omission": {"pass": True, "message": "", "evidence_refs": []},
+            "merge_fidelity": {"pass": True, "message": "", "evidence_refs": []},
+            "format_validity": {"pass": True, "message": "", "evidence_refs": []},
+        },
+    )
+
+    normalization = next(f for f in findings if f["rule_id"] == "synthesizer.change_key_normalization")
+    assert "DefaultLimitNOFILE" in normalization["message"]
+    assert "CPUWeight" in normalization["message"]
+
+
+def test_synth_sensitive_drift_gets_stronger_penalty():
+    bundle = _bundle()
+    bundle["nginx_expert"] = {
+        "rca_records": [
+            {"setting": "tcp_nodelay", "target": "on"},
+            {"setting": "multi_accept", "target": "on"},
+        ],
+        "recommendations": [],
+    }
+    bundle["synthesizer"] = {
+        "summary": "Combined view",
+        "recommendations": [
+            {
+                "title": "Drifted transport",
+                "scope": "nginx",
+                "changes": {"tcp_nodelay": "off", "multi_accept": "off"},
+                "risk_level": "low",
+            }
+        ],
+    }
+
+    findings = evaluate_synthesizer(
+        bundle,
+        synth_judge=lambda payload: {
+            "hallucination": {"pass": True, "message": "", "evidence_refs": []},
+            "critical_omission": {"pass": True, "message": "", "evidence_refs": []},
+            "merge_fidelity": {"pass": True, "message": "", "evidence_refs": []},
+            "format_validity": {"pass": True, "message": "", "evidence_refs": []},
+        },
+    )
+
+    drift = next(f for f in findings if f["rule_id"] == "synthesizer.target_drift")
+    assert drift["score_delta"] == -0.2
