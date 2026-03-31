@@ -2979,7 +2979,6 @@ def _enforce_nginx_fd_consistency(apply_plan: dict[str, Any], config: dict[str, 
     This creates an FD budget of 112*65536*2 = 14.6M but only 200K FDs available,
     causing nginx to crash or reject connections under load.
     """
-    import math
 
     web = apply_plan.get("webserver", {})
     if not isinstance(web, dict):
@@ -3002,19 +3001,25 @@ def _enforce_nginx_fd_consistency(apply_plan: dict[str, Any], config: dict[str, 
     if nofile >= required:
         return
 
-    # Scale up: align with systemd_nofile, then round to power of 2
+    # Strategy: cap worker_connections to fit within nofile, rather than
+    # inflating nofile to unrealistic values (2M+ causes systemd LIMITS errors
+    # when cgroup MemoryMax is active during the transition).
+    max_safe_nofile = 524288  # practical ceiling for most systems
     res_targets = config.get("tuning", {}).get("resource_limits_targets", {})
-    systemd_nofile = int(res_targets.get("systemd_nofile", "524288"))
-    new_nofile = max(required, systemd_nofile)
-    new_nofile = 2 ** math.ceil(math.log2(new_nofile))
-    web["worker_rlimit_nofile"] = str(new_nofile)
+    systemd_nofile = min(int(res_targets.get("systemd_nofile", "524288")), max_safe_nofile)
 
-    # Also scale up systemd LimitNOFILE if needed
+    # Set nofile to systemd_nofile (practical, not theoretical)
+    web["worker_rlimit_nofile"] = str(systemd_nofile)
+
+    # Cap worker_connections to fit within the FD budget
+    max_conns_per_worker = max(1024, (systemd_nofile // procs) - 64)
+    if conns > max_conns_per_worker:
+        web["worker_connections"] = str(max_conns_per_worker)
+
+    # Align systemd LimitNOFILE
     res = apply_plan.get("resource_limits", {})
     if isinstance(res, dict):
-        res_nofile = int(res.get("systemd_nofile", "0") or "0")
-        if res_nofile < new_nofile:
-            res["systemd_nofile"] = str(new_nofile)
+        res["systemd_nofile"] = str(systemd_nofile)
 
 
 def _is_blocked(param: str, value: str, config: dict[str, Any] | None = None) -> bool:
