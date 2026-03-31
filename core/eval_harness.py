@@ -392,11 +392,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.bundle:
         bundle = load_case_bundle(args.bundle)
     else:
-        from main import load_config
+        from main import load_config, load_dotenv
         from memory.embeddings import from_config as embedder_from_config
         from memory.tidb_store import from_config as tidb_from_config
         from models import create_model
 
+        load_dotenv()
         cfg = load_config(args.config)
         embedder = embedder_from_config(cfg)
         memory = tidb_from_config(cfg, embedder)
