@@ -297,6 +297,16 @@ async def main(
         logger.log("main", f"Tokens used so far: {token_counter.summary()}", "warn")
     except Exception as e:
         logger.log("main", f"Error: {e}", "error")
+        try:
+            from core.slack_notifier import SlackNotifier
+
+            SlackNotifier(cfg).notify_error(
+                session_id=session_id,
+                error=str(e),
+                context=f"LLM: {profile_name} | Tokens: {token_counter.total:,}",
+            )
+        except Exception:
+            pass
         raise
     finally:
         # Silent cleanup

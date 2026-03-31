@@ -39,6 +39,9 @@ class DiagnosisOutput:
     notes: str = ""
     rca_records: list[dict[str, Any]] | None = None
     recommendations: list[dict[str, Any]] | None = None
+    apply_results: dict[str, Any] | None = None
+    guardrails_triggered: list[str] | None = None
+    eval_results: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.after_rps = _coerce_float(self.after_rps)
@@ -46,6 +49,9 @@ class DiagnosisOutput:
         self.notes = _coerce_notes(self.notes)
         self.rca_records = list(self.rca_records or [])
         self.recommendations = list(self.recommendations or [])
+        self.apply_results = dict(self.apply_results or {})
+        self.guardrails_triggered = list(self.guardrails_triggered or [])
+        self.eval_results = dict(self.eval_results or {})
 
 
 SYSTEM_PROMPT = """\
@@ -1665,6 +1671,9 @@ def build(model, config=None) -> DiagnosisWorkflow:
                                 "guardrail",
                                 f"forced {param}: '{original}' -> '{filtered[param]}'",
                             )
+                            state.setdefault("guardrails_triggered", []).append(
+                                f"{param}: '{original}' -> '{filtered[param]}'"
+                            )
 
                 if filtered:
                     changes_by_cat[cat] = filtered
@@ -1754,6 +1763,9 @@ def build(model, config=None) -> DiagnosisWorkflow:
             if actions:
                 detail += f" actions={actions}"
             tool_result(f"apply_{cat}", detail)
+
+        # Store apply results for Slack notification
+        state["apply_results"] = results
 
         # Verify changes on DUT
         tool_call("verify", "checking applied changes on DUT")
@@ -2324,6 +2336,9 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
         notes=notes,
         rca_records=list(state.get("rca_records") or []),
         recommendations=list(state.get("recommendations") or []),
+        apply_results=state.get("apply_results"),
+        guardrails_triggered=state.get("guardrails_triggered"),
+        eval_results=state.get("eval_results"),
     )
 
 
@@ -2654,7 +2669,7 @@ async def _run_debate_planner(
     _save_planner_artifact(deps, "nginx_expert", nginx_analysis, iteration=_iter)
     _save_planner_artifact(deps, "rhel_expert", rhel_analysis, iteration=_iter)
     _save_planner_artifact(deps, "synthesizer", synthesis, iteration=_iter)
-    _run_observational_debate_eval(
+    _obs_result = _run_observational_debate_eval(
         deps,
         model,
         iteration=_iter,
@@ -2663,6 +2678,8 @@ async def _run_debate_planner(
         rhel_analysis=rhel_analysis,
         synthesis=synthesis,
     )
+    if _obs_result and agent_state is not None:
+        agent_state["eval_results"] = _obs_result
 
     rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
     recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)

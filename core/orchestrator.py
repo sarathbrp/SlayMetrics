@@ -20,6 +20,7 @@ from core.lessons import (
     get_top_runs,
     merge_targets,
 )
+from core.slack_notifier import SlackNotifier
 from telemetry import (
     collect_snapshot,
     persist_sampler_result,
@@ -38,6 +39,8 @@ async def run(model, deps: AgentDeps) -> str:
     memory = deps.memory
     langfuse = getattr(deps, "langfuse", None)
     max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
+
+    slack = SlackNotifier(cfg)
 
     logger.panel(
         "SlayMetricsAgent",
@@ -99,6 +102,20 @@ async def run(model, deps: AgentDeps) -> str:
         f"{rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB"
     )
     logger.status("system", f"RHEL: {deps.system_fingerprint}")
+
+    # Determine LLM profile name for Slack
+    _llm_cfg = cfg.get("llm") or {}
+    _active = _llm_cfg.get("active_profile", "unknown")
+    _profile = (_llm_cfg.get("profiles") or {}).get(_active) or {}
+    _llm_label = f"{_active} ({_profile.get('backend', '?')} / {_profile.get('model', '?')})"
+
+    slack.notify_run_start(
+        session_id=session_id,
+        dut_host=cfg["target"]["host"],
+        llm_profile=_llm_label,
+        cpu_cores=cpu_cores,
+        ram_gb=ram_gb,
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1.6: Load lessons learned — merge proven params from best run
@@ -225,6 +242,7 @@ async def run(model, deps: AgentDeps) -> str:
         baseline_rps=baseline_rps,
         best_rps=baseline_rps,
     )
+    slack.notify_baseline_complete(session_id=session_id, baselines=baselines)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 2.5: Aggregate benchmark evidence from bench + DUT telemetry
@@ -443,6 +461,39 @@ async def run(model, deps: AgentDeps) -> str:
 
         healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
         should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
+
+        # Collect applied params for Slack from diagnosis
+        _applied_params: dict[str, dict[str, str]] = {}
+        _failed_params: list[str] = []
+        _guardrails: list[str] = []
+        _eval_results: dict[str, Any] | None = None
+        if hasattr(diagnosis, "apply_results"):
+            for cat, res in (getattr(diagnosis, "apply_results", {}) or {}).items():
+                if isinstance(res, dict):
+                    applied = res.get("applied", {})
+                    if isinstance(applied, dict) and applied:
+                        _applied_params[cat] = applied
+                    elif isinstance(applied, list) and applied:
+                        _applied_params[cat] = {p: "applied" for p in applied}
+                    for p in res.get("failed", []) or []:
+                        _failed_params.append(f"{cat}.{p}" if isinstance(p, str) else str(p))
+        if hasattr(diagnosis, "guardrails_triggered"):
+            _guardrails = list(getattr(diagnosis, "guardrails_triggered", []) or [])
+        if hasattr(diagnosis, "eval_results"):
+            _eval_results = getattr(diagnosis, "eval_results", None)
+
+        slack.notify_iteration_complete(
+            session_id=session_id,
+            iteration=iteration,
+            baselines=baselines,
+            results=iteration_finals,
+            applied_params=_applied_params,
+            failed_params=_failed_params,
+            guardrails_triggered=_guardrails,
+            eval_results=_eval_results,
+            tokens_used=deps.token_counter.total,
+            decision="",  # filled after decision logic below
+        )
 
         if in_optimization_mode:
             candidate = getattr(diagnosis, "optimization_group", None) or {}
@@ -832,6 +883,29 @@ async def run(model, deps: AgentDeps) -> str:
             },
             metadata={"session_id": session_id},
         )
+
+    # Collect all applied params from knowledge for final Slack summary
+    _final_applied: dict[str, dict[str, str]] = {}
+    for fact in memory.get_facts(session_id, type="fix") or []:
+        param = fact.get("parameter", "")
+        cat = param.split(".")[0] if "." in param else "webserver"
+        key = param.split(".", 1)[1] if "." in param else param
+        _final_applied.setdefault(cat, {})[key] = fact.get("after_value", "")
+
+    # Determine leaderboard position
+    _lb = check_leaderboard(memory, finals)
+    _lb_pos = _lb.get("position") if _lb.get("qualified") else None
+
+    slack.notify_run_complete(
+        session_id=session_id,
+        baselines=baselines,
+        finals=finals,
+        total_tokens=deps.token_counter.total,
+        leaderboard_position=_lb_pos,
+        report_path=report_path,
+        applied_params=_final_applied,
+    )
+
     return report_path
 
 
