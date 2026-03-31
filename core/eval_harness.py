@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import re
@@ -332,7 +333,35 @@ def evaluate_synthesizer(
             )
         ]
 
-    judged = synth_judge(bundle)
+    from core import log as logger
+
+    logger.status("eval", "Running synthesizer judge...")
+    try:
+        judged = synth_judge(bundle)
+    except TimeoutError:
+        logger.log("eval", "Synthesizer judge timed out; falling back to warning.", "warn")
+        return [
+            _finding(
+                "synthesizer",
+                "synthesizer.judge_timeout",
+                "warn",
+                -0.1,
+                "Synthesizer judge timed out; synthesis quality was not fully evaluated.",
+                evidence_refs=["synthesizer"],
+            )
+        ]
+    except Exception as exc:
+        logger.log("eval", f"Synthesizer judge failed: {exc}", "warn")
+        return [
+            _finding(
+                "synthesizer",
+                "synthesizer.judge_failed",
+                "warn",
+                -0.1,
+                f"Synthesizer judge failed: {exc}",
+                evidence_refs=["synthesizer"],
+            )
+        ]
     findings: list[dict[str, Any]] = []
     for rule_id, payload in (judged or {}).items():
         passed = bool(payload.get("pass"))
@@ -352,7 +381,12 @@ def evaluate_synthesizer(
     return findings
 
 
-def llm_synth_judge(model, bundle: dict[str, Any]) -> dict[str, Any]:
+def llm_synth_judge(
+    model,
+    bundle: dict[str, Any],
+    *,
+    timeout_sec: float = 20.0,
+) -> dict[str, Any]:
     prompt = (
         "You are grading a synthesis artifact. Return strict JSON with keys "
         "hallucination, critical_omission, merge_fidelity, format_validity. "
@@ -362,7 +396,13 @@ def llm_synth_judge(model, bundle: dict[str, Any]) -> dict[str, Any]:
         f"Synthesizer:\n{json.dumps(bundle.get('synthesizer') or {}, ensure_ascii=True)}\n\n"
         f"Requested format: {bundle.get('requested_format') or 'json'}"
     )
-    response = model.invoke(prompt)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(model.invoke, prompt)
+        try:
+            response = future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TimeoutError(f"synth judge exceeded {timeout_sec:.0f}s") from exc
     content = getattr(response, "content", response)
     if isinstance(content, list):
         text_parts = [
@@ -399,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
 
         load_dotenv()
         cfg = load_config(args.config)
+        from core import log as logger
+
+        logger.status("eval", f"Loading session {args.session} for offline eval")
         embedder = embedder_from_config(cfg)
         memory = tidb_from_config(cfg, embedder)
         memory.connect()
@@ -417,9 +460,12 @@ def main(argv: list[str] | None = None) -> int:
                 "warn",
             )
         else:
+            judge_timeout_sec = float(
+                ((cfg.get("agent") or {}).get("eval") or {}).get("synth_timeout_sec", 20.0) or 20.0
+            )
 
             def synth_judge(payload: dict[str, Any]) -> dict[str, Any]:
-                return llm_synth_judge(model, payload)
+                return llm_synth_judge(model, payload, timeout_sec=judge_timeout_sec)
 
     result = evaluate_case_bundle(bundle, synth_judge=synth_judge)
     payload = json.dumps(result, indent=2, ensure_ascii=False)
