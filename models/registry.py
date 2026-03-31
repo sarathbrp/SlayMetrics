@@ -9,6 +9,7 @@ from core import log as logger
 def create_model(cfg: dict):
     profile_name = cfg["llm"]["active_profile"]
     profile = cfg["llm"]["profiles"][profile_name]
+    llm_cfg = cfg.get("llm") or {}
     backend = profile["backend"]
     model_name = os.environ.get(profile.get("model_env", ""), "").strip() or profile["model"]
     logger.status("main", f"LLM profile: {profile_name} ({backend} / {model_name})")
@@ -44,6 +45,12 @@ def create_model(cfg: dict):
         api_key_env = profile.get("api_key_env", "OPENAI_API_KEY")
         api_key = os.environ.get(api_key_env)
         base_url = str(profile.get("base_url") or "").strip()
+        timeout_sec = float(
+            profile.get("timeout_sec")
+            or llm_cfg.get("request_timeout_sec")
+            or (((cfg.get("agent") or {}).get("eval") or {}).get("synth_timeout_sec"))
+            or 60.0
+        )
         if not api_key:
             logger.log("main", f"{api_key_env} not set", "error")
             sys.exit(1)
@@ -55,6 +62,7 @@ def create_model(cfg: dict):
             api_key=api_key,
             base_url=base_url,
             temperature=0,
+            timeout=timeout_sec,
             max_retries=1,
         )
 
