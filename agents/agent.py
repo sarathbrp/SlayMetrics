@@ -2623,6 +2623,15 @@ async def _run_debate_planner(
     _save_planner_artifact(deps, "nginx_expert", nginx_analysis, iteration=_iter)
     _save_planner_artifact(deps, "rhel_expert", rhel_analysis, iteration=_iter)
     _save_planner_artifact(deps, "synthesizer", synthesis, iteration=_iter)
+    _run_observational_debate_eval(
+        deps,
+        model,
+        iteration=_iter,
+        inspection=all_inspection,
+        nginx_analysis=nginx_analysis,
+        rhel_analysis=rhel_analysis,
+        synthesis=synthesis,
+    )
 
     rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
     recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)
@@ -3298,6 +3307,79 @@ def _save_planner_artifact(
             ("Payload", _markdown_json(payload)),
         ],
     )
+
+
+def _run_observational_debate_eval(
+    deps: AgentDeps,
+    model: Any,
+    *,
+    iteration: int,
+    inspection: dict[str, Any],
+    nginx_analysis: dict[str, Any],
+    rhel_analysis: dict[str, Any],
+    synthesis: dict[str, Any],
+) -> dict[str, Any] | None:
+    agent_cfg = (getattr(deps, "config", None) or {}).get("agent") or {}
+    eval_cfg = agent_cfg.get("eval") or {}
+    if not bool(eval_cfg.get("enabled", False)) or not bool(eval_cfg.get("observational", False)):
+        return None
+
+    from core.eval_harness import evaluate_case_bundle, llm_synth_judge
+
+    system = (inspection.get("system") or {}).copy()
+    if not system.get("ram_gb"):
+        profile = deps.memory.get_profile(deps.session_id) or {}
+        system["ram_gb"] = profile.get("ram_gb")
+        system["os_cpu_count"] = system.get("os_cpu_count") or profile.get("cpu_cores")
+        system["host"] = system.get("host") or profile.get("host")
+        system["service"] = system.get("service") or profile.get("service")
+
+    bundle = {
+        "session_id": deps.session_id,
+        "iteration": iteration,
+        "system": system,
+        "inspection": inspection,
+        "nginx_expert": nginx_analysis,
+        "rhel_expert": rhel_analysis,
+        "synthesizer": synthesis,
+        "requested_format": "json",
+    }
+    timeout_sec = float(eval_cfg.get("synth_timeout_sec", 300.0) or 300.0)
+    result = evaluate_case_bundle(
+        bundle,
+        synth_judge=lambda payload: llm_synth_judge(model, payload, timeout_sec=timeout_sec),
+    )
+    findings = list(result.get("findings") or [])
+    top_findings = (
+        ", ".join(
+            f"{item.get('rule_id')}[{item.get('severity')}]"
+            for item in findings[:3]
+            if isinstance(item, dict)
+        )
+        or "no findings"
+    )
+    tool_result(
+        "eval",
+        (
+            "debate observational: "
+            f"score={float(result.get('total_score', 0.0)):.2f} "
+            f"action={result.get('action', 'unknown')} "
+            f"findings={top_findings}"
+        ),
+    )
+    source = f"iter{iteration}_debate_eval" if iteration else "debate_eval"
+    deps.memory.save_context(
+        deps.session_id,
+        "command_output",
+        source,
+        json.dumps(result, ensure_ascii=True),
+        (
+            "debate eval: "
+            f"score={float(result.get('total_score', 0.0)):.2f} "
+            f"action={result.get('action', 'unknown')}"
+        ),
+    )
+    return result
 
 
 def save_iteration_summary(

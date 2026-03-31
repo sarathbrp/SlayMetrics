@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
 import asyncio
 import json
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
+
+sys.modules.setdefault(
+    "paramiko",
+    types.SimpleNamespace(SSHClient=object, AutoAddPolicy=lambda: object()),
+)
 
 import agents.agent as diagnosis_agent
 from adapters.base import BenchmarkResult
@@ -12,6 +20,7 @@ from agents.agent import (
     DiagnosisOutput,
     _coerce_recommendations,
     _coerce_records,
+    _run_observational_debate_eval,
     _save_planner_artifact,
     build,
 )
@@ -752,6 +761,55 @@ def test_run_normalizes_single_planner_mode_to_deterministic(monkeypatch):
     assert output.notes == "Deterministic complete."
     assert deps.token_counter.input_tokens == 5
     assert deps.token_counter.output_tokens == 1
+
+
+def test_observational_debate_eval_logs_and_persists(monkeypatch):
+    deps = SimpleNamespace(
+        session_id="s1",
+        memory=FakeMemory(),
+        config={"agent": {"eval": {"enabled": True, "observational": True, "synth_timeout_sec": 42}}},
+    )
+    captured: dict[str, object] = {}
+
+    def fake_evaluate_case_bundle(bundle, *, synth_judge=None):
+        captured["bundle"] = bundle
+        captured["judged"] = synth_judge({"session_id": bundle["session_id"]})
+        return {
+            "total_score": 0.62,
+            "action": "recommended_improvements",
+            "findings": [
+                {"rule_id": "nginx.fd_capacity", "severity": "fail"},
+                {"rule_id": "rhel.sysctl_range", "severity": "warn"},
+            ],
+        }
+
+    def fake_llm_synth_judge(model, payload, *, timeout_sec=0):
+        captured["model"] = model
+        captured["payload"] = payload
+        captured["timeout_sec"] = timeout_sec
+        return {"hallucination": {"pass": True}}
+
+    monkeypatch.setattr("core.eval_harness.evaluate_case_bundle", fake_evaluate_case_bundle)
+    monkeypatch.setattr("core.eval_harness.llm_synth_judge", fake_llm_synth_judge)
+    logged: list[tuple[str, str]] = []
+    monkeypatch.setattr(diagnosis_agent, "tool_result", lambda tool, msg: logged.append((tool, msg)))
+
+    result = _run_observational_debate_eval(
+        deps,
+        "model",
+        iteration=1,
+        inspection={"system": {"os_cpu_count": 112, "ram_gb": 502}},
+        nginx_analysis={"summary": "n"},
+        rhel_analysis={"summary": "r"},
+        synthesis={"summary": "s"},
+    )
+
+    assert result["action"] == "recommended_improvements"
+    assert captured["model"] == "model"
+    assert captured["timeout_sec"] == 42
+    assert captured["bundle"]["requested_format"] == "json"
+    assert any(tool == "eval" and "score=0.62" in msg for tool, msg in logged)
+    assert any(row[2] == "iter1_debate_eval" for row in deps.memory.saved)
 
 
 def test_coerce_records_drops_malformed_synthesized_items():

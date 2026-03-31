@@ -98,6 +98,8 @@ agent:
     min_small_gain_pct: 1.0
     leaderboard_gap_pct: 3.0
   eval:
+    enabled: true
+    observational: true
     synth_timeout_sec: 300
   stability:
     enabled: false
