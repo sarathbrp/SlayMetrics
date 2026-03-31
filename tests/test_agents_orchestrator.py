@@ -66,6 +66,28 @@ class FakeMemory:
     def get_queue(self, session_id):
         return []
 
+    def _cursor(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _fake_cursor():
+            class _Cur:
+                def execute(self, *a, **k):
+                    pass
+
+                def fetchall(self):
+                    return []
+
+                def fetchone(self):
+                    return None
+
+            yield _Cur()
+
+        return _fake_cursor()
+
+    def save_benchmark(self, *args, **kwargs):
+        self.saved.append(("benchmark", kwargs))
+
 
 class FakeAdapter:
     def __init__(self):
@@ -443,6 +465,7 @@ def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
 
 def test_orchestrator_optimization_mode_reverts_failed_group(monkeypatch, tmp_path):
     deps = _deps()
+    deps.config["service"]["benchmark"]["tool"] = "hackathon"
     deps.config["agent"]["max_iterations"] = 2
     deps.config["agent"]["optimization"] = {
         "enabled": True,

@@ -24,6 +24,23 @@ class FakeConsole:
         self.lines.append((args, kwargs))
 
 
+def _disabled_langfuse():
+    """Return a fake langfuse client with trace() support for tests."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _noop_trace(*a, **k):
+        yield None
+
+    return SimpleNamespace(
+        enabled=False,
+        flush=lambda: None,
+        shutdown=lambda: None,
+        trace=_noop_trace,
+        last_trace_url=None,
+    )
+
+
 class FakeMemory:
     def __init__(self):
         self.created = False
@@ -407,7 +424,7 @@ def test_main_preserves_config_planner_mode_when_cli_omitted(monkeypatch):
     monkeypatch.setattr(
         main.LangfuseClient,
         "from_env",
-        lambda metadata=None, enabled=True: SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
+        lambda metadata=None, enabled=True: _disabled_langfuse(),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -449,7 +466,7 @@ def test_main_normalizes_single_planner_mode_alias(monkeypatch):
     monkeypatch.setattr(
         main.LangfuseClient,
         "from_env",
-        lambda metadata=None, enabled=True: SimpleNamespace(enabled=False, flush=lambda: None, shutdown=lambda: None),
+        lambda metadata=None, enabled=True: _disabled_langfuse(),
     )
     monkeypatch.setitem(
         sys.modules,

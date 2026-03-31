@@ -176,7 +176,7 @@ def _ctx():
         session_id="s1",
         token_counter=TokenCounter(),
         config={
-            "agent": {"debug_planner_payloads": False, "persist_hypotheses": False, "planner_mode": "single"},
+            "agent": {"debug_planner_payloads": False, "persist_hypotheses": False, "planner_mode": "test_passthrough"},
             "service": {
                 "benchmark": {"duration": 30, "small_file_url": "http://localhost/test"},
                 "config_path": "/etc/nginx/nginx.conf",
