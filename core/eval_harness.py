@@ -4,8 +4,13 @@ import argparse
 import json
 import math
 import re
+import sys
 from pathlib import Path
 from typing import Any, Callable
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 AGENT_WEIGHTS = {"nginx": 0.4, "rhel": 0.4, "synthesizer": 0.2}
 PASS_THRESHOLDS = {"self_correct": 0.5, "recommended_improvements": 1.0}
