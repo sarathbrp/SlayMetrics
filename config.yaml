@@ -112,7 +112,7 @@ tuning:
   webserver_targets:
     worker_processes: "auto"
     worker_connections: "65536"
-    worker_rlimit_nofile: "200000"
+    worker_rlimit_nofile: "524288"
     worker_cpu_affinity: "auto"
     sendfile: "on"
     tcp_nopush: "on"

@@ -2431,6 +2431,9 @@ async def _run_rules_engine(
             if _param not in plan_cat and not _is_blocked(_param, str(_default_val), _cfg):
                 plan_cat[_param] = str(_default_val)
 
+    # ── 5b. Nginx FD consistency — deterministic correction ──────────
+    _enforce_nginx_fd_consistency(apply_plan, getattr(deps, "config", None) or {})
+
     # ── 6. Store apply plan for apply_saved_recommendations_impl ─────
     if agent_state is not None:
         agent_state["apply_plan"] = apply_plan
@@ -2727,6 +2730,9 @@ async def _run_debate_planner(
             if _param not in plan_cat and not _is_blocked(_param, _default_val, _cfg):
                 plan_cat[_param] = _default_val
 
+    # Nginx FD consistency — deterministic correction
+    _enforce_nginx_fd_consistency(apply_plan, getattr(deps, "config", None) or {})
+
     # Store the grouped changes for apply_saved_recommendations_impl
     if agent_state is not None:
         agent_state["apply_plan"] = apply_plan
@@ -2957,6 +2963,52 @@ def _strip_inline_comment(value: str) -> str:
     if idx > 0:
         value = value[:idx]
     return value.strip().split(";")[0].strip()
+
+
+def _enforce_nginx_fd_consistency(apply_plan: dict[str, Any], config: dict[str, Any]) -> None:
+    """Ensure worker_rlimit_nofile >= worker_processes * worker_connections * 2.
+
+    The LLM planner often proposes high concurrency (worker_connections=65536)
+    with auto worker_processes (112 cores) but low worker_rlimit_nofile (200000).
+    This creates an FD budget of 112*65536*2 = 14.6M but only 200K FDs available,
+    causing nginx to crash or reject connections under load.
+    """
+    import math
+
+    web = apply_plan.get("webserver", {})
+    if not isinstance(web, dict):
+        return
+
+    try:
+        procs_str = str(web.get("worker_processes", "auto"))
+        conns = int(web.get("worker_connections", "65536"))
+        nofile = int(web.get("worker_rlimit_nofile", "200000"))
+    except (ValueError, TypeError):
+        return
+
+    # Resolve "auto" to CPU count
+    cpu_cores = int(config.get("_cpu_cores", 112))
+    procs = cpu_cores if procs_str == "auto" else int(procs_str)
+
+    # Each connection uses ~2 FDs (client socket + backend/file)
+    required = (procs * conns * 2) + 4096
+
+    if nofile >= required:
+        return
+
+    # Scale up: align with systemd_nofile, then round to power of 2
+    res_targets = config.get("tuning", {}).get("resource_limits_targets", {})
+    systemd_nofile = int(res_targets.get("systemd_nofile", "524288"))
+    new_nofile = max(required, systemd_nofile)
+    new_nofile = 2 ** math.ceil(math.log2(new_nofile))
+    web["worker_rlimit_nofile"] = str(new_nofile)
+
+    # Also scale up systemd LimitNOFILE if needed
+    res = apply_plan.get("resource_limits", {})
+    if isinstance(res, dict):
+        res_nofile = int(res.get("systemd_nofile", "0") or "0")
+        if res_nofile < new_nofile:
+            res["systemd_nofile"] = str(new_nofile)
 
 
 def _is_blocked(param: str, value: str, config: dict[str, Any] | None = None) -> bool:
