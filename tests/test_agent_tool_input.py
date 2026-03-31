@@ -777,9 +777,12 @@ def test_observational_debate_eval_logs_and_persists(monkeypatch):
         return {
             "total_score": 0.62,
             "action": "recommended_improvements",
+            "nginx_score": 0.4,
+            "rhel_score": 0.7,
+            "synthesizer_score": 1.0,
             "findings": [
-                {"rule_id": "nginx.fd_capacity", "severity": "fail"},
-                {"rule_id": "rhel.sysctl_range", "severity": "warn"},
+                {"agent": "nginx", "rule_id": "nginx.fd_capacity", "severity": "fail"},
+                {"agent": "rhel", "rule_id": "rhel.sysctl_range", "severity": "warn"},
             ],
         }
 
@@ -805,10 +808,16 @@ def test_observational_debate_eval_logs_and_persists(monkeypatch):
     )
 
     assert result["action"] == "recommended_improvements"
+    assert result["by_agent"]["nginx"]["verdict"] == "fail"
+    assert result["by_agent"]["rhel"]["verdict"] == "warning"
+    assert result["by_agent"]["synthesizer"]["verdict"] == "pass"
     assert captured["model"] == "model"
     assert captured["timeout_sec"] == 42
     assert captured["bundle"]["requested_format"] == "json"
     assert any(tool == "eval" and "score=0.62" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "nginx score=0.40" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "rhel score=0.70" in msg for tool, msg in logged)
+    assert any(tool == "eval" and "synthesizer score=1.00" in msg for tool, msg in logged)
     assert any(row[2] == "iter1_debate_eval" for row in deps.memory.saved)
 
 

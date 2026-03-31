@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import unicodedata
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -3350,23 +3351,68 @@ def _run_observational_debate_eval(
         synth_judge=lambda payload: llm_synth_judge(model, payload, timeout_sec=timeout_sec),
     )
     findings = list(result.get("findings") or [])
-    top_findings = (
-        ", ".join(
-            f"{item.get('rule_id')}[{item.get('severity')}]"
-            for item in findings[:3]
-            if isinstance(item, dict)
+    by_agent: dict[str, list[dict[str, Any]]] = {"nginx": [], "rhel": [], "synthesizer": []}
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        agent_name = str(item.get("agent") or "")
+        if agent_name in by_agent:
+            by_agent[agent_name].append(item)
+
+    def _agent_verdict(agent_findings: list[dict[str, Any]]) -> str:
+        if any(str(item.get("severity")) == "fail" for item in agent_findings):
+            return "fail"
+        if any(str(item.get("severity")) == "warn" for item in agent_findings):
+            return "warning"
+        return "pass"
+
+    def _agent_finding_summary(agent_findings: list[dict[str, Any]]) -> str:
+        counts = Counter(
+            str(item.get("rule_id"))
+            for item in agent_findings
+            if isinstance(item, dict) and item.get("rule_id")
         )
-        or "no findings"
-    )
+        return (
+            ", ".join(
+                f"{rule_id} x{count}" if count > 1 else rule_id
+                for rule_id, count in counts.most_common(3)
+            )
+            or "clean"
+        )
+
+    agent_scores = {
+        "nginx": float(result.get("nginx_score", 0.0)),
+        "rhel": float(result.get("rhel_score", 0.0)),
+        "synthesizer": float(result.get("synthesizer_score", 0.0)),
+    }
+    result["by_agent"] = {
+        agent_name: {
+            "score": agent_scores.get(agent_name, 0.0),
+            "verdict": _agent_verdict(agent_findings),
+            "findings": agent_findings,
+            "summary": _agent_finding_summary(agent_findings),
+        }
+        for agent_name, agent_findings in by_agent.items()
+    }
+
     tool_result(
         "eval",
         (
             "debate observational: "
             f"score={float(result.get('total_score', 0.0)):.2f} "
-            f"action={result.get('action', 'unknown')} "
-            f"findings={top_findings}"
+            f"action={result.get('action', 'unknown')}"
         ),
     )
+    for agent_name in ("nginx", "rhel", "synthesizer"):
+        agent_view = result["by_agent"][agent_name]
+        tool_result(
+            "eval",
+            (
+                f"{agent_name} score={float(agent_view.get('score', 0.0)):.2f} "
+                f"verdict={agent_view.get('verdict', 'unknown')} "
+                f"findings={agent_view.get('summary', 'clean')}"
+            ),
+        )
     source = f"iter{iteration}_debate_eval" if iteration else "debate_eval"
     deps.memory.save_context(
         deps.session_id,
