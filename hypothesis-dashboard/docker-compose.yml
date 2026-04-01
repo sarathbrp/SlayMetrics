@@ -1,15 +1,14 @@
 services:
   dashboard:
     build: .
-    ports:
-      - "8080:8080"
+    network_mode: host
     volumes:
       - ../hypothesis:/data/hypothesis:ro
       - ../report:/data/report:ro
     environment:
       - DATA_DIR=/data
       - STATIC_DIR=/app/static
-      - TIDB_HOST=host.containers.internal
+      - TIDB_HOST=127.0.0.1
       - TIDB_PORT=4000
       - TIDB_DATABASE=perfagent
       - TIDB_USER=root
