@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react'
 
 const PAGE_SIZE = 10
 const MAX_ROWS = 30
+const MAX_COMPARISON_ROWS = MAX_ROWS - 1
 const AGENT_SOURCE_STYLES = {
   nginx_expert: { label: 'Nginx', color: '#38bdf8', bg: 'rgba(56,189,248,0.14)', border: 'rgba(56,189,248,0.3)' },
   rhel_expert: { label: 'RHEL', color: '#f59e0b', bg: 'rgba(245,158,11,0.14)', border: 'rgba(245,158,11,0.3)' },
@@ -42,7 +43,7 @@ export default function WinningGapsView({ data }) {
     const rows = [...(winningGaps.sessions || [])]
       .filter((row) => Number(row.best_small_rps || 0) > 0)
       .sort((a, b) => Number(b.best_small_rps || 0) - Number(a.best_small_rps || 0))
-      .slice(0, MAX_ROWS)
+      .slice(0, MAX_COMPARISON_ROWS)
 
     const filtered = hideExactMatches
       ? rows.filter((row) => row.missing_count > 0 || row.differing_count > 0)
@@ -134,7 +135,7 @@ export default function WinningGapsView({ data }) {
               Winning Gaps
             </h3>
             <p className="text-sm max-w-3xl" style={{ color: 'var(--text-secondary)' }}>
-              Compares the strongest observed session against the top 30 positive-RPS sessions. Each page shows 10 sessions at a time so the missing combinations stay readable.
+              Compares the strongest observed session against the top 30 sessions overall, including the reference. Each page shows 10 sessions at a time so the missing combinations stay readable.
             </p>
           </div>
           <div className="flex items-start gap-4 flex-wrap">
@@ -142,7 +143,7 @@ export default function WinningGapsView({ data }) {
               <SummaryStat label="Reference" value={reference.session_id} />
               <SummaryStat label="Best Small RPS" value={Math.round(reference.best_small_rps || 0).toLocaleString()} accent="#34d399" />
               <SummaryStat label="Homepage RPS" value={Math.round(reference.best_homepage_rps || 0).toLocaleString()} />
-              <SummaryStat label="Rows" value={`${rankedRows.length}/${MAX_ROWS}`} />
+              <SummaryStat label="Rows" value={`${rankedRows.length + 1}/${MAX_ROWS}`} />
             </div>
             <button
               onClick={() => setShowReferencePanel(true)}
@@ -182,7 +183,7 @@ export default function WinningGapsView({ data }) {
 
         <div className="flex items-center justify-between gap-4 flex-wrap mb-4">
           <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-            Reference session is rank #1. Page {currentPage}: showing ranks {((currentPage - 1) * PAGE_SIZE) + 2}-{Math.min((currentPage * PAGE_SIZE) + 1, rankedRows.length + 1)} of top {rankedRows.length + 1}
+            Reference session is rank #1. Page {currentPage}: showing ranks {((currentPage - 1) * PAGE_SIZE) + 2}-{Math.min((currentPage * PAGE_SIZE) + 1, rankedRows.length + 1)} of top {Math.min(rankedRows.length + 1, MAX_ROWS)}
           </p>
           <div className="flex items-center gap-3 flex-wrap">
             <button
