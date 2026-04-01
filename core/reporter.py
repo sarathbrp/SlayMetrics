@@ -15,6 +15,7 @@ def generate(
     output_dir: str = "report",
     baselines: dict | None = None,
     finals: dict | None = None,
+    final_effective_config: dict | None = None,
     best_results: dict | None = None,
     best_iteration: int | None = None,
     stability: dict | None = None,
@@ -29,6 +30,9 @@ def generate(
     recommendation_entries = memory.get_contexts(session_id, type="recommendation")
     optimization_entries = memory.get_contexts(
         session_id, type="command_output", source_prefix="optimization_"
+    )
+    final_snapshot_entries = memory.get_contexts(
+        session_id, type="command_output", source_prefix="final_effective_config_snapshot", limit=1
     )
     queue = memory.get_queue(session_id)
 
@@ -79,6 +83,8 @@ def generate(
         "finals_by_size": finals or {},
         "best_results_by_size": best_results or {},
         "best_iteration": best_iteration,
+        "final_effective_config": final_effective_config
+        or _load_final_effective_config(final_snapshot_entries),
         "stability": stability or {},
         "throughput": throughput or {},
         "fixes_applied": [_clean(f) for f in fixes],
@@ -115,6 +121,18 @@ def generate(
         json.dump(report_data, f, indent=2, default=str)
 
     return md_path
+
+
+def _load_final_effective_config(entries: list[dict]) -> dict:
+    if not entries:
+        return {}
+    content = str(entries[0].get("content") or "").strip()
+    if not content:
+        return {}
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return {}
 
 
 def _md_report(

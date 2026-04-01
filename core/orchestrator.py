@@ -11,6 +11,7 @@ import agents.agent as diagnosis_agent
 import core.reporter as reporter
 import rhel.system_checks as system_checks
 from agents import AgentDeps
+from agents.tools_inspect import inspect_all
 from core import log as logger
 from core.lessons import (
     check_leaderboard,
@@ -30,6 +31,79 @@ from telemetry import (
 )
 
 PAYLOAD_SIZES = ["small", "medium", "large"]
+
+
+def _normalize_final_effective_config(inspection: dict[str, Any]) -> dict[str, dict[str, str]]:
+    web = dict(((inspection.get("webserver") or {}).get("current") or {}))
+    kernel = dict(((inspection.get("kernel") or {}).get("current") or {}))
+    resource = (inspection.get("resource_limits") or {}).get("findings") or {}
+    network = (inspection.get("network") or {}).get("findings") or {}
+    storage = (inspection.get("storage") or {}).get("findings") or {}
+
+    resource_limits: dict[str, str] = {}
+    for key in ("systemd_nofile", "systemd_nproc", "cgroup_io_weight", "cgroup_cpu_weight"):
+        value = resource.get(key)
+        if value not in (None, "", "unknown"):
+            resource_limits[key] = str(value)
+    if resource.get("numa_policy"):
+        resource_limits["numa_policy"] = str(resource["numa_policy"])
+    resource_limits["cgroup_cpu"] = (
+        "max" if not resource.get("cgroup_cpu_pct") else str(resource["cgroup_cpu_pct"])
+    )
+    resource_limits["cgroup_memory"] = (
+        "max" if not resource.get("cgroup_memory_mb") else f"{resource['cgroup_memory_mb']}MB"
+    )
+
+    network_state: dict[str, str] = {}
+    if network.get("conntrack_max") not in (None, "", "unknown"):
+        network_state["conntrack_max"] = str(network["conntrack_max"])
+    network_state["iptables_drop_rules"] = (
+        "present" if network.get("iptables_has_drops") else "none"
+    )
+    network_state["tc_rules"] = (
+        str(network.get("tc_summary") or "present") if network.get("tc_has_shaping") else "fq_codel"
+    )
+
+    storage_state: dict[str, str] = {}
+    for key in ("io_scheduler", "readahead"):
+        value = storage.get(key)
+        if value not in (None, "", "unknown"):
+            storage_state[key] = str(value)
+
+    return {
+        "webserver": {str(k): str(v) for k, v in web.items() if str(v)},
+        "kernel": {str(k): str(v) for k, v in kernel.items() if str(v)},
+        "resource_limits": resource_limits,
+        "network": network_state,
+        "storage": storage_state,
+    }
+
+
+def _capture_final_effective_config(deps: AgentDeps, session_id: str, memory) -> dict[str, Any]:
+    inspection = inspect_all(deps.ssh, deps.config)
+    effective_config = _normalize_final_effective_config(inspection)
+    snapshot = {
+        "version": 1,
+        "captured_at": _utc_now_iso(),
+        "inspection": inspection,
+        "effective_config": effective_config,
+    }
+    parameter_count = sum(len(values) for values in effective_config.values())
+    summary = f"final snapshot: {parameter_count} parameters"
+    memory.save_context(
+        session_id,
+        "command_output",
+        "final_effective_config_snapshot",
+        json.dumps(snapshot, ensure_ascii=True),
+        summary,
+    )
+    return snapshot
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def run(model, deps: AgentDeps) -> str:
@@ -717,6 +791,8 @@ async def run(model, deps: AgentDeps) -> str:
     final_small_rps = finals.get("small", {}).get("rps", finals.get("homepage", {}).get("rps", 0))
     memory.update_profile(session_id, best_rps=best_rps)
 
+    final_effective_config = _capture_final_effective_config(deps, session_id, memory)
+
     # Persist final results to benchmarks table (permanent, not session-scoped)
     for workload in ("homepage", "small", "medium", "large", "mixed"):
         wl_data = finals.get(workload, {})
@@ -847,6 +923,7 @@ async def run(model, deps: AgentDeps) -> str:
         deps.token_counter,
         baselines=baselines,
         finals=finals,
+        final_effective_config=final_effective_config,
         best_results=best_results,
         best_iteration=best_iteration,
         stability=stability_data,

@@ -231,9 +231,25 @@ def _build_tidb_summary(conn, data_dir: str) -> dict:
         )
         validation_rows = cur.fetchall()
 
+        cur.execute(
+            """
+            SELECT session_id, content
+            FROM context
+            WHERE source = 'final_effective_config_snapshot'
+            ORDER BY created_at DESC
+            """
+        )
+        snapshot_rows = cur.fetchall()
+
     validation_rows_by_session: dict[str, list[dict]] = defaultdict(list)
     for row in validation_rows:
         validation_rows_by_session[str(row.get("session_id"))].append(row)
+    snapshot_by_session: dict[str, dict[str, str]] = {}
+    for row in snapshot_rows:
+        session_id = str(row.get("session_id") or "")
+        if session_id in snapshot_by_session:
+            continue
+        snapshot_by_session[session_id] = _parse_effective_snapshot(row.get("content"))
 
     for meta in session_meta_rows:
         session_id = str(meta["session_id"])
@@ -296,6 +312,26 @@ def _build_tidb_summary(conn, data_dir: str) -> dict:
                     "titles": set(),
                 },
             )["applied"] = True
+
+        snapshot_effective = snapshot_by_session.get(session_id) or {}
+        if snapshot_effective:
+            effective_applied = dict(snapshot_effective)
+            for parameter, value in snapshot_effective.items():
+                state = session_state.setdefault(
+                    parameter,
+                    {
+                        "parameter": parameter,
+                        "scope": _scope_for_parameter(parameter),
+                        "recommended": True,
+                        "applied": False,
+                        "rejected": False,
+                        "values": set(),
+                        "titles": set(),
+                    },
+                )
+                state["applied"] = True
+                state["recommended"] = True
+                state["values"].add(str(value))
 
         timestamp = _format_tidb_timestamp(meta.get("completed_at") or meta.get("started_at"))
         best_small_rps = float(meta.get("best_small_rps") or 0.0)
@@ -1317,6 +1353,28 @@ def _collect_precise_applied(iterations: list[dict]) -> dict[str, str]:
                 if key:
                     applied[key] = str(value)
     return applied
+
+
+def _parse_effective_snapshot(content: object) -> dict[str, str]:
+    text = str(content or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    effective = payload.get("effective_config") or {}
+    if not isinstance(effective, dict):
+        return {}
+    flattened: dict[str, str] = {}
+    for category, values in effective.items():
+        if not isinstance(values, dict):
+            continue
+        for parameter, value in values.items():
+            normalized = _normalize_tidb_parameter(f"{category}.{parameter}")
+            if normalized:
+                flattened[normalized] = str(value)
+    return flattened
 
 
 def _normalize_precise_param(parameter: str) -> str:

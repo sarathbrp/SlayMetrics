@@ -191,6 +191,7 @@ curl "http://localhost:8080/api/leaderboard/224815cd/export?pretty=1"
 
 Data source behavior:
 - The dashboard now prefers live TiDB data for sessions, benchmarks, confirmed fixes, and contradicted/reverted validations.
+- New runs also persist a canonical `final_effective_config_snapshot` in TiDB context and `report.json`; the dashboard prefers that snapshot over inferred validation history when it exists.
 - Historical `hypothesis/` artifacts are still used as a fallback when TiDB is unavailable, and as a provenance source for agent attribution where available.
 - In containerized deployment on system 2, the dashboard runs in host-network mode so it can reach TiDB on `127.0.0.1:4000`.
 - `pretty=1`
