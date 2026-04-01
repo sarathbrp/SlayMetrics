@@ -141,16 +141,28 @@ hypothesis/99b3fc48/
 
 ## Hypothesis Dashboard
 
-Visual dashboard for reviewing agent sessions and comparing runs:
+Visual dashboard for reviewing agent sessions and aggregating parameter evidence across runs:
 
 ```bash
 cd hypothesis-dashboard
+npm run dev                  # starts backend + frontend for local dev
+# Open http://localhost:5176
+
 podman-compose up --build    # or docker-compose
-# Open http://localhost:8080
+# Open http://localhost:8080 for the containerized build
+```
+
+If the root dev command fails, run the frontend and backend separately to isolate the issue:
+
+```bash
+cd hypothesis-dashboard
+npm run dev:backend
+# in another shell
+npm run dev:frontend
 ```
 
 - **Session View** — benchmark charts, iteration timeline, agent reasoning
-- **Compare View** — side-by-side session comparison with token efficiency
+- **Parameters View** — hot/cold parameters, rejection patterns, and cross-session evidence matrix
 
 ## Knowledge Base
 

@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react'
 import SessionView from './components/SessionView'
-import CompareView from './components/CompareView'
+import ParameterView from './components/ParameterView'
+import WinningGapsView from './components/WinningGapsView'
 
-const API = '/api'
+const API = import.meta.env.DEV ? 'http://127.0.0.1:8000/api' : '/api'
 
 function ThemeToggle({ dark, onToggle }) {
   return (
@@ -37,17 +38,26 @@ export default function App() {
   const [sessions, setSessions] = useState([])
   const [selectedSession, setSelectedSession] = useState(null)
   const [sessionData, setSessionData] = useState(null)
-  const [compareData, setCompareData] = useState(null)
+  const [parameterData, setParameterData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [dark, setDark] = useState(() => {
-    const stored = localStorage.getItem('slaymetrics-theme')
-    if (stored) return stored === 'dark'
-    return window.matchMedia('(prefers-color-scheme: dark)').matches
+    try {
+      const stored = localStorage.getItem('slaymetrics-theme')
+      if (stored) return stored === 'dark'
+      return window.matchMedia('(prefers-color-scheme: dark)').matches
+    } catch {
+      return true
+    }
   })
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
-    localStorage.setItem('slaymetrics-theme', dark ? 'dark' : 'light')
+    try {
+      localStorage.setItem('slaymetrics-theme', dark ? 'dark' : 'light')
+    } catch {
+      // Ignore storage failures in locked-down browser contexts.
+    }
   }, [dark])
 
   useEffect(() => {
@@ -60,7 +70,10 @@ export default function App() {
         }
         setLoading(false)
       })
-      .catch(() => setLoading(false))
+      .catch((err) => {
+        setError(`Failed to load sessions from ${API}/sessions: ${err.message}`)
+        setLoading(false)
+      })
   }, [])
 
   useEffect(() => {
@@ -68,15 +81,15 @@ export default function App() {
     fetch(`${API}/sessions/${selectedSession}`)
       .then(r => r.json())
       .then(setSessionData)
+      .catch((err) => setError(`Failed to load session ${selectedSession}: ${err.message}`))
   }, [selectedSession])
 
   useEffect(() => {
-    if (sessions.length < 2) return
-    const ids = sessions.slice(0, 3).map(s => s.session_id).join(',')
-    fetch(`${API}/compare?sessions=${ids}`)
+    fetch(`${API}/parameters`)
       .then(r => r.json())
-      .then(setCompareData)
-  }, [sessions])
+      .then(setParameterData)
+      .catch((err) => setError(`Failed to load parameter summary: ${err.message}`))
+  }, [])
 
   if (loading) {
     return (
@@ -91,9 +104,31 @@ export default function App() {
     )
   }
 
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-6" style={{ background: 'var(--bg-primary)' }}>
+        <div className="glass-card p-6 max-w-3xl w-full">
+          <h2 className="text-lg font-semibold mb-3" style={{ color: 'var(--text-primary)' }}>
+            Dashboard Startup Error
+          </h2>
+          <p className="text-sm mb-4" style={{ color: 'var(--text-secondary)' }}>
+            The frontend loaded but could not fetch dashboard data.
+          </p>
+          <pre
+            className="text-xs font-mono p-4 rounded-xl overflow-x-auto"
+            style={{ background: 'var(--code-bg)', color: 'var(--text-secondary)' }}
+          >
+            {error}
+          </pre>
+        </div>
+      </div>
+    )
+  }
+
   const tabs = [
     { id: 'session', label: 'Session View', icon: '📊' },
-    { id: 'compare', label: 'Compare', icon: '🔀' },
+    { id: 'parameters', label: 'Parameters', icon: '🔥' },
+    { id: 'gaps', label: 'Winning Gaps', icon: '🧩' },
   ]
 
   return (
@@ -146,8 +181,10 @@ export default function App() {
             onSelectSession={setSelectedSession}
             data={sessionData}
           />
+        ) : tab === 'parameters' ? (
+          <ParameterView data={parameterData} />
         ) : (
-          <CompareView sessions={sessions} data={compareData} />
+          <WinningGapsView data={parameterData} />
         )}
       </main>
     </div>

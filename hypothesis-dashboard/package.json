@@ -1,0 +1,10 @@
+{
+  "name": "slaymetrics-dashboard-dev",
+  "private": true,
+  "scripts": {
+    "dev": "bash -lc 'trap \"kill 0\" EXIT; (cd backend && python3 -m uvicorn main:app --host 127.0.0.1 --port 8000) & (cd frontend && npm run dev -- --host 127.0.0.1 --port 5176 --strictPort) & wait'",
+    "dev:backend": "cd backend && python3 -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload",
+    "dev:frontend": "cd frontend && npm run dev -- --host 127.0.0.1 --port 5176 --strictPort",
+    "build": "cd frontend && npm run build"
+  }
+}
