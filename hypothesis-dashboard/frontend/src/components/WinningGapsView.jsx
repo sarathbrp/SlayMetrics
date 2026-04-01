@@ -51,15 +51,9 @@ export default function WinningGapsView({ data }) {
     return filtered
   }, [winningGaps.sessions, hideExactMatches])
 
-  const rankedRowIds = useMemo(
-    () => new Set((winningGaps.sessions || []).slice(0, MAX_ROWS).map((row) => row.session_id)),
-    [winningGaps.sessions],
-  )
-
   const customCandidates = useMemo(() => {
     return [...(winningGaps.sessions || [])]
       .filter((row) => row.session_id !== reference?.session_id)
-      .filter((row) => Number(row.best_small_rps || 0) > 0)
       .sort((a, b) => Number(b.best_small_rps || 0) - Number(a.best_small_rps || 0))
   }, [reference?.session_id, winningGaps.sessions])
 
@@ -105,7 +99,7 @@ export default function WinningGapsView({ data }) {
       const next = new Set(current)
       const availableIds = new Set(customCandidates.map((row) => row.session_id))
       for (const sessionId of requestedIds) {
-        if (availableIds.has(sessionId) && !rankedRowIds.has(sessionId)) {
+        if (availableIds.has(sessionId)) {
           next.add(sessionId)
         }
       }
