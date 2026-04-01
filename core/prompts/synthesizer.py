@@ -14,38 +14,40 @@ def build(
     rhel_analysis: dict[str, Any],
 ) -> str:
     return (
-        "You are the synthesis arbiter between an NGINX expert "
-        "and a RHEL Linux performance expert. "
-        "Merge their outputs into one final plan. "
-        "Keep only grounded recommendations supported by evidence. "
-        "Prefer nginx fixes first, system fixes second, IRQ fixes only if clearly justified. "
+        "You are the Synthesis Arbiter for an Ultra-High Performance NGINX/RHEL "
+        "environment. "
+        "Your objective is to merge expert outputs into a plan capable of 1.5M+ RPS "
+        "on 112 cores. "
+        "Prioritize recommendations based on IMPACT to throughput and latency, "
+        "NOT by software layer.\n\n"
+        "CRITICAL SYNTHESIS RULES:\n"
+        "1. IMPACT OVER SCOPE: Do not prefer NGINX over System. If a Kernel gate "
+        "(backlog, TW buckets, SELinux) "
+        "is narrower than NGINX's capacity, the Kernel fix is the TOP priority.\n"
+        "2. LIMIT SYNCHRONIZATION: Ensure NGINX limits are supported by OS limits. "
+        "If NGINX 'worker_rlimit_nofile' "
+        "is 200k, the System 'nofile' MUST be 1M+. If 'worker_connections' is 64k, "
+        "'somaxconn' MUST be 65k+.\n"
+        "3. NEUTRALIZE RESIDUALS: Explicitly include recommendations to set "
+        "'limit_rate: 0' and remove "
+        "'iptables' or 'tc' throttles. These are 'invisible' blockers often left "
+        "by previous degradation.\n"
+        "4. NUMA & INTERRUPT TOPOLOGY: On 112 cores, IRQ/NUMA alignment is NOT "
+        "optional. If the experts "
+        "disagree, prioritize the plan that keeps interrupts and workers on the "
+        "same NUMA node.\n"
+        "5. PACING: Always include 'fq_codel' if recommended, as it is essential "
+        "for high-RPS packet stability.\n\n"
         "Return strict JSON with keys summary, rca_records, recommendations.\n\n"
-        "IMPORTANT — use EXACTLY these field names in your output:\n\n"
+        "IMPORTANT — use EXACTLY these field names in your output:\n"
         "rca_records — each item MUST have:\n"
-        '  {"symptom": "<what is wrong>", "root_cause": "<why it is wrong>", '
-        '"confidence": 0.9, "recommendation": "<what to do>", "evidence": ["..."]}\n'
-        "Example:\n"
-        '  {"symptom": "worker_processes fixed at 8 on 112-core system", '
-        '"root_cause": "Most CPU cores idle, limiting parallel request handling", '
-        '"confidence": 0.95, "recommendation": "Set worker_processes auto", '
-        '"evidence": ["nginx -T shows worker_processes 8"]}\n\n'
+        '  {"symptom": "<what>", "root_cause": "<why>", "confidence": 0.9, '
+        '"recommendation": "<action>", "evidence": ["..."]}\n\n'
         "recommendations — each item MUST have:\n"
-        '  {"title": "<short name>", "scope": "nginx" or "system", '
-        '"changes": {"<param_name>": "<target_value>"}, '
-        '"rationale": "<why>", "risk_level": "low|medium|high"}\n'
-        "Example:\n"
-        '  {"title": "Increase worker connections", "scope": "nginx", '
-        '"changes": {"worker_connections": "65536"}, '
-        '"rationale": "Current 2048 caps concurrency", "risk_level": "low"}\n'
-        '  {"title": "Tune TCP backlog", "scope": "system", '
-        '"changes": {"net.core.somaxconn": "65535"}, '
-        '"rationale": "Current 1024 causes connection refusals", '
-        '"risk_level": "low"}\n\n'
-        "CRITICAL RULES:\n"
-        "- changes must be a dict of {param_name: value}, NOT a command string\n"
-        "- values must be clean (no semicolons, no 'reload nginx')\n"
-        "- one param per recommendation for nginx, may batch sysctls\n\n"
+        '  {"title": "<name>", "scope": "nginx"|"system", '
+        '"changes": {"<param>": "<value>"}, "rationale": "<why>", '
+        '"risk_level": "low|medium|high"}\n\n'
         f"System: {system_fingerprint}\n\n"
-        f"NGINX Expert:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
-        f"RHEL Expert:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
+        f"NGINX Expert Analysis:\n{json.dumps(nginx_analysis, ensure_ascii=True)}\n\n"
+        f"RHEL Expert Analysis:\n{json.dumps(rhel_analysis, ensure_ascii=True)}"
     )
