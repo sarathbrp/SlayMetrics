@@ -284,6 +284,9 @@ export default function WinningGapsView({ data }) {
                           <div className="font-mono text-xs" style={{ color: 'var(--text-primary)' }}>
                             {row.session_id}
                           </div>
+                          <div className="text-[0.65rem] mb-1">
+                            <LeaderboardShift row={row} />
+                          </div>
                           <div className="text-[0.7rem] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
                             <BenchmarkTrend value={row.improvement_pct} />
                             <span>{fmtPct(row.improvement_pct)}</span>
@@ -362,6 +365,9 @@ export default function WinningGapsView({ data }) {
                     </td>
                     <td className="py-2.5 px-2">
                       <div className="font-mono text-xs" style={{ color: 'var(--text-primary)' }}>{row.session_id}</div>
+                      <div className="text-[0.65rem] mb-1">
+                        <LeaderboardShift row={row} />
+                      </div>
                       <div className="text-[0.7rem] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
                         <BenchmarkTrend value={row.improvement_pct} />
                         <span>{fmtPct(row.improvement_pct)}</span>
@@ -660,6 +666,20 @@ function BenchmarkTrend({ value }) {
     return <span title="Benchmark regressed" style={{ color: '#fb7185' }}>↓</span>
   }
   return <span title="No benchmark change" style={{ color: 'var(--text-muted)' }}>→</span>
+}
+
+function LeaderboardShift({ row }) {
+  if (row?.is_new_entry) {
+    return <span style={{ color: '#34d399' }}>↑ new leaderboard entry</span>
+  }
+  const delta = Number(row?.rank_delta || 0)
+  if (delta > 0) {
+    return <span style={{ color: '#34d399' }}>↑ up {delta}</span>
+  }
+  if (delta < 0) {
+    return <span style={{ color: '#fb7185' }}>↓ down {Math.abs(delta)}</span>
+  }
+  return <span style={{ color: 'var(--text-muted)' }}>→ unchanged</span>
 }
 
 function trendLabel(value) {

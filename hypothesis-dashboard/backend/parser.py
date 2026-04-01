@@ -8,6 +8,7 @@ import math
 import os
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 PRECISE_BUNDLE_MAP: dict[str, str] = {
@@ -92,6 +93,7 @@ REFERENCE_SESSION_OVERRIDE = os.environ.get(
     "b27d6d9f",
 ).strip()
 IGNORED_SESSION_IDS = {"fc1e49d9"}
+LEADERBOARD_LIMIT = 30
 
 
 def discover_sessions(data_dir: str) -> list[dict]:
@@ -247,7 +249,7 @@ def load_parameter_summary(data_dir: str) -> dict:
         session = load_session(data_dir, session_id)
         report = session.get("report") or _load_report_json(report_root, session_id) or {}
         improvement = _resolve_session_improvement(session)
-        timestamp = report.get("generated_at", "")
+        timestamp = _resolve_session_timestamp(session_dir, report)
 
         session_state: dict[str, dict] = {}
         recommended = _parse_recommendations_file(session_dir / "05_recommendations.md")
@@ -735,6 +737,10 @@ def _build_winning_gaps(
         )
         if override:
             reference = override
+    current_rank_map = {
+        item["session_id"]: index for index, item in enumerate(ranked[:LEADERBOARD_LIMIT], start=1)
+    }
+    previous_rank_map = _previous_rank_map(ranked)
     ref_applied = session_precise_applied.get(reference["session_id"], {})
     ref_bundles = _bundle_counts(ref_applied.keys())
 
@@ -775,6 +781,16 @@ def _build_winning_gaps(
                 "best_small_rps": session.get("best_small_rps", 0.0),
                 "best_homepage_rps": session.get("best_homepage_rps", 0.0),
                 "improvement_pct": session.get("improvement_pct", 0.0),
+                "timestamp": session.get("timestamp", ""),
+                "leaderboard_rank": current_rank_map.get(session["session_id"]),
+                "rank_delta": _rank_delta(
+                    current_rank_map.get(session["session_id"]),
+                    previous_rank_map.get(session["session_id"]),
+                ),
+                "is_new_entry": (
+                    current_rank_map.get(session["session_id"]) is not None
+                    and previous_rank_map.get(session["session_id"]) is None
+                ),
                 "performance_vs_reference_pct": _ratio_pct(
                     session.get("best_small_rps", 0.0),
                     reference.get("best_small_rps", 0.0),
@@ -823,6 +839,16 @@ def _build_winning_gaps(
             "best_small_rps": reference.get("best_small_rps", 0.0),
             "best_homepage_rps": reference.get("best_homepage_rps", 0.0),
             "improvement_pct": reference.get("improvement_pct", 0.0),
+            "timestamp": reference.get("timestamp", ""),
+            "leaderboard_rank": current_rank_map.get(reference["session_id"], 1),
+            "rank_delta": _rank_delta(
+                current_rank_map.get(reference["session_id"]),
+                previous_rank_map.get(reference["session_id"]),
+            ),
+            "is_new_entry": (
+                current_rank_map.get(reference["session_id"]) is not None
+                and previous_rank_map.get(reference["session_id"]) is None
+            ),
             "selection_mode": "override"
             if reference["session_id"] == REFERENCE_SESSION_OVERRIDE
             else "top_rps",
@@ -876,6 +902,47 @@ def _ratio_pct(value: object, reference: object) -> float:
     if ref <= 0:
         return 0.0
     return round(cur / ref * 100.0, 1)
+
+
+def _resolve_session_timestamp(session_dir: Path, report: dict) -> str:
+    generated_at = str(report.get("generated_at") or "").strip()
+    if generated_at:
+        return generated_at
+    latest_mtime = session_dir.stat().st_mtime
+    for path in session_dir.rglob("*"):
+        try:
+            latest_mtime = max(latest_mtime, path.stat().st_mtime)
+        except OSError:
+            continue
+    return datetime.fromtimestamp(latest_mtime, tz=timezone.utc).isoformat()
+
+
+def _previous_rank_map(ranked: list[dict]) -> dict[str, int]:
+    latest = max(ranked, key=lambda item: str(item.get("timestamp", "")), default=None)
+    if not latest:
+        return {}
+    if not latest.get("timestamp"):
+        return {}
+    previous = [item for item in ranked if item["session_id"] != latest["session_id"]]
+    previous.sort(
+        key=lambda item: (
+            -float(item.get("best_small_rps") or 0.0),
+            -float(item.get("best_homepage_rps") or 0.0),
+            -float(item.get("improvement_pct") or 0.0),
+        ),
+    )
+    return {
+        item["session_id"]: index
+        for index, item in enumerate(previous[:LEADERBOARD_LIMIT], start=1)
+    }
+
+
+def _rank_delta(current_rank: int | None, previous_rank: int | None) -> int | None:
+    if current_rank is None:
+        return None
+    if previous_rank is None:
+        return None
+    return previous_rank - current_rank
 
 
 def _primary_value(state: dict) -> str:
