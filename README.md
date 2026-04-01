@@ -164,6 +164,33 @@ npm run dev:frontend
 - **Session View** — benchmark charts, iteration timeline, agent reasoning
 - **Parameters View** — hot/cold parameters, rejection patterns, and cross-session evidence matrix
 
+### Dashboard API
+
+The dashboard backend also exposes API endpoints for leaderboard automation and external analysis:
+
+```bash
+curl "http://localhost:8080/api/leaderboard"
+curl "http://localhost:8080/api/leaderboard?pretty=1"
+curl "http://localhost:8080/api/leaderboard/export"
+curl "http://localhost:8080/api/leaderboard/export?format=csv"
+curl "http://localhost:8080/api/leaderboard/224815cd"
+curl "http://localhost:8080/api/leaderboard/224815cd/export?pretty=1"
+```
+
+- `GET /api/leaderboard`
+  Returns the current leaderboard payload with:
+  `metadata`, `reference`, and ranked `rows`.
+- `GET /api/leaderboard/export`
+  Returns the full leaderboard in JSON by default.
+  Use `?format=csv` for a CSV export.
+- `GET /api/leaderboard/{session_id}`
+  Returns one selected leaderboard row plus the active reference metadata.
+- `GET /api/leaderboard/{session_id}/export`
+  Returns the same export-style compare payload used by the UI:
+  reference/current session metadata, applied parameters, and per-parameter compare rows.
+- `pretty=1`
+  Supported on JSON endpoints for human-readable curl output.
+
 ## Knowledge Base
 
 Drop `.md` files into `facts/` with performance tuning documentation. Automatically chunked, embedded, and loaded into TiDB on startup.
