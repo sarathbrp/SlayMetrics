@@ -441,6 +441,78 @@ def load_parameter_summary(data_dir: str) -> dict:
     }
 
 
+def load_leaderboard(data_dir: str) -> dict:
+    summary = load_parameter_summary(data_dir)
+    winning_gaps = summary.get("winning_gaps") or {}
+    reference = winning_gaps.get("reference")
+    rows = [
+        row
+        for row in (winning_gaps.get("sessions") or [])
+        if float(row.get("best_small_rps") or 0.0) > 0
+    ]
+    rows.sort(key=lambda item: float(item.get("best_small_rps") or 0.0), reverse=True)
+    rows = rows[: max(LEADERBOARD_LIMIT - 1, 0)]
+    return {
+        "metadata": {
+            "leaderboard_total_limit": LEADERBOARD_LIMIT,
+            "comparison_row_limit": max(LEADERBOARD_LIMIT - 1, 0),
+            "row_count": len(rows),
+        },
+        "reference": reference,
+        "rows": rows,
+    }
+
+
+def load_leaderboard_row(data_dir: str, session_id: str) -> dict | None:
+    leaderboard = load_leaderboard(data_dir)
+    if leaderboard.get("reference", {}).get("session_id") == session_id:
+        return {
+            "session_id": session_id,
+            "is_reference": True,
+            "reference": leaderboard.get("reference"),
+            "row": None,
+        }
+    row = next(
+        (item for item in leaderboard.get("rows", []) if item["session_id"] == session_id),
+        None,
+    )
+    if not row:
+        return None
+    return {
+        "session_id": session_id,
+        "is_reference": False,
+        "reference": leaderboard.get("reference"),
+        "row": row,
+    }
+
+
+def load_leaderboard_export(data_dir: str, session_id: str) -> dict | None:
+    leaderboard = load_leaderboard(data_dir)
+    reference = leaderboard.get("reference")
+    if not reference:
+        return None
+    row = next(
+        (item for item in leaderboard.get("rows", []) if item["session_id"] == session_id),
+        None,
+    )
+    if not row:
+        return None
+    compare_rows = _build_compare_rows(reference, row)
+    return {
+        "reference_session_id": reference["session_id"],
+        "reference_small_rps": reference.get("best_small_rps", 0),
+        "reference_applied_parameters": reference.get("applied_parameters", []),
+        "current_session_id": row["session_id"],
+        "current_small_rps": row.get("best_small_rps", 0),
+        "current_applied_parameters": row.get("current_applied_parameters", []),
+        "leaderboard_rank": row.get("leaderboard_rank"),
+        "rank_delta": row.get("rank_delta"),
+        "is_new_entry": row.get("is_new_entry", False),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "rows": compare_rows,
+    }
+
+
 def _parse_summary_md(text: str) -> dict:
     """Parse iter{N}_00_summary.md into structured data."""
     result: dict = {
@@ -1075,3 +1147,44 @@ def _collect_source_agents(
     for session_id in session_id_map:
         agents.update(session_param_sources.get(session_id, {}).get(parameter, set()))
     return sorted(agents)
+
+
+def _build_compare_rows(reference: dict, current: dict) -> list[dict]:
+    reference_map = {
+        item["parameter"]: item for item in (reference.get("applied_parameters") or [])
+    }
+    current_map = {
+        item["parameter"]: item for item in (current.get("current_applied_parameters") or [])
+    }
+    keys = sorted(set(reference_map) | set(current_map))
+    rows: list[dict] = []
+    for parameter in keys:
+        ref = reference_map.get(parameter)
+        cur = current_map.get(parameter)
+        status = "missing"
+        if ref and cur and str(ref.get("value", "")) == str(cur.get("value", "")):
+            status = "match"
+        elif ref and cur:
+            status = "different"
+        elif not ref and cur:
+            status = "extra"
+        rows.append(
+            {
+                "parameter": parameter,
+                "bundle": (ref or cur or {}).get("bundle", "other"),
+                "referenceValue": (ref or {}).get("value", ""),
+                "currentValue": (cur or {}).get("value", ""),
+                "status": status,
+                "sources": sorted(
+                    set((ref or {}).get("sources", [])) | set((cur or {}).get("sources", []))
+                ),
+            }
+        )
+    status_rank = {"missing": 0, "different": 1, "extra": 2, "match": 3}
+    rows.sort(
+        key=lambda item: (
+            status_rank.get(item["status"], 9),
+            item["parameter"],
+        )
+    )
+    return rows
