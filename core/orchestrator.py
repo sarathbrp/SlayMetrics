@@ -449,18 +449,24 @@ async def run(model, deps: AgentDeps) -> str:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 4c: Skip optimization if system is already optimal
-    # Conditions: inspection shows 0 issues AND baseline small >= 1.5M RPS
+    # Primary signal: baseline small RPS >= threshold (system is performing well)
+    # Secondary: check for critical issues (cgroup caps, firewall, worker_processes)
     # ══════════════════════════════════════════════════════════════════════════
     _skip_threshold_rps = float((cfg.get("agent") or {}).get("skip_if_above_rps", 1_500_000))
     _baseline_small = float(baselines.get("small", {}).get("rps", 0) or 0)
     _pre_inspection = inspect_all(deps.ssh, cfg)
-    _pre_issue_count = _pre_inspection.get("summary", {}).get("total_issues", 999)
-    _skip_optimization = _pre_issue_count == 0 and _baseline_small >= _skip_threshold_rps
+    # Only count critical issues that actually hurt performance
+    _critical_cats = ("resource_limits", "network", "storage")
+    _critical_issues = sum(
+        len(_pre_inspection.get(cat, {}).get("problems", [])) for cat in _critical_cats
+    )
+    _skip_optimization = _baseline_small >= _skip_threshold_rps and _critical_issues == 0
 
     if _skip_optimization:
+        _total_issues = _pre_inspection.get("summary", {}).get("total_issues", 0)
         logger.status(
             "skip",
-            f"System already optimal: {_pre_issue_count} issues, "
+            f"System already optimal: {_total_issues} issues ({_critical_issues} critical), "
             f"small={_baseline_small:,.0f} RPS (>= {_skip_threshold_rps:,.0f}) — skipping LLM",
         )
         final_results = dict(baselines)
