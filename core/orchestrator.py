@@ -447,7 +447,44 @@ async def run(model, deps: AgentDeps) -> str:
     in_optimization_mode = False
     has_top_runs = bool(top_runs)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 4c: Skip optimization if system is already optimal
+    # Conditions: inspection shows 0 issues AND baseline small >= 1.5M RPS
+    # ══════════════════════════════════════════════════════════════════════════
+    _skip_threshold_rps = float((cfg.get("agent") or {}).get("skip_if_above_rps", 1_500_000))
+    _baseline_small = float(baselines.get("small", {}).get("rps", 0) or 0)
+    _pre_inspection = inspect_all(deps.ssh, cfg)
+    _pre_issue_count = _pre_inspection.get("summary", {}).get("total_issues", 999)
+    _skip_optimization = _pre_issue_count == 0 and _baseline_small >= _skip_threshold_rps
+
+    if _skip_optimization:
+        logger.status(
+            "skip",
+            f"System already optimal: {_pre_issue_count} issues, "
+            f"small={_baseline_small:,.0f} RPS (>= {_skip_threshold_rps:,.0f}) — skipping LLM",
+        )
+        final_results = dict(baselines)
+        best_results = dict(baselines)
+        iteration = 0
+        diagnosis = SimpleNamespace(
+            nginx_applied=False,
+            system_applied=False,
+            notes="System already at optimal performance — no changes needed",
+            recommendations=[],
+            rca_records=[],
+        )
+        slack.notify_run_complete(
+            session_id=session_id,
+            baselines=baselines,
+            finals=baselines,
+            total_tokens=0,
+            report_path="",
+        )
+
     for iteration in range(1, max_iterations + 1):
+        if _skip_optimization:
+            break
+
         deps.iteration = iteration  # type: ignore[attr-defined]
 
         if in_optimization_mode:

@@ -1675,6 +1675,45 @@ def build(model, config=None) -> DiagnosisWorkflow:
                                 f"{param}: '{original}' -> '{filtered[param]}'"
                             )
 
+                # Apply max_values guardrail — clamp numeric values
+                max_vals = _tuning.get("max_values") or {}
+                for param in filtered:
+                    if param in max_vals:
+                        try:
+                            current_num = int(filtered[param])
+                            cap = int(max_vals[param])
+                            if current_num > cap:
+                                tool_result(
+                                    "guardrail",
+                                    f"capped {param}: {current_num} -> {cap}",
+                                )
+                                state.setdefault("guardrails_triggered", []).append(
+                                    f"{param}: {current_num} -> {cap} (max)"
+                                )
+                                filtered[param] = str(cap)
+                        except (ValueError, TypeError):
+                            pass
+                    # Cap tcp_rmem/tcp_wmem third value using rmem_max/wmem_max cap
+                    if param in ("net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem"):
+                        buf_cap_key = (
+                            "net.core.rmem_max" if "rmem" in param else "net.core.wmem_max"
+                        )
+                        buf_cap = max_vals.get(buf_cap_key)
+                        if buf_cap:
+                            parts = filtered[param].strip().strip('"').split()
+                            if len(parts) == 3:
+                                try:
+                                    if int(parts[2]) > int(buf_cap):
+                                        old_val = filtered[param]
+                                        parts[2] = str(int(buf_cap))
+                                        filtered[param] = " ".join(parts)
+                                        tool_result(
+                                            "guardrail",
+                                            f"capped {param} max: {old_val} -> {filtered[param]}",
+                                        )
+                                except (ValueError, TypeError):
+                                    pass
+
                 if filtered:
                     changes_by_cat[cat] = filtered
 
