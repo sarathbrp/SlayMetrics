@@ -238,6 +238,19 @@ def apply_network(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict
         )
         actions.append("flushed iptables DROP/connlimit rules")
 
+    # Flush nftables DROP/limit rules (R5-style nftables rate limiting)
+    if changes.get("iptables_drop_rules") == "flush":
+        nft_check = ssh.execute(
+            "nft list ruleset 2>/dev/null | grep -iE 'drop|reject|limit'",
+            timeout=5,
+        ).stdout.strip()
+        if nft_check:
+            ssh.execute(
+                "nft flush ruleset 2>/dev/null || true",
+                timeout=10,
+            )
+            actions.append("flushed nftables ruleset")
+
     # Fix conntrack max
     conntrack = changes.get("conntrack_max")
     if conntrack:
