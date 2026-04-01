@@ -32,6 +32,8 @@ export default function WinningGapsView({ data }) {
   const [compareSessionId, setCompareSessionId] = useState('')
   const [compareFilter, setCompareFilter] = useState('all')
   const [showReferencePanel, setShowReferencePanel] = useState(false)
+  const [customSessionId, setCustomSessionId] = useState('')
+  const [pinnedSessionIds, setPinnedSessionIds] = useState([])
 
   const winningGaps = data?.winning_gaps || {}
   const reference = winningGaps.reference
@@ -49,10 +51,31 @@ export default function WinningGapsView({ data }) {
     return filtered
   }, [winningGaps.sessions, hideExactMatches])
 
+  const rankedRowIds = useMemo(
+    () => new Set((winningGaps.sessions || []).slice(0, MAX_ROWS).map((row) => row.session_id)),
+    [winningGaps.sessions],
+  )
+
+  const customCandidates = useMemo(() => {
+    return [...(winningGaps.sessions || [])]
+      .filter((row) => row.session_id !== reference?.session_id)
+      .filter((row) => Number(row.best_small_rps || 0) > 0)
+      .filter((row) => !rankedRowIds.has(row.session_id))
+      .sort((a, b) => Number(b.best_small_rps || 0) - Number(a.best_small_rps || 0))
+  }, [reference?.session_id, rankedRowIds, winningGaps.sessions])
+
+  const pinnedRows = useMemo(() => {
+    const pinned = new Set(pinnedSessionIds)
+    return customCandidates.filter((row) => pinned.has(row.session_id))
+  }, [customCandidates, pinnedSessionIds])
+
   const totalPages = Math.max(1, Math.ceil(rankedRows.length / PAGE_SIZE))
   const currentPage = Math.min(page, totalPages)
   const pageRows = rankedRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
-  const compareRow = pageRows.find((row) => row.session_id === compareSessionId) || rankedRows.find((row) => row.session_id === compareSessionId)
+  const compareRow =
+    pageRows.find((row) => row.session_id === compareSessionId) ||
+    rankedRows.find((row) => row.session_id === compareSessionId) ||
+    pinnedRows.find((row) => row.session_id === compareSessionId)
   const compareItems = useMemo(() => {
     if (!compareRow) return []
     const rows = buildCompareRows(reference, compareRow)
@@ -72,6 +95,23 @@ export default function WinningGapsView({ data }) {
     if (!compareRow) return []
     return buildCompareRows(reference, compareRow)
   }, [reference, compareRow])
+
+  const addPinnedSession = () => {
+    if (!customSessionId) return
+    setPinnedSessionIds((current) => {
+      if (current.includes(customSessionId)) return current
+      return [...current, customSessionId]
+    })
+    setCustomSessionId('')
+  }
+
+  const removePinnedSession = (sessionId) => {
+    setPinnedSessionIds((current) => current.filter((item) => item !== sessionId))
+    if (compareSessionId === sessionId) {
+      setCompareSessionId('')
+      setCompareFilter('all')
+    }
+  }
 
   if (!data || !reference) {
     return (
@@ -177,6 +217,119 @@ export default function WinningGapsView({ data }) {
           </div>
         </div>
 
+        <div className="mb-5 p-4 rounded-2xl" style={{ background: 'var(--progress-bg)', border: '1px solid var(--border-card)' }}>
+          <div className="flex items-center justify-between gap-4 flex-wrap mb-3">
+            <div>
+              <p className="text-xs uppercase tracking-wider mb-1" style={{ color: 'var(--text-muted)' }}>
+                Custom Session Gap Check
+              </p>
+              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                Add any positive-RPS session outside the ranked top 30 to compare it against the current reference.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <select
+                value={customSessionId}
+                onChange={(e) => setCustomSessionId(e.target.value)}
+                className="px-3 py-2 rounded-lg text-sm"
+                style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)', border: '1px solid var(--border-card)' }}
+              >
+                <option value="">Select session outside top 30</option>
+                {customCandidates.map((row) => (
+                  <option key={row.session_id} value={row.session_id}>
+                    {row.session_id} · {Math.round(row.best_small_rps || 0).toLocaleString()} small RPS
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={addPinnedSession}
+                disabled={!customSessionId}
+                className="px-3 py-2 rounded-lg text-sm font-medium"
+                style={{
+                  background: customSessionId ? 'var(--accent-gradient)' : 'var(--progress-bg)',
+                  color: customSessionId ? '#fff' : 'var(--text-muted)',
+                  opacity: customSessionId ? 1 : 0.8,
+                }}
+              >
+                Add
+              </button>
+            </div>
+          </div>
+
+          {pinnedRows.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm styled-table">
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--table-border)' }}>
+                    <th className="text-left py-2.5 px-2">Session</th>
+                    <th className="text-left py-2.5 px-2">Compare</th>
+                    <th className="text-right py-2.5 px-2">Small RPS</th>
+                    <th className="text-right py-2.5 px-2">% of Ref</th>
+                    <th className="text-right py-2.5 px-2">Missing</th>
+                    <th className="text-right py-2.5 px-2">Different</th>
+                    <th className="text-left py-2.5 px-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pinnedRows.map((row) => (
+                    <tr key={`pinned-${row.session_id}`}>
+                      <td className="py-2.5 px-2">
+                        <div className="font-mono text-xs" style={{ color: 'var(--text-primary)' }}>
+                          {row.session_id}
+                        </div>
+                        <div className="text-[0.7rem] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
+                          <BenchmarkTrend value={row.improvement_pct} />
+                          <span>{fmtPct(row.improvement_pct)}</span>
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-2">
+                        <button
+                          onClick={() => {
+                            setCompareSessionId(compareSessionId === row.session_id ? '' : row.session_id)
+                            setCompareFilter('all')
+                            setShowReferencePanel(false)
+                          }}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                          style={{
+                            background: compareSessionId === row.session_id ? 'var(--accent-gradient)' : 'var(--progress-bg)',
+                            color: compareSessionId === row.session_id ? '#fff' : 'var(--text-secondary)',
+                          }}
+                        >
+                          {compareSessionId === row.session_id ? 'Hide' : 'Compare'}
+                        </button>
+                      </td>
+                      <td className="py-2.5 px-2 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
+                        <div className="flex items-center justify-end gap-1">
+                          <BenchmarkTrend value={row.improvement_pct} />
+                          <span>{Math.round(row.best_small_rps || 0).toLocaleString()}</span>
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
+                        {row.performance_vs_reference_pct?.toFixed(1)}%
+                      </td>
+                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
+                        {row.missing_count}
+                      </td>
+                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
+                        {row.differing_count}
+                      </td>
+                      <td className="py-2.5 px-2">
+                        <button
+                          onClick={() => removePinnedSession(row.session_id)}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                          style={{ background: 'rgba(244,63,94,0.14)', color: '#fb7185', border: '1px solid rgba(244,63,94,0.25)' }}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
         <div className="overflow-x-auto">
           <table className="w-full text-sm styled-table">
             <thead>
@@ -201,13 +354,17 @@ export default function WinningGapsView({ data }) {
                     </td>
                     <td className="py-2.5 px-2">
                       <div className="font-mono text-xs" style={{ color: 'var(--text-primary)' }}>{row.session_id}</div>
-                      <div className="text-[0.7rem]" style={{ color: 'var(--text-muted)' }}>{fmtPct(row.improvement_pct)}</div>
+                      <div className="text-[0.7rem] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
+                        <BenchmarkTrend value={row.improvement_pct} />
+                        <span>{fmtPct(row.improvement_pct)}</span>
+                      </div>
                     </td>
                     <td className="py-2.5 px-2">
-              <button
+                      <button
                         onClick={() => {
                           setCompareSessionId(compareSessionId === row.session_id ? '' : row.session_id)
                           setCompareFilter('all')
+                          setShowReferencePanel(false)
                         }}
                         className="px-3 py-1.5 rounded-lg text-xs font-medium"
                         style={{
@@ -219,7 +376,10 @@ export default function WinningGapsView({ data }) {
                       </button>
                     </td>
                     <td className="py-2.5 px-2 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
-                      {Math.round(row.best_small_rps || 0).toLocaleString()}
+                      <div className="flex items-center justify-end gap-1">
+                        <BenchmarkTrend value={row.improvement_pct} />
+                        <span>{Math.round(row.best_small_rps || 0).toLocaleString()}</span>
+                      </div>
                     </td>
                   <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
                     {row.performance_vs_reference_pct?.toFixed(1)}%
@@ -359,7 +519,10 @@ export default function WinningGapsView({ data }) {
                     <SummaryStat label="Best Session" value={reference.session_id} accent="#34d399" />
                     <SummaryStat label="Best Small RPS" value={Math.round(reference.best_small_rps || 0).toLocaleString()} accent="#34d399" />
                     <SummaryStat label="Current Session" value={compareRow.session_id} />
-                    <SummaryStat label="Current Small RPS" value={Math.round(compareRow.best_small_rps || 0).toLocaleString()} />
+                    <SummaryStat
+                      label="Current Small RPS"
+                      value={`${Math.round(compareRow.best_small_rps || 0).toLocaleString()} ${trendLabel(compareRow.improvement_pct)}`}
+                    />
                   </div>
 
                   <div className="flex items-center justify-between gap-4 flex-wrap mb-4">
@@ -478,6 +641,24 @@ export default function WinningGapsView({ data }) {
       )}
     </div>
   )
+}
+
+function BenchmarkTrend({ value }) {
+  const numeric = Number(value || 0)
+  if (numeric > 0) {
+    return <span title="Benchmark improved" style={{ color: '#34d399' }}>↑</span>
+  }
+  if (numeric < 0) {
+    return <span title="Benchmark regressed" style={{ color: '#fb7185' }}>↓</span>
+  }
+  return <span title="No benchmark change" style={{ color: 'var(--text-muted)' }}>→</span>
+}
+
+function trendLabel(value) {
+  const numeric = Number(value || 0)
+  if (numeric > 0) return '↑'
+  if (numeric < 0) return '↓'
+  return '→'
 }
 
 function buildCompareRows(reference, current) {
