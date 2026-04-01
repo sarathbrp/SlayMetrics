@@ -60,9 +60,8 @@ export default function WinningGapsView({ data }) {
     return [...(winningGaps.sessions || [])]
       .filter((row) => row.session_id !== reference?.session_id)
       .filter((row) => Number(row.best_small_rps || 0) > 0)
-      .filter((row) => !rankedRowIds.has(row.session_id))
       .sort((a, b) => Number(b.best_small_rps || 0) - Number(a.best_small_rps || 0))
-  }, [reference?.session_id, rankedRowIds, winningGaps.sessions])
+  }, [reference?.session_id, winningGaps.sessions])
 
   const pinnedRows = useMemo(() => {
     const pinned = new Set(pinnedSessionIds)
@@ -98,9 +97,19 @@ export default function WinningGapsView({ data }) {
 
   const addPinnedSession = () => {
     if (!customSessionId) return
+    const requestedIds = customSessionId
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
     setPinnedSessionIds((current) => {
-      if (current.includes(customSessionId)) return current
-      return [...current, customSessionId]
+      const next = new Set(current)
+      const availableIds = new Set(customCandidates.map((row) => row.session_id))
+      for (const sessionId of requestedIds) {
+        if (availableIds.has(sessionId) && !rankedRowIds.has(sessionId)) {
+          next.add(sessionId)
+        }
+      }
+      return Array.from(next)
     })
     setCustomSessionId('')
   }
@@ -224,23 +233,17 @@ export default function WinningGapsView({ data }) {
                 Custom Session Gap Check
               </p>
               <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
-                Add any positive-RPS session outside the ranked top 30 to compare it against the current reference.
+                Type one or more session IDs like `xyz,abc` to add positive-RPS sessions outside the ranked top 30.
               </p>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
-              <select
+              <input
                 value={customSessionId}
                 onChange={(e) => setCustomSessionId(e.target.value)}
-                className="px-3 py-2 rounded-lg text-sm"
+                placeholder="Add sessions: xyz,abc"
+                className="px-3 py-2 rounded-lg text-sm min-w-[20rem]"
                 style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)', border: '1px solid var(--border-card)' }}
-              >
-                <option value="">Select session outside top 30</option>
-                {customCandidates.map((row) => (
-                  <option key={row.session_id} value={row.session_id}>
-                    {row.session_id} · {Math.round(row.best_small_rps || 0).toLocaleString()} small RPS
-                  </option>
-                ))}
-              </select>
+              />
               <button
                 onClick={addPinnedSession}
                 disabled={!customSessionId}
@@ -257,76 +260,11 @@ export default function WinningGapsView({ data }) {
           </div>
 
           {pinnedRows.length > 0 && (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm styled-table">
-                <thead>
-                  <tr style={{ borderBottom: '1px solid var(--table-border)' }}>
-                    <th className="text-left py-2.5 px-2">Session</th>
-                    <th className="text-left py-2.5 px-2">Compare</th>
-                    <th className="text-right py-2.5 px-2">Small RPS</th>
-                    <th className="text-right py-2.5 px-2">% of Ref</th>
-                    <th className="text-right py-2.5 px-2">Missing</th>
-                    <th className="text-right py-2.5 px-2">Different</th>
-                    <th className="text-left py-2.5 px-2">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pinnedRows.map((row) => (
-                    <tr key={`pinned-${row.session_id}`}>
-                      <td className="py-2.5 px-2">
-                        <div className="font-mono text-xs" style={{ color: 'var(--text-primary)' }}>
-                          {row.session_id}
-                        </div>
-                        <div className="text-[0.7rem] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
-                          <BenchmarkTrend value={row.improvement_pct} />
-                          <span>{fmtPct(row.improvement_pct)}</span>
-                        </div>
-                      </td>
-                      <td className="py-2.5 px-2">
-                        <button
-                          onClick={() => {
-                            setCompareSessionId(compareSessionId === row.session_id ? '' : row.session_id)
-                            setCompareFilter('all')
-                            setShowReferencePanel(false)
-                          }}
-                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
-                          style={{
-                            background: compareSessionId === row.session_id ? 'var(--accent-gradient)' : 'var(--progress-bg)',
-                            color: compareSessionId === row.session_id ? '#fff' : 'var(--text-secondary)',
-                          }}
-                        >
-                          {compareSessionId === row.session_id ? 'Hide' : 'Compare'}
-                        </button>
-                      </td>
-                      <td className="py-2.5 px-2 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
-                        <div className="flex items-center justify-end gap-1">
-                          <BenchmarkTrend value={row.improvement_pct} />
-                          <span>{Math.round(row.best_small_rps || 0).toLocaleString()}</span>
-                        </div>
-                      </td>
-                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
-                        {row.performance_vs_reference_pct?.toFixed(1)}%
-                      </td>
-                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
-                        {row.missing_count}
-                      </td>
-                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
-                        {row.differing_count}
-                      </td>
-                      <td className="py-2.5 px-2">
-                        <button
-                          onClick={() => removePinnedSession(row.session_id)}
-                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
-                          style={{ background: 'rgba(244,63,94,0.14)', color: '#fb7185', border: '1px solid rgba(244,63,94,0.25)' }}
-                        >
-                          Remove
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <>
+              <p className="text-xs mb-3" style={{ color: 'var(--text-muted)' }}>
+                Added sessions appear below the main ranked table.
+              </p>
+            </>
           )}
         </div>
 
@@ -421,6 +359,89 @@ export default function WinningGapsView({ data }) {
             </tbody>
           </table>
         </div>
+
+        {pinnedRows.length > 0 && (
+          <div className="mt-6 overflow-x-auto">
+            <div className="mb-3">
+              <p className="text-xs uppercase tracking-wider mb-1" style={{ color: 'var(--text-muted)' }}>
+                Custom Session Rows
+              </p>
+              <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+                Sessions you entered manually, shown below the ranked 1-30 list.
+              </p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm styled-table">
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--table-border)' }}>
+                    <th className="text-left py-2.5 px-2">Session</th>
+                    <th className="text-left py-2.5 px-2">Compare</th>
+                    <th className="text-right py-2.5 px-2">Small RPS</th>
+                    <th className="text-right py-2.5 px-2">% of Ref</th>
+                    <th className="text-right py-2.5 px-2">Missing</th>
+                    <th className="text-right py-2.5 px-2">Different</th>
+                    <th className="text-left py-2.5 px-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pinnedRows.map((row) => (
+                    <tr key={`pinned-${row.session_id}`}>
+                      <td className="py-2.5 px-2">
+                        <div className="font-mono text-xs" style={{ color: 'var(--text-primary)' }}>
+                          {row.session_id}
+                        </div>
+                        <div className="text-[0.7rem] flex items-center gap-1" style={{ color: 'var(--text-muted)' }}>
+                          <BenchmarkTrend value={row.improvement_pct} />
+                          <span>{fmtPct(row.improvement_pct)}</span>
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-2">
+                        <button
+                          onClick={() => {
+                            setCompareSessionId(compareSessionId === row.session_id ? '' : row.session_id)
+                            setCompareFilter('all')
+                            setShowReferencePanel(false)
+                          }}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                          style={{
+                            background: compareSessionId === row.session_id ? 'var(--accent-gradient)' : 'var(--progress-bg)',
+                            color: compareSessionId === row.session_id ? '#fff' : 'var(--text-secondary)',
+                          }}
+                        >
+                          {compareSessionId === row.session_id ? 'Hide' : 'Compare'}
+                        </button>
+                      </td>
+                      <td className="py-2.5 px-2 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
+                        <div className="flex items-center justify-end gap-1">
+                          <BenchmarkTrend value={row.improvement_pct} />
+                          <span>{Math.round(row.best_small_rps || 0).toLocaleString()}</span>
+                        </div>
+                      </td>
+                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
+                        {row.performance_vs_reference_pct?.toFixed(1)}%
+                      </td>
+                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
+                        {row.missing_count}
+                      </td>
+                      <td className="py-2.5 px-2 text-right" style={{ color: 'var(--text-secondary)' }}>
+                        {row.differing_count}
+                      </td>
+                      <td className="py-2.5 px-2">
+                        <button
+                          onClick={() => removePinnedSession(row.session_id)}
+                          className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                          style={{ background: 'rgba(244,63,94,0.14)', color: '#fb7185', border: '1px solid rgba(244,63,94,0.25)' }}
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </div>
 
       {(compareRow || showReferencePanel) && (
