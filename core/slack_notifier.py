@@ -67,16 +67,21 @@ class SlackNotifier:
         cpu_cores: int,
         ram_gb: int,
         issue_count: dict[str, int] | None = None,
+        degradation_summary: str = "",
     ) -> None:
         if "run_start" not in self.notify_on:
             return
         issues_text = ""
         if issue_count:
             issues_text = " | ".join(f"{k}: {v}" for k, v in issue_count.items() if v)
+        total_issues = sum(issue_count.values()) if issue_count else 0
+        header = f":wrench: SlayMetrics | {total_issues} issues detected"
+        if degradation_summary:
+            header = f":wrench: SlayMetrics | {degradation_summary}"
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": ":wrench: SlayMetrics Run Started"},
+                "text": {"type": "plain_text", "text": header[:150]},
             },
             {
                 "type": "section",
@@ -94,7 +99,7 @@ class SlackNotifier:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Issues detected:* {issues_text}",
+                        "text": f"*Issues by category:* {issues_text}",
                     },
                 }
             )

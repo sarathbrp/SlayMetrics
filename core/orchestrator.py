@@ -183,12 +183,43 @@ async def run(model, deps: AgentDeps) -> str:
     _profile = (_llm_cfg.get("profiles") or {}).get(_active) or {}
     _llm_label = f"{_active} ({_profile.get('backend', '?')} / {_profile.get('model', '?')})"
 
+    # Build degradation summary from RHEL checks for Slack header
+    _warn_checks = [chk for chk in checks if chk.status in ("warning", "critical", "degraded")]
+    _degradation_hints = []
+    for chk in checks:
+        val = chk.value[:80]
+        if "somaxconn=" in val:
+            import re as _re
+
+            _m = _re.search(r"somaxconn=(\d+)", val)
+            if _m and int(_m.group(1)) < 65535:
+                _degradation_hints.append(f"somaxconn={_m.group(1)}")
+        if "Enforcing" in val:
+            _degradation_hints.append("SELinux=enforcing")
+    # Quick nginx worker count
+    _nginx_workers = (
+        ssh.execute(
+            "grep -c '^' /proc/$(pgrep -o nginx)/fd 2>/dev/null || "
+            "grep worker_processes /etc/nginx/nginx.conf 2>/dev/null | awk '{print $2}'"
+        )
+        .stdout.strip()
+        .rstrip(";")
+    )
+    if _nginx_workers and _nginx_workers not in ("auto", ""):
+        try:
+            if int(_nginx_workers) < cpu_cores // 2:
+                _degradation_hints.append(f"workers={_nginx_workers}/{cpu_cores}")
+        except ValueError:
+            pass
+    _degradation_summary = ", ".join(_degradation_hints[:5]) if _degradation_hints else ""
+
     slack.notify_run_start(
         session_id=session_id,
         dut_host=cfg["target"]["host"],
         llm_profile=_llm_label,
         cpu_cores=cpu_cores,
         ram_gb=ram_gb,
+        degradation_summary=_degradation_summary,
     )
 
     # ══════════════════════════════════════════════════════════════════════════

@@ -26,27 +26,48 @@ def build(
         "Your goal is to transform the synthesizer's recommendations into a final, "
         "high-performance "
         "configuration payload. You must be aggressive in clearing bottlenecks.\n\n"
-        "THE 5 CATEGORY SCHEMA:\n"
+        "THE 5 CATEGORY SCHEMA (use EXACTLY these param names and values):\n"
         '1. "webserver" — NGINX directives. '
         f"Allowed: {', '.join(sorted(webserver_targets))}\n"
+        "   ACTION PARAMS with EXACT values:\n"
+        '     limit_req: "remove"  (removes all limit_req zones and directives)\n'
+        '     limit_conn: "remove"  (removes all limit_conn zones and directives)\n'
+        '     limit_rate: "0"  (disables rate limiting)\n'
+        '     limit_rate_after: "0"  (disables rate limiting threshold)\n'
+        '     access_log: "off"  (disables access logging)\n'
+        '     error_log_level: "warn"  (reduces log verbosity)\n\n'
         '2. "kernel" — sysctl, THP, SELinux, CPU governor, IRQ. '
         f"Allowed: {', '.join(sorted(kernel_targets))}\n"
+        "   ACTION PARAMS with EXACT values:\n"
+        '     selinux: "permissive"  (not SELINUX, not Permissive)\n'
+        '     transparent_hugepage: "never"\n'
+        '     irqbalance: "active"\n'
+        '     cpu_governor: "performance"\n\n'
         '3. "resource_limits" — cgroup weights, systemd limits, NUMA pinning. '
         f"Allowed: {', '.join(sorted(resource_limits_targets))}\n"
+        "   ACTION PARAMS with EXACT values:\n"
+        '     cgroup_cpu: "max"  (removes CPU quota)\n'
+        '     cgroup_memory: "max"  (removes memory cap)\n'
+        '     numa_policy: "remove"  (removes NUMA pinning)\n'
+        '     kill_background_hogs: "true"\n\n'
         '4. "network" — iptables, conntrack, tc/pacing rules. '
         f"Allowed: {', '.join(sorted(network_targets))}\n"
+        "   ACTION PARAMS with EXACT values:\n"
+        "     iptables_drop_rules: \"flush\"  (not 'clear', not 'remove')\n"
+        "     tc_rules: \"remove\"  (not 'delete', not 'fq_codel')\n\n"
         '5. "storage" — I/O scheduler, readahead. '
-        f"Allowed: {', '.join(sorted(storage_targets))}\n\n"
+        f"Allowed: {', '.join(sorted(storage_targets))}\n"
+        "   ACTION PARAMS with EXACT values:\n"
+        '     kill_io_hogs: "true"\n'
+        '     io_scheduler: "none"  (passthrough)\n\n'
         "CRITICAL EXECUTION RULES:\n"
         "1. CROSS-LAYER SYNC: If 'worker_rlimit_nofile' is increased, you MUST "
-        "ensure 'nofile' in "
+        "ensure 'systemd_nofile' in "
         "resource_limits is set to at least 1,048,576. One cannot succeed without "
         "the other.\n"
-        "2. MANDATORY NEUTRALIZATION: If 'limit_rate' or 'limit_req' are NOT in "
-        "the recommendations "
-        "but were flagged in inspection, you MUST explicitly include them set to "
-        "'0' or 'none' to "
-        "clear residual degradation from previous rounds.\n"
+        "2. MANDATORY NEUTRALIZATION: If 'limit_rate' or 'limit_req' are detected "
+        'in inspection, you MUST include limit_rate: "0" and limit_req: "remove" '
+        "to clear residual degradation.\n"
         "3. KERNEL SCALING: For a 112-core system, ensure 'somaxconn' and "
         "'tcp_max_syn_backlog' are "
         "set to 65535. Ensure 'tcp_max_tw_buckets' is set to 2,000,000 to handle "
