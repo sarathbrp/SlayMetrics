@@ -188,6 +188,11 @@ curl "http://localhost:8080/api/leaderboard/224815cd/export?pretty=1"
 - `GET /api/leaderboard/{session_id}/export`
   Returns the same export-style compare payload used by the UI:
   reference/current session metadata, applied parameters, and per-parameter compare rows.
+
+Data source behavior:
+- The dashboard now prefers live TiDB data for sessions, benchmarks, confirmed fixes, and contradicted/reverted validations.
+- Historical `hypothesis/` artifacts are still used as a fallback when TiDB is unavailable, and as a provenance source for agent attribution where available.
+- In containerized deployment, the dashboard expects TiDB connectivity via `TIDB_HOST`, `TIDB_PORT`, `TIDB_DATABASE`, and `TIDB_USER`.
 - `pretty=1`
   Supported on JSON endpoints for human-readable curl output.
 

@@ -9,3 +9,7 @@ services:
     environment:
       - DATA_DIR=/data
       - STATIC_DIR=/app/static
+      - TIDB_HOST=host.containers.internal
+      - TIDB_PORT=4000
+      - TIDB_DATABASE=perfagent
+      - TIDB_USER=root

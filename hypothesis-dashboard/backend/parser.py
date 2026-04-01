@@ -11,6 +11,12 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import pymysql
+    import pymysql.cursors
+except ImportError:  # pragma: no cover - optional in some dev environments
+    pymysql = None
+
 PRECISE_BUNDLE_MAP: dict[str, str] = {
     "worker_processes": "nginx core concurrency",
     "worker_connections": "nginx core concurrency",
@@ -94,6 +100,240 @@ REFERENCE_SESSION_OVERRIDE = os.environ.get(
 ).strip()
 IGNORED_SESSION_IDS = {"fc1e49d9"}
 LEADERBOARD_LIMIT = 30
+
+
+def _tidb_settings(data_dir: str) -> dict[str, object] | None:
+    env_host = os.environ.get("TIDB_HOST", "").strip()
+    if env_host:
+        return {
+            "host": env_host,
+            "port": int(os.environ.get("TIDB_PORT", "4000")),
+            "user": os.environ.get("TIDB_USER", "root"),
+            "password": os.environ.get("TIDB_PASSWORD", ""),
+            "database": os.environ.get("TIDB_DATABASE", "perfagent"),
+        }
+
+    config_path = Path(data_dir) / "config.yaml"
+    if not config_path.exists():
+        return None
+
+    memory_values: dict[str, str] = {}
+    in_memory = False
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if re.match(r"^\S", line):
+            in_memory = line.startswith("memory:")
+            continue
+        if not in_memory:
+            continue
+        match = re.match(r"^\s+([A-Za-z0-9_]+):\s*(.+?)\s*$", line)
+        if not match:
+            continue
+        key = match.group(1)
+        value = match.group(2).split("#", 1)[0].strip().strip("'\"")
+        memory_values[key] = value
+
+    if not memory_values.get("host"):
+        return None
+
+    password = ""
+    password_env = memory_values.get("password_env")
+    if password_env:
+        password = os.environ.get(password_env, "")
+
+    return {
+        "host": memory_values.get("host", "127.0.0.1"),
+        "port": int(memory_values.get("port", "4000")),
+        "user": memory_values.get("user", "root"),
+        "password": password,
+        "database": memory_values.get("database", "perfagent"),
+    }
+
+
+def _load_parameter_summary_from_tidb(data_dir: str) -> dict | None:
+    if pymysql is None:
+        return None
+
+    settings = _tidb_settings(data_dir)
+    if not settings:
+        return None
+
+    try:
+        conn = pymysql.connect(
+            host=str(settings["host"]),
+            port=int(settings["port"]),
+            user=str(settings["user"]),
+            password=str(settings["password"]),
+            database=str(settings["database"]),
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=True,
+        )
+    except Exception:
+        return None
+
+    try:
+        return _build_tidb_summary(conn, data_dir)
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _build_tidb_summary(conn, data_dir: str) -> dict:
+    hypo_root = Path(data_dir) / "hypothesis"
+    session_rows: list[dict] = []
+    session_states: dict[str, dict[str, dict]] = {}
+    session_precise_applied: dict[str, dict[str, str]] = {}
+    session_param_sources: dict[str, dict[str, set[str]]] = {}
+    parameter_sessions: dict[str, dict[str, dict]] = defaultdict(dict)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                s.id AS session_id,
+                s.status,
+                s.rps_delta_pct,
+                s.started_at,
+                s.completed_at,
+                COALESCE(
+                    MAX(CASE WHEN b.payload_size = 'small' THEN b.rps END),
+                    0
+                ) AS best_small_rps,
+                COALESCE(
+                    MAX(CASE WHEN b.payload_size = 'homepage' THEN b.rps END),
+                    0
+                ) AS best_homepage_rps
+            FROM sessions s
+            LEFT JOIN benchmarks b ON b.session_id = s.id
+            GROUP BY s.id, s.status, s.rps_delta_pct, s.started_at, s.completed_at
+            ORDER BY s.started_at DESC
+            """
+        )
+        session_meta_rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT
+                v.session_id,
+                v.outcome,
+                v.created_at,
+                k.parameter,
+                k.before_value,
+                k.after_value
+            FROM validations v
+            JOIN knowledge k ON k.id = v.knowledge_id
+            ORDER BY v.session_id ASC, v.created_at ASC, k.created_at ASC
+            """
+        )
+        validation_rows = cur.fetchall()
+
+    validation_rows_by_session: dict[str, list[dict]] = defaultdict(list)
+    for row in validation_rows:
+        validation_rows_by_session[str(row.get("session_id"))].append(row)
+
+    for meta in session_meta_rows:
+        session_id = str(meta["session_id"])
+        validation_rows = validation_rows_by_session.get(session_id, [])
+        if not validation_rows and float(meta.get("best_small_rps") or 0.0) <= 0:
+            continue
+
+        session_state: dict[str, dict] = {}
+        effective_applied: dict[str, str] = {}
+        session_param_sources[session_id] = _collect_sources_for_session(hypo_root, session_id)
+
+        for row in validation_rows:
+            raw_parameter = str(row.get("parameter") or "").strip()
+            parameter = _normalize_tidb_parameter(raw_parameter)
+            if not parameter:
+                continue
+            after_value = str(row.get("after_value") or "").strip()
+            before_value = str(row.get("before_value") or "").strip()
+            outcome = str(row.get("outcome") or "").strip()
+
+            state = session_state.setdefault(
+                parameter,
+                {
+                    "parameter": parameter,
+                    "scope": _scope_for_parameter(raw_parameter),
+                    "recommended": True,
+                    "applied": False,
+                    "rejected": False,
+                    "values": set(),
+                    "titles": set(),
+                },
+            )
+            state["recommended"] = True
+            if after_value:
+                state["values"].add(after_value)
+
+            if outcome == "confirmed":
+                if after_value:
+                    effective_applied[parameter] = after_value
+            elif outcome == "contradicted":
+                state["rejected"] = True
+                if (
+                    parameter in effective_applied
+                    and str(effective_applied[parameter]) == after_value
+                ):
+                    effective_applied.pop(parameter, None)
+                elif not after_value and before_value and parameter in effective_applied:
+                    effective_applied.pop(parameter, None)
+
+        for parameter in effective_applied:
+            session_state.setdefault(
+                parameter,
+                {
+                    "parameter": parameter,
+                    "scope": _scope_for_parameter(parameter),
+                    "recommended": True,
+                    "applied": False,
+                    "rejected": False,
+                    "values": set(),
+                    "titles": set(),
+                },
+            )["applied"] = True
+
+        timestamp = _format_tidb_timestamp(meta.get("completed_at") or meta.get("started_at"))
+        best_small_rps = float(meta.get("best_small_rps") or 0.0)
+        best_homepage_rps = float(meta.get("best_homepage_rps") or 0.0)
+        improvement = float(meta.get("rps_delta_pct") or 0.0)
+
+        session_rows.append(
+            {
+                "session_id": session_id,
+                "timestamp": timestamp,
+                "improvement_pct": round(improvement, 2),
+                "iterations": 0,
+                "parameter_count": len(session_state),
+                "applied_count": len(effective_applied),
+                "rejected_count": sum(1 for item in session_state.values() if item["rejected"]),
+                "best_small_rps": best_small_rps,
+                "best_homepage_rps": best_homepage_rps,
+            }
+        )
+        session_states[session_id] = session_state
+        session_precise_applied[session_id] = effective_applied
+
+        for parameter, state in session_state.items():
+            parameter_sessions[parameter][session_id] = {
+                "state": _resolve_parameter_state(state),
+                "scope": state.get("scope", "unknown"),
+                "improvement_pct": improvement,
+                "values": sorted(state["values"]),
+                "titles": sorted(state["titles"]),
+            }
+
+    return _assemble_parameter_summary(
+        session_rows=session_rows,
+        parameter_sessions=parameter_sessions,
+        session_states=session_states,
+        session_precise_applied=session_precise_applied,
+        session_param_sources=session_param_sources,
+    )
 
 
 def discover_sessions(data_dir: str) -> list[dict]:
@@ -229,6 +469,13 @@ def load_comparison(data_dir: str, session_ids: list[str]) -> list[dict]:
 
 
 def load_parameter_summary(data_dir: str) -> dict:
+    tidb_summary = _load_parameter_summary_from_tidb(data_dir)
+    if tidb_summary:
+        return tidb_summary
+    return _load_parameter_summary_from_artifacts(data_dir)
+
+
+def _load_parameter_summary_from_artifacts(data_dir: str) -> dict:
     """Build a cross-session parameter dataset from all hypothesis folders."""
     hypo_root = Path(data_dir) / "hypothesis"
     report_root = Path(data_dir) / "report"
@@ -349,96 +596,13 @@ def load_parameter_summary(data_dir: str) -> dict:
                 "titles": sorted(state["titles"]),
             }
 
-    parameters: list[dict] = []
-    for parameter, session_map in parameter_sessions.items():
-        rows = list(session_map.values())
-        sessions_seen = len(rows)
-        applied_rows = [row for row in rows if row["state"] == "applied"]
-        rejected_rows = [row for row in rows if row["state"] == "rejected"]
-        recommended_rows = [
-            row for row in rows if row["state"] in {"recommended", "applied", "rejected"}
-        ]
-        applied_improvements = [row["improvement_pct"] for row in applied_rows]
-        rejected_improvements = [row["improvement_pct"] for row in rejected_rows]
-        acceptance_rate = len(applied_rows) / len(recommended_rows) if recommended_rows else 0.0
-        avg_improvement = _avg(applied_improvements)
-        score = (
-            len(applied_rows) * 3.0
-            + len([row for row in applied_rows if row["improvement_pct"] > 0]) * 2.0
-            - len(rejected_rows) * 2.0
-            + avg_improvement / 25.0
-        )
-        parameters.append(
-            {
-                "parameter": parameter,
-                "scope": _majority_scope(rows),
-                "sessions_seen": sessions_seen,
-                "recommended_sessions": len(recommended_rows),
-                "applied_sessions": len(applied_rows),
-                "rejected_sessions": len(rejected_rows),
-                "acceptance_rate": round(acceptance_rate, 3),
-                "avg_improvement_when_applied": round(avg_improvement, 2),
-                "avg_improvement_when_rejected": round(_avg(rejected_improvements), 2),
-                "score": round(score, 2),
-                "temperature": _classify_parameter(
-                    acceptance_rate=acceptance_rate,
-                    avg_improvement=avg_improvement,
-                    rejected_count=len(rejected_rows),
-                    applied_count=len(applied_rows),
-                ),
-                "sessions": {
-                    session_id: value["state"] for session_id, value in sorted(session_map.items())
-                },
-                "values": _collect_unique_values(rows),
-                "source_agents": _collect_source_agents(
-                    session_id_map=session_map,
-                    session_param_sources=session_param_sources,
-                    parameter=parameter,
-                ),
-            }
-        )
-
-    parameters.sort(
-        key=lambda item: (
-            -item["score"],
-            -item["sessions_seen"],
-            item["parameter"],
-        )
+    return _assemble_parameter_summary(
+        session_rows=session_rows,
+        parameter_sessions=parameter_sessions,
+        session_states=session_states,
+        session_precise_applied=session_precise_applied,
+        session_param_sources=session_param_sources,
     )
-    session_rows.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
-
-    matrix = []
-    for item in parameters:
-        matrix.append(
-            {
-                "parameter": item["parameter"],
-                "scope": item["scope"],
-                "score": item["score"],
-                "sessions": [
-                    {
-                        "session_id": session["session_id"],
-                        "state": item["sessions"].get(session["session_id"], "none"),
-                        "improvement_pct": session["improvement_pct"],
-                    }
-                    for session in session_rows
-                ],
-            }
-        )
-
-    return {
-        "sessions": session_rows,
-        "parameters": parameters,
-        "matrix": matrix,
-        "winning_gaps": _build_winning_gaps(
-            session_rows, session_states, session_precise_applied, session_param_sources
-        ),
-        "summary": {
-            "session_count": len(session_rows),
-            "parameter_count": len(parameters),
-            "hot_count": sum(1 for item in parameters if item["temperature"] == "hot"),
-            "cold_count": sum(1 for item in parameters if item["temperature"] == "cold"),
-        },
-    }
 
 
 def load_leaderboard(data_dir: str) -> dict:
@@ -784,6 +948,106 @@ def _classify_parameter(
     return "mixed"
 
 
+def _assemble_parameter_summary(
+    *,
+    session_rows: list[dict],
+    parameter_sessions: dict[str, dict[str, dict]],
+    session_states: dict[str, dict[str, dict]],
+    session_precise_applied: dict[str, dict[str, str]],
+    session_param_sources: dict[str, dict[str, set[str]]],
+) -> dict:
+    parameters: list[dict] = []
+    for parameter, session_map in parameter_sessions.items():
+        rows = list(session_map.values())
+        sessions_seen = len(rows)
+        applied_rows = [row for row in rows if row["state"] == "applied"]
+        rejected_rows = [row for row in rows if row["state"] == "rejected"]
+        recommended_rows = [
+            row for row in rows if row["state"] in {"recommended", "applied", "rejected"}
+        ]
+        applied_improvements = [row["improvement_pct"] for row in applied_rows]
+        rejected_improvements = [row["improvement_pct"] for row in rejected_rows]
+        acceptance_rate = len(applied_rows) / len(recommended_rows) if recommended_rows else 0.0
+        avg_improvement = _avg(applied_improvements)
+        score = (
+            len(applied_rows) * 3.0
+            + len([row for row in applied_rows if row["improvement_pct"] > 0]) * 2.0
+            - len(rejected_rows) * 2.0
+            + avg_improvement / 25.0
+        )
+        parameters.append(
+            {
+                "parameter": parameter,
+                "scope": _majority_scope(rows),
+                "sessions_seen": sessions_seen,
+                "recommended_sessions": len(recommended_rows),
+                "applied_sessions": len(applied_rows),
+                "rejected_sessions": len(rejected_rows),
+                "acceptance_rate": round(acceptance_rate, 3),
+                "avg_improvement_when_applied": round(avg_improvement, 2),
+                "avg_improvement_when_rejected": round(_avg(rejected_improvements), 2),
+                "score": round(score, 2),
+                "temperature": _classify_parameter(
+                    acceptance_rate=acceptance_rate,
+                    avg_improvement=avg_improvement,
+                    rejected_count=len(rejected_rows),
+                    applied_count=len(applied_rows),
+                ),
+                "sessions": {
+                    session_id: value["state"] for session_id, value in sorted(session_map.items())
+                },
+                "values": _collect_unique_values(rows),
+                "source_agents": _collect_source_agents(
+                    session_id_map=session_map,
+                    session_param_sources=session_param_sources,
+                    parameter=parameter,
+                ),
+            }
+        )
+
+    parameters.sort(
+        key=lambda item: (
+            -item["score"],
+            -item["sessions_seen"],
+            item["parameter"],
+        )
+    )
+    session_rows.sort(key=lambda item: item.get("timestamp", ""), reverse=True)
+
+    matrix = []
+    for item in parameters:
+        matrix.append(
+            {
+                "parameter": item["parameter"],
+                "scope": item["scope"],
+                "score": item["score"],
+                "sessions": [
+                    {
+                        "session_id": session["session_id"],
+                        "state": item["sessions"].get(session["session_id"], "none"),
+                        "improvement_pct": session["improvement_pct"],
+                    }
+                    for session in session_rows
+                ],
+            }
+        )
+
+    return {
+        "sessions": session_rows,
+        "parameters": parameters,
+        "matrix": matrix,
+        "winning_gaps": _build_winning_gaps(
+            session_rows, session_states, session_precise_applied, session_param_sources
+        ),
+        "summary": {
+            "session_count": len(session_rows),
+            "parameter_count": len(parameters),
+            "hot_count": sum(1 for item in parameters if item["temperature"] == "hot"),
+            "cold_count": sum(1 for item in parameters if item["temperature"] == "cold"),
+        },
+    }
+
+
 def _build_winning_gaps(
     session_rows: list[dict],
     session_states: dict[str, dict[str, dict]],
@@ -1064,6 +1328,52 @@ def _normalize_precise_param(parameter: str) -> str:
         "tc_qdisc": "tc_rules",
     }
     return aliases.get(parameter, parameter)
+
+
+def _normalize_tidb_parameter(parameter: str) -> str:
+    parameter = parameter.strip()
+    if not parameter:
+        return ""
+    aliases = {
+        "webserver.": "",
+        "kernel.": "",
+        "resource_limits.": "",
+        "network.": "",
+        "storage.": "",
+    }
+    for prefix, replacement in aliases.items():
+        if parameter.startswith(prefix):
+            return _normalize_precise_param(replacement + parameter[len(prefix) :])
+    return _normalize_precise_param(parameter)
+
+
+def _scope_for_parameter(parameter: str) -> str:
+    raw = parameter.strip()
+    if raw.startswith("webserver."):
+        return "nginx"
+    if raw.startswith(("kernel.", "resource_limits.", "network.", "storage.")):
+        return "system"
+    if raw in PRECISE_BUNDLE_MAP:
+        return "nginx" if PRECISE_BUNDLE_MAP[raw].startswith("nginx") else "system"
+    return "unknown"
+
+
+def _collect_sources_for_session(hypo_root: Path, session_id: str) -> dict[str, set[str]]:
+    session_dir = hypo_root / session_id
+    if not session_dir.exists():
+        return {}
+    session = load_session(str(hypo_root.parent), session_id)
+    return _collect_param_sources(session.get("iterations", []))
+
+
+def _format_tidb_timestamp(value: object) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _collect_param_sources(iterations: list[dict]) -> dict[str, set[str]]:
