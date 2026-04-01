@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from parser import discover_sessions, load_comparison, load_parameter_summary, load_session
 
 BACKEND_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BACKEND_DIR.parents[1]
+PROJECT_ROOT = BACKEND_DIR.parents[1] if len(BACKEND_DIR.parents) > 1 else BACKEND_DIR.parent
 DATA_DIR = os.environ.get("DATA_DIR", str(PROJECT_ROOT))
 STATIC_DIR = os.environ.get("STATIC_DIR", str(BACKEND_DIR / "static"))
 
