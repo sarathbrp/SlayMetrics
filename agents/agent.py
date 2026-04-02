@@ -1852,28 +1852,28 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         findings: list[dict[str, Any]] = []
         for param in web_applied if isinstance(web_applied, list) else web_applied.keys():
-            before = _normalize(web_current.get(param, ""))
-            after = _normalize(web_changes.get(param, ""))
-            if before == after:
+            raw_before = web_current.get(param, "")
+            raw_after = web_changes.get(param, "")
+            if _normalize(raw_before) == _normalize(raw_after):
                 continue  # no change — don't save duplicate
             findings.append(
                 {
                     "parameter": f"webserver.{param}",
-                    "before_value": before,
-                    "after_value": after,
+                    "before_value": raw_before,
+                    "after_value": raw_after,
                     "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
             )
         for param, value in kern_applied.items():
-            before = _normalize(kern_current.get(param, ""))
-            after = _normalize(value)
-            if before == after:
+            raw_before = kern_current.get(param, "")
+            raw_after = value
+            if _normalize(raw_before) == _normalize(raw_after):
                 continue  # no change — don't save duplicate
             findings.append(
                 {
                     "parameter": f"kernel.{param}",
-                    "before_value": before,
-                    "after_value": after,
+                    "before_value": raw_before,
+                    "after_value": raw_after,
                     "reasoning": rca_by_param.get(param, "config-driven tuning"),
                 }
             )
