@@ -2990,12 +2990,15 @@ def _strip_inline_comment(value: str) -> str:
 
 
 def _enforce_nginx_fd_consistency(apply_plan: dict[str, Any], config: dict[str, Any]) -> None:
-    """Ensure worker_rlimit_nofile >= worker_processes * worker_connections * 2.
+    """Ensure worker_rlimit_nofile can support worker_connections.
 
-    The LLM planner often proposes high concurrency (worker_connections=65536)
-    with auto worker_processes (112 cores) but low worker_rlimit_nofile (200000).
-    This creates an FD budget of 112*65536*2 = 14.6M but only 200K FDs available,
-    causing nginx to crash or reject connections under load.
+    worker_rlimit_nofile is a PER-PROCESS limit — each nginx worker
+    independently gets this many FDs. Each connection uses ~2 FDs
+    (client socket + file/upstream), so:
+        worker_connections <= worker_rlimit_nofile / 2
+
+    If worker_connections exceeds the FD budget, cap it.
+    If worker_rlimit_nofile is too low for worker_connections, raise it.
     """
 
     web = apply_plan.get("webserver", {})
@@ -3003,41 +3006,28 @@ def _enforce_nginx_fd_consistency(apply_plan: dict[str, Any], config: dict[str, 
         return
 
     try:
-        procs_str = str(web.get("worker_processes", "auto"))
         conns = int(web.get("worker_connections", "65536"))
         nofile = int(web.get("worker_rlimit_nofile", "200000"))
     except (ValueError, TypeError):
         return
 
-    # Resolve "auto" to CPU count
-    cpu_cores = int(config.get("_cpu_cores", 112))
-    procs = cpu_cores if procs_str == "auto" else int(procs_str)
-
-    # Each connection uses ~2 FDs (client socket + backend/file)
-    required = (procs * conns * 2) + 4096
-
-    if nofile >= required:
-        return
-
-    # Strategy: cap worker_connections to fit within nofile, rather than
-    # inflating nofile to unrealistic values (2M+ causes systemd LIMITS errors
-    # when cgroup MemoryMax is active during the transition).
-    max_safe_nofile = 524288  # practical ceiling for most systems
     res_targets = config.get("tuning", {}).get("resource_limits_targets", {})
-    systemd_nofile = min(int(res_targets.get("systemd_nofile", "524288")), max_safe_nofile)
+    max_safe_nofile = int(res_targets.get("systemd_nofile", "524288"))
 
-    # Set nofile to systemd_nofile (practical, not theoretical)
-    web["worker_rlimit_nofile"] = str(systemd_nofile)
+    # Ensure nofile is aligned with systemd limit
+    if nofile > max_safe_nofile:
+        web["worker_rlimit_nofile"] = str(max_safe_nofile)
+        nofile = max_safe_nofile
 
-    # Cap worker_connections to fit within the FD budget
-    max_conns_per_worker = max(1024, (systemd_nofile // procs) - 64)
-    if conns > max_conns_per_worker:
-        web["worker_connections"] = str(max_conns_per_worker)
+    # Each connection uses ~2 FDs (per worker, not shared across workers)
+    max_conns = max(1024, (nofile // 2) - 512)
+    if conns > max_conns:
+        web["worker_connections"] = str(max_conns)
 
-    # Align systemd LimitNOFILE
+    # Align systemd LimitNOFILE with worker_rlimit_nofile
     res = apply_plan.get("resource_limits", {})
     if isinstance(res, dict):
-        res["systemd_nofile"] = str(systemd_nofile)
+        res["systemd_nofile"] = str(max_safe_nofile)
 
 
 def _is_blocked(param: str, value: str, config: dict[str, Any] | None = None) -> bool:
