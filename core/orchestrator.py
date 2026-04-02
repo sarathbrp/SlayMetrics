@@ -465,6 +465,15 @@ async def run(model, deps: AgentDeps) -> str:
         if any(kw in str(p) for kw in _throttle_keywords)
     ]
     _skip_optimization = _baseline_small >= _skip_threshold_rps and len(_res_problems) == 0
+    _all_res_problems = _pre_inspection.get("resource_limits", {}).get("problems", [])
+    logger.status(
+        "skip_check",
+        f"small={_baseline_small:,.0f} (threshold={_skip_threshold_rps:,.0f}) | "
+        f"throttles={len(_res_problems)} | all_res_problems={len(_all_res_problems)} "
+        f"{'-> SKIPPING' if _skip_optimization else '-> PROCEEDING'}",
+    )
+    if _all_res_problems and not _res_problems:
+        logger.status("skip_check", f"Filtered out: {_all_res_problems}")
 
     if _skip_optimization:
         _total_issues = _pre_inspection.get("summary", {}).get("total_issues", 0)
