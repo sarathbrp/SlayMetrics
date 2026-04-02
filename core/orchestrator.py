@@ -455,12 +455,16 @@ async def run(model, deps: AgentDeps) -> str:
     _skip_threshold_rps = float((cfg.get("agent") or {}).get("skip_if_above_rps", 1_500_000))
     _baseline_small = float(baselines.get("small", {}).get("rps", 0) or 0)
     _pre_inspection = inspect_all(deps.ssh, cfg)
-    # Only count critical issues that actually hurt performance at high RPS.
-    # resource_limits problems (cgroup caps) are always critical.
-    # network/storage problems at >1.5M RPS are usually false positives
-    # (default iptables INVALID rule, default mq qdisc, conntrack below target).
-    _res_problems = len(_pre_inspection.get("resource_limits", {}).get("problems", []))
-    _skip_optimization = _baseline_small >= _skip_threshold_rps and _res_problems == 0
+    # Only count throttle problems that actually cap throughput.
+    # NUMA cross-node memory, background hogs (if small), etc. are not throttles.
+    # Real throttles: cgroup CPU/memory caps, low nofile, low cgroup weights.
+    _throttle_keywords = ("cgroup CPU", "cgroup memory", "LimitNOFILE", "CPUWeight", "IOWeight")
+    _res_problems = [
+        p
+        for p in _pre_inspection.get("resource_limits", {}).get("problems", [])
+        if any(kw in str(p) for kw in _throttle_keywords)
+    ]
+    _skip_optimization = _baseline_small >= _skip_threshold_rps and len(_res_problems) == 0
 
     if _skip_optimization:
         _total_issues = _pre_inspection.get("summary", {}).get("total_issues", 0)
