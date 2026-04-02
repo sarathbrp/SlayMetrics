@@ -449,37 +449,22 @@ async def run(model, deps: AgentDeps) -> str:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 4c: Skip optimization if system is already optimal
-    # Primary signal: baseline small RPS >= threshold (system is performing well)
-    # Secondary: check for critical issues (cgroup caps, firewall, worker_processes)
+    # If baseline small RPS >= threshold, the system is already performing well.
+    # The RPS itself proves there are no real throttles — skip the LLM.
     # ══════════════════════════════════════════════════════════════════════════
     _skip_threshold_rps = float((cfg.get("agent") or {}).get("skip_if_above_rps", 1_500_000))
     _baseline_small = float(baselines.get("small", {}).get("rps", 0) or 0)
-    _pre_inspection = inspect_all(deps.ssh, cfg)
-    # Only count throttle problems that actually cap throughput.
-    # NUMA cross-node memory, background hogs (if small), etc. are not throttles.
-    # Real throttles: cgroup CPU/memory caps, low nofile, low cgroup weights.
-    _throttle_keywords = ("cgroup CPU", "cgroup memory", "LimitNOFILE", "CPUWeight", "IOWeight")
-    _res_problems = [
-        p
-        for p in _pre_inspection.get("resource_limits", {}).get("problems", [])
-        if any(kw in str(p) for kw in _throttle_keywords)
-    ]
-    _skip_optimization = _baseline_small >= _skip_threshold_rps and len(_res_problems) == 0
-    _all_res_problems = _pre_inspection.get("resource_limits", {}).get("problems", [])
+    _skip_optimization = _baseline_small >= _skip_threshold_rps
     logger.status(
         "skip_check",
-        f"small={_baseline_small:,.0f} (threshold={_skip_threshold_rps:,.0f}) | "
-        f"throttles={len(_res_problems)} | all_res_problems={len(_all_res_problems)} "
+        f"small={_baseline_small:,.0f} (threshold={_skip_threshold_rps:,.0f}) "
         f"{'-> SKIPPING' if _skip_optimization else '-> PROCEEDING'}",
     )
-    if _all_res_problems and not _res_problems:
-        logger.status("skip_check", f"Filtered out: {_all_res_problems}")
 
     if _skip_optimization:
-        _total_issues = _pre_inspection.get("summary", {}).get("total_issues", 0)
         logger.status(
             "skip",
-            f"System already optimal: {_total_issues} issues ({_res_problems} cgroup), "
+            f"System already optimal: "
             f"small={_baseline_small:,.0f} RPS (>= {_skip_threshold_rps:,.0f}) — skipping LLM",
         )
         final_results = dict(baselines)
