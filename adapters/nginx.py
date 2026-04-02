@@ -110,6 +110,13 @@ class NginxAdapter(ServiceAdapter):
         new_directive = f"{spec['indent']}{parameter} {value};"
         updated = _upsert_directive_in_context(lines, parameter, new_directive, block)
         if updated is None:
+            import sys
+
+            print(
+                f"[nginx_adapter] FAILED upsert {parameter}={value} in {block} "
+                f"(config {len(lines)} lines)",
+                file=sys.stderr,
+            )
             return False
 
         # Write to temp, test, then apply
@@ -126,6 +133,12 @@ class NginxAdapter(ServiceAdapter):
         # Validate — rollback if broken
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
+            import sys
+
+            print(
+                f"[nginx_adapter] FAILED nginx -t for {parameter}={value}: {test.stdout[:200]}",
+                file=sys.stderr,
+            )
             self._ssh.execute(f"cp {config_path}.bak {config_path}")
             return False
 
