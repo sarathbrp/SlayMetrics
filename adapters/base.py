@@ -49,6 +49,14 @@ class ServiceAdapter(ABC):
         """Reload service to apply config changes. Returns True on success."""
 
     @abstractmethod
+    def validate_config(self) -> bool:
+        """Validate service configuration syntax without applying. Returns True if valid."""
+
+    @abstractmethod
+    def restart(self) -> bool:
+        """Hard restart the service (not graceful reload). Returns True on success."""
+
+    @abstractmethod
     def get_hypothesis_queue(self) -> list[dict]:
         """Return ordered list of {name, priority} hypotheses to test."""
 

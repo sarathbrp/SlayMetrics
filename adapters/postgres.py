@@ -47,6 +47,14 @@ class PostgresAdapter(ServiceAdapter):
         result = self._ssh.execute(f"systemctl reload {self._cfg['systemd_unit']}")
         return result.ok
 
+    def validate_config(self) -> bool:
+        # PostgreSQL has no offline config syntax check; errors surface on reload
+        return True
+
+    def restart(self) -> bool:
+        result = self._ssh.execute(f"systemctl restart {self._cfg['systemd_unit']}")
+        return result.ok
+
     def inspect(self, targets: dict[str, str]) -> dict[str, Any]:
         """Inspect PostgreSQL configuration against targets."""
         raw = self._ssh.execute(

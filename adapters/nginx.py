@@ -324,6 +324,14 @@ class NginxAdapter(ServiceAdapter):
         result = self._ssh.execute(f"systemctl reload {self._cfg['systemd_unit']}")
         return result.ok
 
+    def validate_config(self) -> bool:
+        test = self._ssh.execute("nginx -t 2>&1")
+        return "syntax is ok" in test.stdout or "test is successful" in test.stdout
+
+    def restart(self) -> bool:
+        result = self._ssh.execute(f"systemctl restart {self._cfg['systemd_unit']} 2>&1")
+        return result.ok
+
     def inspect(self, targets: dict[str, str]) -> dict[str, Any]:
         """Inspect nginx configuration against targets."""
         raw = self._ssh.execute("nginx -T 2>/dev/null", timeout=10).stdout
