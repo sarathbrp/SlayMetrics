@@ -2,26 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import statistics
 from contextlib import nullcontext
-from types import SimpleNamespace
 from typing import Any
 
 import agents.agent as diagnosis_agent
 import core.reporter as reporter
 import rhel.system_checks as system_checks
 from agents import AgentDeps
-from agents.tools_inspect import inspect_all
 from core import log as logger
-from core.lessons import (
-    check_leaderboard,
-    get_best_run_params,
-    get_prior_knowledge_text,
-    get_ranked_optimization_groups,
-    get_top_runs,
-    merge_targets,
-)
-from core.slack_notifier import SlackNotifier
 from telemetry import (
     collect_snapshot,
     persist_sampler_result,
@@ -33,79 +23,6 @@ from telemetry import (
 PAYLOAD_SIZES = ["small", "medium", "large"]
 
 
-def _normalize_final_effective_config(inspection: dict[str, Any]) -> dict[str, dict[str, str]]:
-    web = dict(((inspection.get("webserver") or {}).get("current") or {}))
-    kernel = dict(((inspection.get("kernel") or {}).get("current") or {}))
-    resource = (inspection.get("resource_limits") or {}).get("findings") or {}
-    network = (inspection.get("network") or {}).get("findings") or {}
-    storage = (inspection.get("storage") or {}).get("findings") or {}
-
-    resource_limits: dict[str, str] = {}
-    for key in ("systemd_nofile", "systemd_nproc", "cgroup_io_weight", "cgroup_cpu_weight"):
-        value = resource.get(key)
-        if value not in (None, "", "unknown"):
-            resource_limits[key] = str(value)
-    if resource.get("numa_policy"):
-        resource_limits["numa_policy"] = str(resource["numa_policy"])
-    resource_limits["cgroup_cpu"] = (
-        "max" if not resource.get("cgroup_cpu_pct") else str(resource["cgroup_cpu_pct"])
-    )
-    resource_limits["cgroup_memory"] = (
-        "max" if not resource.get("cgroup_memory_mb") else f"{resource['cgroup_memory_mb']}MB"
-    )
-
-    network_state: dict[str, str] = {}
-    if network.get("conntrack_max") not in (None, "", "unknown"):
-        network_state["conntrack_max"] = str(network["conntrack_max"])
-    network_state["iptables_drop_rules"] = (
-        "present" if network.get("iptables_has_drops") else "none"
-    )
-    network_state["tc_rules"] = (
-        str(network.get("tc_summary") or "present") if network.get("tc_has_shaping") else "fq_codel"
-    )
-
-    storage_state: dict[str, str] = {}
-    for key in ("io_scheduler", "readahead"):
-        value = storage.get(key)
-        if value not in (None, "", "unknown"):
-            storage_state[key] = str(value)
-
-    return {
-        "webserver": {str(k): str(v) for k, v in web.items() if str(v)},
-        "kernel": {str(k): str(v) for k, v in kernel.items() if str(v)},
-        "resource_limits": resource_limits,
-        "network": network_state,
-        "storage": storage_state,
-    }
-
-
-def _capture_final_effective_config(deps: AgentDeps, session_id: str, memory) -> dict[str, Any]:
-    inspection = inspect_all(deps.ssh, deps.config)
-    effective_config = _normalize_final_effective_config(inspection)
-    snapshot = {
-        "version": 1,
-        "captured_at": _utc_now_iso(),
-        "inspection": inspection,
-        "effective_config": effective_config,
-    }
-    parameter_count = sum(len(values) for values in effective_config.values())
-    summary = f"final snapshot: {parameter_count} parameters"
-    memory.save_context(
-        session_id,
-        "command_output",
-        "final_effective_config_snapshot",
-        json.dumps(snapshot, ensure_ascii=True),
-        summary,
-    )
-    return snapshot
-
-
-def _utc_now_iso() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat()
-
-
 async def run(model, deps: AgentDeps) -> str:
     """Main orchestration loop. Returns path to final report."""
     cfg = deps.config
@@ -113,8 +30,6 @@ async def run(model, deps: AgentDeps) -> str:
     memory = deps.memory
     langfuse = getattr(deps, "langfuse", None)
     max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
-
-    slack = SlackNotifier(cfg)
 
     logger.panel(
         "SlayMetricsAgent",
@@ -176,89 +91,6 @@ async def run(model, deps: AgentDeps) -> str:
         f"{rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB"
     )
     logger.status("system", f"RHEL: {deps.system_fingerprint}")
-
-    # Determine LLM profile name for Slack
-    _llm_cfg = cfg.get("llm") or {}
-    _active = _llm_cfg.get("active_profile", "unknown")
-    _profile = (_llm_cfg.get("profiles") or {}).get(_active) or {}
-    _llm_label = f"{_active} ({_profile.get('backend', '?')} / {_profile.get('model', '?')})"
-
-    # Build degradation summary from RHEL checks for Slack header
-    _warn_checks = [chk for chk in checks if chk.status in ("warning", "critical", "degraded")]
-    _degradation_hints = []
-    for chk in checks:
-        val = chk.value[:80]
-        if "somaxconn=" in val:
-            import re as _re
-
-            _m = _re.search(r"somaxconn=(\d+)", val)
-            if _m and int(_m.group(1)) < 65535:
-                _degradation_hints.append(f"somaxconn={_m.group(1)}")
-        if "Enforcing" in val:
-            _degradation_hints.append("SELinux=enforcing")
-    # Quick nginx worker count
-    _nginx_workers = (
-        ssh.execute(
-            "grep -c '^' /proc/$(pgrep -o nginx)/fd 2>/dev/null || "
-            "grep worker_processes /etc/nginx/nginx.conf 2>/dev/null | awk '{print $2}'"
-        )
-        .stdout.strip()
-        .rstrip(";")
-    )
-    if _nginx_workers and _nginx_workers not in ("auto", ""):
-        try:
-            if int(_nginx_workers) < cpu_cores // 2:
-                _degradation_hints.append(f"workers={_nginx_workers}/{cpu_cores}")
-        except ValueError:
-            pass
-    _degradation_summary = ", ".join(_degradation_hints[:5]) if _degradation_hints else ""
-
-    slack.notify_run_start(
-        session_id=session_id,
-        dut_host=cfg["target"]["host"],
-        llm_profile=_llm_label,
-        cpu_cores=cpu_cores,
-        ram_gb=ram_gb,
-        degradation_summary=_degradation_summary,
-    )
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 1.6: Load lessons learned — merge proven params from best run
-    # ══════════════════════════════════════════════════════════════════════════
-    top_runs = get_top_runs(memory)
-    prior_knowledge_text = ""
-    if top_runs:
-        best = top_runs[0]
-        logger.status(
-            "lessons",
-            f"Best prior run: {best['session_id']} "
-            f"(small={best['small_rps']:.0f} RPS, {best['tokens']} tokens)",
-        )
-        prior_knowledge_text = get_prior_knowledge_text(memory)
-        proven = get_best_run_params(memory)
-        if proven:
-            tuning = cfg.get("tuning") or {}
-            config_targets = {
-                "webserver": tuning.get("webserver_targets") or {},
-                "kernel": tuning.get("kernel_targets") or {},
-                "resource_limits": tuning.get("resource_limits_targets") or {},
-                "network": tuning.get("network_targets") or {},
-                "storage": tuning.get("storage_targets") or {},
-            }
-            merged = merge_targets(config_targets, proven)
-            # Write merged targets back into config so all downstream code uses them
-            for cat, key in (
-                ("webserver", "webserver_targets"),
-                ("kernel", "kernel_targets"),
-                ("resource_limits", "resource_limits_targets"),
-                ("network", "network_targets"),
-                ("storage", "storage_targets"),
-            ):
-                if cat in merged:
-                    tuning[key] = merged[cat]
-            logger.status("lessons", f"Merged {len(proven)} proven params into targets")
-    else:
-        logger.status("lessons", "No prior qualifying runs — using config.yaml defaults")
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1.7: Pre-flight validation (LLM-assisted)
@@ -347,7 +179,6 @@ async def run(model, deps: AgentDeps) -> str:
         baseline_rps=baseline_rps,
         best_rps=baseline_rps,
     )
-    slack.notify_baseline_complete(session_id=session_id, baselines=baselines)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 2.5: Aggregate benchmark evidence from bench + DUT telemetry
@@ -431,160 +262,57 @@ async def run(model, deps: AgentDeps) -> str:
     # STEP 5: RCA + recommendations (ITERATION LOOP)
     # ══════════════════════════════════════════════════════════════════════════
     max_iterations = int((cfg.get("agent") or {}).get("max_iterations", 3))
-    optimization_cfg = ((cfg.get("agent") or {}).get("optimization") or {}).copy()
-    optimization_enabled = bool(optimization_cfg.get("enabled", False))
-    optimization_top_n = int(optimization_cfg.get("top_runs", 3) or 3)
-    optimization_min_gain_pct = float(optimization_cfg.get("min_small_gain_pct", 1.0) or 1.0)
-    optimization_gap_pct = float(optimization_cfg.get("leaderboard_gap_pct", 3.0) or 3.0)
     iteration_feedback = ""
-    diagnosis: Any = None
+    diagnosis = None
     iteration_finals: dict[str, Any] = {}
-    healthy_results: dict[str, Any] = {}
-    final_results: dict[str, Any] = {}
-    best_results = dict(baselines)
-    best_iteration = 0
-    rejected_optimization_groups: set[str] = set()
-    in_optimization_mode = False
-    has_top_runs = bool(top_runs)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4c: Skip optimization if system is already optimal
-    # If baseline small RPS >= threshold, the system is already performing well.
-    # The RPS itself proves there are no real throttles — skip the LLM.
-    # ══════════════════════════════════════════════════════════════════════════
-    _skip_threshold_rps = float((cfg.get("agent") or {}).get("skip_if_above_rps", 1_500_000))
-    _baseline_small = float(baselines.get("small", {}).get("rps", 0) or 0)
-    _skip_optimization = _baseline_small >= _skip_threshold_rps
-    logger.status(
-        "skip_check",
-        f"small={_baseline_small:,.0f} (threshold={_skip_threshold_rps:,.0f}) "
-        f"{'-> SKIPPING' if _skip_optimization else '-> PROCEEDING'}",
-    )
-
-    if _skip_optimization:
-        logger.status(
-            "skip",
-            f"System already optimal: "
-            f"small={_baseline_small:,.0f} RPS (>= {_skip_threshold_rps:,.0f}) — skipping LLM",
-        )
-        final_results = dict(baselines)
-        best_results = dict(baselines)
-        iteration = 0
-        diagnosis = SimpleNamespace(
-            nginx_applied=False,
-            system_applied=False,
-            notes="System already at optimal performance — no changes needed",
-            recommendations=[],
-            rca_records=[],
-        )
-        slack.notify_run_complete(
-            session_id=session_id,
-            baselines=baselines,
-            finals=baselines,
-            total_tokens=0,
-            report_path="",
-        )
+    best_iteration_finals: dict[str, Any] = {}
+    best_iteration_rps: float = 0.0
 
     for iteration in range(1, max_iterations + 1):
-        if _skip_optimization:
-            break
-
+        logger.step(
+            f"Step 5: Iteration {iteration}/{max_iterations} — RCA and recommendation planning..."
+        )
+        # Pass iteration number to agent for per-iteration hypothesis files
         deps.iteration = iteration  # type: ignore[attr-defined]
 
-        if in_optimization_mode:
-            logger.step(f"Step 5: Iteration {iteration}/{max_iterations} — ranked optimization...")
-            current_state = _collect_current_state(deps)
-            ranked_groups = [
-                group
-                for group in get_ranked_optimization_groups(
-                    memory,
-                    current_state,
-                    top_n=optimization_top_n,
-                )
-                if group["name"] not in rejected_optimization_groups
-            ]
-            _save_optimization_considered(memory, session_id, iteration, ranked_groups)
-            if not ranked_groups:
-                decision = "No ranked optimization groups remain — stopping"
-                logger.status("optimization", decision)
-                diagnosis_agent.save_iteration_summary(
-                    deps,
-                    iteration=iteration,
-                    baselines=baselines,
-                    results=healthy_results or final_results or baselines,
-                    regressions=[],
-                    decision=decision,
-                    diagnosis=SimpleNamespace(
-                        nginx_applied=False,
-                        system_applied=False,
-                        recommendations=[],
-                    ),
-                )
-                break
+        context_prompt = _build_context_prompt(
+            rhel_ver=rhel_ver,
+            kernel_ver=kernel_ver,
+            cpu_cores=cpu_cores,
+            ram_gb=ram_gb,
+            checks_summary=checks_summary,
+            benchmark_evidence_text=benchmark_evidence_text,
+            prior_fixes=prior_fixes,
+        )
+        if iteration_feedback:
+            context_prompt += f"\n{iteration_feedback}\n"
 
-            candidate = ranked_groups[0]
-            candidate_params = _format_group_changes(candidate.get("changes", {}) or {})
-            logger.status(
-                "optimization",
-                f"Selected group {candidate['name']} score={candidate['score']:.2f} "
-                f"params={candidate_params}",
+        logger.log(
+            "orchestrator",
+            f"Context prompt: {len(context_prompt)} chars (iteration {iteration})",
+            "info",
+        )
+
+        # Snapshot fact count to isolate this iteration's applied facts
+        pre_iteration_facts = memory.get_facts(session_id, type="fix")
+        pre_iteration_fact_count = len(pre_iteration_facts)
+
+        with (
+            langfuse.span(
+                "diagnosis_planning",
+                input={
+                    "context_prompt_length": len(context_prompt),
+                    "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "debate"),
+                    "iteration": iteration,
+                },
+                metadata={"session_id": session_id},
             )
-            snapshot = _snapshot_optimization_state(deps, candidate)
-            apply_result = _apply_optimization_group(deps, candidate)
-            total_changes = sum(len(values) for values in candidate.get("changes", {}).values())
-            diagnosis = SimpleNamespace(
-                nginx_applied=bool(candidate.get("changes", {}).get("webserver")),
-                system_applied=bool(candidate.get("changes", {}).get("kernel")),
-                output=f"Optimization group {candidate['name']} applied",
-                notes=f"Applied optimization group {candidate['name']} ({total_changes} params)",
-                summary=f"Applied optimization group {candidate['name']} ({total_changes} params)",
-                recommendations=[
-                    {
-                        "title": candidate["name"],
-                        "scope": "optimization",
-                        "changes": candidate["changes"],
-                    }
-                ],
-                optimization_group=candidate,
-                optimization_apply=apply_result,
-            )
-        else:
-            logger.step(f"Step 5: Iteration {iteration}/{max_iterations} — LLM debate...")
+            if langfuse
+            else nullcontext()
+        ):
+            diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
 
-            context_prompt = _build_context_prompt(
-                rhel_ver=rhel_ver,
-                kernel_ver=kernel_ver,
-                cpu_cores=cpu_cores,
-                ram_gb=ram_gb,
-                checks_summary=checks_summary,
-                benchmark_evidence_text=benchmark_evidence_text,
-                prior_fixes=prior_fixes,
-                prior_knowledge=prior_knowledge_text,
-            )
-            if iteration_feedback:
-                context_prompt += f"\n{iteration_feedback}\n"
-
-            logger.log(
-                "orchestrator",
-                f"Context prompt: {len(context_prompt)} chars (iteration {iteration})",
-                "info",
-            )
-
-            with (
-                langfuse.span(
-                    "diagnosis_planning",
-                    input={
-                        "context_prompt_length": len(context_prompt),
-                        "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "debate"),
-                        "iteration": iteration,
-                    },
-                    metadata={"session_id": session_id},
-                )
-                if langfuse
-                else nullcontext()
-            ):
-                diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
-
+        # Check if any changes were applied
         nginx_applied = getattr(diagnosis, "nginx_applied", False)
         system_applied = getattr(diagnosis, "system_applied", False)
         if not nginx_applied and not system_applied:
@@ -594,133 +322,64 @@ async def run(model, deps: AgentDeps) -> str:
                 deps,
                 iteration=iteration,
                 baselines=baselines,
-                results=iteration_finals or healthy_results or baselines,
+                results=iteration_finals or baselines,
                 regressions=[],
                 decision=decision,
                 diagnosis=diagnosis,
             )
             break
 
+        # Benchmark ALL workloads to check for regressions
         if bench_tool == "hackathon":
             logger.step(f"Step 5.{iteration}: Running post-iteration benchmark (all workloads)...")
             iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
 
+        # Check exit criteria: all workloads within 1% of baseline
         healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
         should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
 
-        # Collect applied params for Slack from diagnosis
-        _applied_params: dict[str, dict[str, str]] = {}
-        _failed_params: list[str] = []
-        _guardrails: list[str] = []
-        _eval_results: dict[str, Any] | None = None
-        if hasattr(diagnosis, "apply_results"):
-            for cat, res in (getattr(diagnosis, "apply_results", {}) or {}).items():
-                if isinstance(res, dict):
-                    applied = res.get("applied", {})
-                    if isinstance(applied, dict) and applied:
-                        _applied_params[cat] = applied
-                    elif isinstance(applied, list) and applied:
-                        _applied_params[cat] = {p: "applied" for p in applied}
-                    for p in res.get("failed", []) or []:
-                        _failed_params.append(f"{cat}.{p}" if isinstance(p, str) else str(p))
-        if hasattr(diagnosis, "guardrails_triggered"):
-            _guardrails = list(getattr(diagnosis, "guardrails_triggered", []) or [])
-        if hasattr(diagnosis, "eval_results"):
-            _eval_results = getattr(diagnosis, "eval_results", None)
-
-        slack.notify_iteration_complete(
-            session_id=session_id,
-            iteration=iteration,
-            baselines=baselines,
-            results=iteration_finals,
-            applied_params=_applied_params,
-            failed_params=_failed_params,
-            guardrails_triggered=_guardrails,
-            eval_results=_eval_results,
-            tokens_used=deps.token_counter.total,
-            decision="",  # filled after decision logic below
+        # Check if this iteration degraded vs best so far — rollback if so
+        current_small_rps = float(
+            iteration_finals.get("small", {}).get("rps", 0)
+            or iteration_finals.get("homepage", {}).get("rps", 0)
+            or 0
         )
+        iteration_degraded = False
+        if best_iteration_rps and current_small_rps < best_iteration_rps * 0.99:
+            iteration_degraded = True
+        elif not best_iteration_rps:
+            # First iteration — compare against baseline
+            if current_small_rps < baseline_rps * 0.99:
+                iteration_degraded = True
 
-        if in_optimization_mode:
-            candidate = getattr(diagnosis, "optimization_group", None) or {}
-            current_small = float(iteration_finals.get("small", {}).get("rps", 0) or 0)
-            prior_results = dict(healthy_results or baselines)
-            prior_small = float(prior_results.get("small", {}).get("rps", 0) or 0)
-            gain_pct = ((current_small - prior_small) / prior_small * 100) if prior_small else 0.0
-            keep_group = should_stop and gain_pct >= optimization_min_gain_pct
-            decision = (
-                f"Kept optimization group {candidate.get('name')} (small {gain_pct:+.1f}%)"
-                if keep_group
-                else f"Reverted optimization group {candidate.get('name')} (small {gain_pct:+.1f}%)"
+        if iteration_degraded and getattr(diagnosis, "system_applied", False):
+            # Revert this iteration's sysctl params
+            # get_facts returns ORDER BY created_at — safe to slice by count
+            all_facts = memory.get_facts(session_id, type="fix")
+            iteration_facts = all_facts[pre_iteration_fact_count:]
+            reverted = _revert_iteration_params(deps, iteration_facts)
+            if reverted:
+                logger.status(
+                    "rollback",
+                    f"Iteration {iteration}: Reverted {len(reverted)} sysctl params "
+                    f"(small {current_small_rps:.0f} < best {best_iteration_rps:.0f})",
+                )
+                _mark_facts_reverted(
+                    deps, session_id, iteration_facts, iteration, memory
+                )
+        elif iteration_degraded:
+            # Degraded but no system params applied — nothing to revert
+            logger.status(
+                "iteration",
+                f"Iteration {iteration}: Degraded (small {current_small_rps:.0f} "
+                f"< best {best_iteration_rps or baseline_rps:.0f}) but no sysctl "
+                f"params to revert",
             )
-            if keep_group:
-                healthy_results = dict(iteration_finals)
-                final_results = dict(iteration_finals)
-                if current_small > float(best_results.get("small", {}).get("rps", 0) or 0):
-                    best_results = dict(iteration_finals)
-                    best_iteration = iteration
-            else:
-                _revert_optimization_group(deps, snapshot)
-                rejected_optimization_groups.add(candidate.get("name", "unknown"))
-                final_results = dict(healthy_results or baselines)
-
-            _save_optimization_outcome(
-                memory,
-                session_id,
-                iteration,
-                candidate,
-                decision=decision,
-                kept=keep_group,
-                baseline_results=prior_results,
-                benchmark_results=iteration_finals,
-                applied=getattr(diagnosis, "optimization_apply", {}),
-                reverted=not keep_group,
-            )
-            logger.status("iteration", f"Iteration {iteration}: {decision}")
-            diagnosis_agent.save_iteration_summary(
-                deps,
-                iteration=iteration,
-                baselines=baselines,
-                results=iteration_finals,
-                regressions=regressions,
-                decision=decision,
-                diagnosis=diagnosis,
-            )
-            if iteration >= max_iterations:
-                break
-            continue
+        else:
+            best_iteration_finals = dict(iteration_finals)
+            best_iteration_rps = current_small_rps
 
         if should_stop:
-            current_small = float(iteration_finals.get("small", {}).get("rps", 0) or 0)
-            best_small = top_runs[0]["small_rps"] if top_runs else 0
-            healthy_results = dict(iteration_finals)
-            final_results = dict(iteration_finals)
-            if current_small > float(best_results.get("small", {}).get("rps", 0) or 0):
-                best_results = dict(iteration_finals)
-                best_iteration = iteration
-            if (
-                optimization_enabled
-                and has_top_runs
-                and current_small < best_small * (1 - (optimization_gap_pct / 100.0))
-                and iteration < max_iterations
-            ):
-                decision = (
-                    f"All workloads OK but small={current_small:.0f} < "
-                    f"best={best_small:.0f} — entering optimization mode"
-                )
-                logger.status("iteration", f"Iteration {iteration}: {decision}")
-                diagnosis_agent.save_iteration_summary(
-                    deps,
-                    iteration=iteration,
-                    baselines=baselines,
-                    results=iteration_finals,
-                    regressions=regressions,
-                    decision=decision,
-                    diagnosis=diagnosis,
-                )
-                in_optimization_mode = True
-                continue
-
             decision = f"All workloads OK — stopping after iteration {iteration}"
             logger.status("iteration", f"Iteration {iteration}: {decision}")
             diagnosis_agent.save_iteration_summary(
@@ -748,6 +407,7 @@ async def run(model, deps: AgentDeps) -> str:
             )
             break
 
+        # Continuing to next iteration
         decision = f"{len(regressions)} regressions — continuing to iteration {iteration + 1}"
         logger.status("iteration", f"Iteration {iteration}: {decision}")
         diagnosis_agent.save_iteration_summary(
@@ -784,15 +444,8 @@ async def run(model, deps: AgentDeps) -> str:
 
     if max_phase <= 3:
         logger.status("main", "Stopping after Phase 3 planning (RCA + recommendations)")
+        memory.update_profile(session_id, status="completed")
         _save_token_usage(memory, session_id, deps.token_counter)
-        fixes_applied_count = len(memory.get_facts(session_id, type="fix") or [])
-        memory.complete_session(
-            session_id,
-            total_tokens=deps.token_counter.total,
-            fixes_applied=fixes_applied_count,
-            rps_start=baseline_rps,
-            rps_end=baseline_rps,
-        )
         token_history = memory.get_token_history()
         report_path = reporter.generate(
             session_id,
@@ -815,16 +468,23 @@ async def run(model, deps: AgentDeps) -> str:
         )
         return report_path
 
-    best_rps = float(best_results.get("small", {}).get("rps", baseline_rps) or baseline_rps)
+    # Update best RPS from agent's result
+    best_rps = baseline_rps
+    diagnosis_after_rps = getattr(diagnosis, "after_rps", None)
+    if diagnosis_after_rps is None:
+        fixes_applied = getattr(diagnosis, "fixes_applied", []) or []
+        diagnosis_after_rps = max((fix.get("after_rps", 0) for fix in fixes_applied), default=0)
+    if diagnosis_after_rps > best_rps:
+        best_rps = diagnosis_after_rps
     memory.update_profile(session_id, best_rps=best_rps)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6: Final benchmarks (direct — no LLM)
     # Reuse last iteration results if available; otherwise run fresh.
     # ══════════════════════════════════════════════════════════════════════════
-    if final_results:
-        logger.step("Step 6: Using last iteration benchmark as final results...")
-        finals = final_results
+    if iteration_finals:
+        logger.step("Step 6: Using best iteration benchmark as final results...")
+        finals = best_iteration_finals if best_iteration_finals else iteration_finals
         # Run telemetry capture for the final state
         _capture_telemetry(deps, scope="final", source="post")
     elif bench_tool == "hackathon":
@@ -860,25 +520,11 @@ async def run(model, deps: AgentDeps) -> str:
                 runner=lambda: _run_wrk2_benchmarks(deps, cfg, "Final", session_id),
             )
 
+    # Update best_rps from actual final benchmarks
     final_small_rps = finals.get("small", {}).get("rps", finals.get("homepage", {}).get("rps", 0))
+    if final_small_rps > best_rps:
+        best_rps = final_small_rps
     memory.update_profile(session_id, best_rps=best_rps)
-
-    final_effective_config = _capture_final_effective_config(deps, session_id, memory)
-
-    # Persist final results to benchmarks table (permanent, not session-scoped)
-    for workload in ("homepage", "small", "medium", "large", "mixed"):
-        wl_data = finals.get(workload, {})
-        if wl_data.get("rps"):
-            memory.save_benchmark(
-                session_id=session_id,
-                iteration_num=iteration,
-                phase="final",
-                payload_size=workload,
-                rps=wl_data.get("rps"),
-                latency_p99_ms=wl_data.get("p99"),
-                cpu_pct=wl_data.get("cpu_pct"),
-                mem_pct=wl_data.get("mem_mb"),
-            )
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6.5: Capture system throughput limits (direct — no LLM)
@@ -953,39 +599,13 @@ async def run(model, deps: AgentDeps) -> str:
         )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 7.5: Leaderboard check (query TiDB — no LLM)
-    # ══════════════════════════════════════════════════════════════════════════
-    leaderboard = check_leaderboard(memory, finals)
-    if leaderboard.get("qualifies") and leaderboard.get("rank"):
-        rank = leaderboard["rank"]
-        logger.status(
-            "leaderboard",
-            f"This run ranks #{rank} with small={leaderboard['current_small']:.0f} RPS",
-        )
-        if leaderboard.get("beats_best"):
-            logger.status("leaderboard", "NEW BEST RUN!")
-    else:
-        top = get_top_runs(memory)
-        floor = top[-1]["small_rps"] if top else 0
-        logger.status(
-            "leaderboard",
-            f"Did not qualify (floor: small>{floor:.0f}, medium>={1300}, large>={180})",
-        )
-
-    # ══════════════════════════════════════════════════════════════════════════
     # STEP 8: Generate report (template — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 8: Generating report...")
 
     _save_token_usage(memory, session_id, deps.token_counter)
-    fixes_applied_count = len(memory.get_facts(session_id, type="fix") or [])
-    memory.complete_session(
-        session_id,
-        total_tokens=deps.token_counter.total,
-        fixes_applied=fixes_applied_count,
-        rps_start=baseline_rps,
-        rps_end=final_small_rps,
-    )
+
+    memory.update_profile(session_id, status="completed")
 
     token_history = memory.get_token_history()
 
@@ -995,9 +615,6 @@ async def run(model, deps: AgentDeps) -> str:
         deps.token_counter,
         baselines=baselines,
         finals=finals,
-        final_effective_config=final_effective_config,
-        best_results=best_results,
-        best_iteration=best_iteration,
         stability=stability_data,
         throughput=throughput_info,
         token_history=token_history,
@@ -1012,8 +629,7 @@ async def run(model, deps: AgentDeps) -> str:
         "SlayMetricsAgent Complete",
         f"Session: {session_id}\n"
         f"Baseline (small): {baseline_rps:.1f} req/sec\n"
-        f"Best achieved (small): {best_rps:.1f} req/sec\n"
-        f"Final state (small):   {final_small_rps:.1f} req/sec\n"
+        f"Best (small):     {best_rps:.1f} req/sec\n"
         f"Improvement: {total_improvement:+.1f}%\n"
         f"Nginx applied: {nginx_applied}, System applied: {system_applied}\n"
         f"Tokens used: {deps.token_counter.summary()}\n"
@@ -1032,29 +648,6 @@ async def run(model, deps: AgentDeps) -> str:
             },
             metadata={"session_id": session_id},
         )
-
-    # Collect all applied params from knowledge for final Slack summary
-    _final_applied: dict[str, dict[str, str]] = {}
-    for fact in memory.get_facts(session_id, type="fix") or []:
-        param = fact.get("parameter", "")
-        cat = param.split(".")[0] if "." in param else "webserver"
-        key = param.split(".", 1)[1] if "." in param else param
-        _final_applied.setdefault(cat, {})[key] = fact.get("after_value", "")
-
-    # Determine leaderboard position
-    _lb = check_leaderboard(memory, finals)
-    _lb_pos = _lb.get("position") if _lb.get("qualified") else None
-
-    slack.notify_run_complete(
-        session_id=session_id,
-        baselines=baselines,
-        finals=finals,
-        total_tokens=deps.token_counter.total,
-        leaderboard_position=_lb_pos,
-        report_path=report_path,
-        applied_params=_final_applied,
-    )
-
     return report_path
 
 
@@ -1086,7 +679,6 @@ def _build_context_prompt(
     checks_summary,
     benchmark_evidence_text,
     prior_fixes=None,
-    prior_knowledge: str = "",
 ) -> str:
     checks_text = "\n".join(checks_summary)
 
@@ -1096,13 +688,11 @@ def _build_context_prompt(
         prior_text += ", ".join(f"{pf['parameter']}" for pf in prior_fixes)
         prior_text += "\n"
 
-    knowledge_text = f"\n{prior_knowledge}\n" if prior_knowledge else ""
-
     return f"""{rhel_ver} | {kernel_ver} | {cpu_cores} CPU | {ram_gb}GB
 Checks: {checks_text}
 Benchmark Evidence:
 {benchmark_evidence_text}
-{prior_text}{knowledge_text}
+{prior_text}
 Inspect, apply proven fixes, benchmark after, save_findings.
 """
 
@@ -1173,6 +763,81 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_SYSCTL_PREFIXES = ("net.", "vm.", "kernel.", "fs.")
+
+
+_SAFE_SYSCTL_VALUE = re.compile(r"^[\w./:\- ]+$")
+
+
+def _revert_iteration_params(
+    deps: Any, iteration_facts: list[dict]
+) -> list[dict[str, str]]:
+    """Revert sysctl params applied in this iteration using before_value from saved facts."""
+    sysctl_reverts: list[tuple[str, str]] = []
+    for fact in iteration_facts:
+        param = fact.get("parameter", "")
+        before = fact.get("before_value", "")
+        if not before or not any(param.startswith(p) for p in _SYSCTL_PREFIXES):
+            continue
+        # Sanitize values to prevent command injection
+        if not _SAFE_SYSCTL_VALUE.match(param) or not _SAFE_SYSCTL_VALUE.match(before):
+            logger.log(
+                "rollback",
+                f"Skipping revert of {param!r} — unsafe characters in param or value",
+                "warning",
+            )
+            continue
+        # Strip kernel. prefix if present (e.g. kernel.net.core.somaxconn → net.core.somaxconn)
+        sysctl_param = param
+        if param.startswith("kernel.") and any(
+            param[7:].startswith(p) for p in ("net.", "vm.", "fs.")
+        ):
+            sysctl_param = param[7:]
+        sysctl_reverts.append((sysctl_param, before))
+
+    if not sysctl_reverts:
+        return []
+
+    script_lines = [f"sysctl -w {p}={v}" for p, v in sysctl_reverts]
+    script = " && ".join(script_lines)
+    result = deps.ssh.execute(script)
+
+    if not getattr(result, "ok", True):
+        logger.log(
+            "rollback",
+            f"SSH revert failed: {getattr(result, 'stderr', '') or getattr(result, 'output', '')}",
+            "error",
+        )
+        return []
+
+    return [{"parameter": p, "reverted_to": v} for p, v in sysctl_reverts]
+
+
+def _mark_facts_reverted(
+    deps: Any,
+    session_id: str,
+    iteration_facts: list[dict],
+    iteration: int,
+    memory: Any,
+) -> None:
+    """Mark this iteration's applied facts as reverted in TiDB knowledge store."""
+    for fact in iteration_facts:
+        param = fact.get("parameter", "")
+        if not any(param.startswith(p) for p in _SYSCTL_PREFIXES):
+            continue
+        if not fact.get("before_value"):
+            continue
+        memory.save_fact(
+            session_id=session_id,
+            type="fix",
+            parameter=param,
+            reasoning=f"Reverted: iteration {iteration} caused performance regression",
+            before_value=fact.get("after_value", ""),
+            after_value=fact.get("before_value", ""),
+            status="reverted",
+        )
+
+
 def _check_iteration_exit(
     baselines: dict[str, Any],
     current_results: dict[str, Any],
@@ -1240,191 +905,6 @@ def _build_iteration_feedback(
             "Do NOT revert changes that improved other workloads."
         )
     return "\n".join(lines)
-
-
-def _collect_current_state(deps: AgentDeps) -> dict[str, str]:
-    from agents.tools_inspect import inspect_all
-
-    inspection = inspect_all(deps.ssh, deps.config)
-    current: dict[str, str] = {}
-    for category in ("webserver", "kernel"):
-        category_current = (inspection.get(category) or {}).get("current") or {}
-        for param, value in category_current.items():
-            current[f"{category}.{param}"] = str(value)
-    return current
-
-
-def _snapshot_optimization_state(deps: AgentDeps, candidate: dict[str, Any]) -> dict[str, Any]:
-    changes = candidate.get("changes", {}) or {}
-    snapshot: dict[str, Any] = {
-        "kernel": dict(candidate.get("current", {}) or {}),
-        "nginx_backup_dir": None,
-    }
-    if changes.get("webserver"):
-        config_path = deps.config["service"]["config_path"]
-        backup_dir = f"/tmp/slay_opt_{deps.session_id}_{getattr(deps, 'iteration', 0)}"
-        deps.ssh.execute(
-            "mkdir -p {dir}/conf.d && "
-            "cp {config} {dir}/nginx.conf && "
-            "cp -a /etc/nginx/conf.d/. {dir}/conf.d/ 2>/dev/null || true".format(
-                dir=backup_dir,
-                config=config_path,
-            ),
-            timeout=20,
-        )
-        snapshot["nginx_backup_dir"] = backup_dir
-    return snapshot
-
-
-def _apply_optimization_group(deps: AgentDeps, candidate: dict[str, Any]) -> dict[str, Any]:
-    from agents.tools_apply import apply_kernel
-
-    changes = candidate.get("changes", {}) or {}
-    results: dict[str, Any] = {}
-    web_changes = changes.get("webserver") or {}
-    if web_changes:
-        applied: list[str] = []
-        failed: list[str] = []
-        for param, value in web_changes.items():
-            if deps.adapter.apply_config(param, value):
-                applied.append(param)
-            else:
-                failed.append(param)
-        reload_result = deps.ssh.execute("nginx -t 2>&1 && nginx -s reload 2>&1", timeout=20)
-        results["webserver"] = {
-            "applied": applied,
-            "failed": failed,
-            "reload_ok": reload_result.exit_code == 0,
-        }
-    kernel_changes = changes.get("kernel") or {}
-    if kernel_changes:
-        results["kernel"] = apply_kernel(deps.ssh, kernel_changes)
-    return results
-
-
-def _revert_optimization_group(deps: AgentDeps, snapshot: dict[str, Any]) -> None:
-    from agents.tools_apply import apply_kernel
-
-    backup_dir = snapshot.get("nginx_backup_dir")
-    if backup_dir:
-        config_path = deps.config["service"]["config_path"]
-        deps.ssh.execute(
-            "cp {dir}/nginx.conf {config} && "
-            "rm -rf /etc/nginx/conf.d && mkdir -p /etc/nginx/conf.d && "
-            "cp -a {dir}/conf.d/. /etc/nginx/conf.d/ 2>/dev/null || true && "
-            "nginx -t 2>&1 && nginx -s reload 2>&1".format(
-                dir=backup_dir,
-                config=config_path,
-            ),
-            timeout=30,
-        )
-    kernel_snapshot = {}
-    for full_param, value in (snapshot.get("kernel") or {}).items():
-        if not full_param.startswith("kernel."):
-            continue
-        param = full_param.split(".", 1)[1]
-        if value and value not in ("unknown", "not set"):
-            kernel_snapshot[param] = value
-    if kernel_snapshot:
-        apply_kernel(deps.ssh, kernel_snapshot)
-
-
-def _save_optimization_considered(
-    memory, session_id: str, iteration: int, groups: list[dict[str, Any]]
-):
-    payload = [
-        {
-            "name": group["name"],
-            "score": group["score"],
-            "risk": group["risk"],
-            "reasons": group["reasons"],
-            "changes": group["changes"],
-            "params_text": _format_group_changes(group["changes"]),
-        }
-        for group in groups
-    ]
-    memory.save_context(
-        session_id,
-        "command_output",
-        f"optimization_considered_iter{iteration}",
-        json.dumps(payload),
-        f"optimization iter {iteration}: considered {len(groups)} groups",
-    )
-
-
-def _save_optimization_outcome(
-    memory,
-    session_id: str,
-    iteration: int,
-    candidate: dict[str, Any],
-    *,
-    decision: str,
-    kept: bool,
-    baseline_results: dict[str, Any],
-    benchmark_results: dict[str, Any],
-    applied: dict[str, Any],
-    reverted: bool,
-) -> None:
-    memory.save_context(
-        session_id,
-        "command_output",
-        f"optimization_decision_iter{iteration}_{candidate.get('name', 'unknown')}",
-        json.dumps(
-            {
-                "group": candidate.get("name"),
-                "score": candidate.get("score"),
-                "risk": candidate.get("risk"),
-                "reasons": candidate.get("reasons", []),
-                "changes": candidate.get("changes", {}),
-                "params_text": _format_group_changes(candidate.get("changes", {})),
-                "decision": decision,
-                "kept": kept,
-                "reverted": reverted,
-                "baseline_results": baseline_results,
-                "benchmark_results": benchmark_results,
-                "applied": applied,
-            }
-        ),
-        decision,
-    )
-
-    # Persist optimization outcomes as validations on the logical fix identity.
-    # This keeps the knowledge row stable and lets future ranking learn from
-    # confirmed/contradicted history without deprecating the fact itself.
-    group_changes = candidate.get("changes", {}) or {}
-    group_name = candidate.get("name", "unknown")
-    baseline_small = float(baseline_results.get("small", {}).get("rps", 0) or 0)
-    benchmark_small = float(benchmark_results.get("small", {}).get("rps", 0) or 0)
-    small_delta_pct = (
-        ((benchmark_small - baseline_small) / baseline_small * 100) if baseline_small else None
-    )
-    validation_outcome = "confirmed" if kept else "contradicted"
-    for category, params in group_changes.items():
-        if not isinstance(params, dict):
-            continue
-        for param, value in params.items():
-            full_param = f"{category}.{param}"
-            current_values = candidate.get("current", {}) or {}
-            memory.save_optimization_validation(
-                session_id=session_id,
-                parameter=full_param,
-                reasoning=f"optimization group '{group_name}'",
-                before_value=str(current_values.get(full_param, "")),
-                after_value=str(value),
-                outcome=validation_outcome,
-                before_rps=baseline_small or None,
-                after_rps=benchmark_small or None,
-                impact_pct=small_delta_pct,
-                notes=decision,
-            )
-
-
-def _format_group_changes(changes: dict[str, dict[str, str]]) -> str:
-    parts: list[str] = []
-    for category in ("webserver", "kernel", "resource_limits", "network", "storage"):
-        for param, value in (changes.get(category) or {}).items():
-            parts.append(f"{param}={value}")
-    return ", ".join(parts) if parts else "none"
 
 
 def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) -> dict[str, Any]:
@@ -1626,33 +1106,6 @@ def _run_hackathon_benchmark(deps, cfg, label, session_id):
 
     contestant = f"{name}-{label}"
     results_dir = "/root/hackathon-results"
-
-    # Healthcheck: verify nginx is alive before benchmarking.
-    # Run from bench host (System 2) using the same target_host the benchmark uses.
-    health = deps.bench.execute(
-        f"curl -s -o /dev/null -w '%{{http_code}}' http://{target_host}/ 2>/dev/null",
-        timeout=10,
-    )
-    if health.stdout.strip() != "200":
-        logger.status(
-            "benchmark",
-            f"nginx healthcheck FAILED (HTTP {health.stdout.strip()}) — restarting",
-        )
-        # Restart on the DUT via SSH
-        deps.ssh.execute("nginx -t 2>&1 && systemctl restart nginx 2>&1", timeout=15)
-        import time
-
-        time.sleep(2)
-        # Re-check from bench host
-        health2 = deps.bench.execute(
-            f"curl -s -o /dev/null -w '%{{http_code}}' http://{target_host}/ 2>/dev/null",
-            timeout=10,
-        )
-        if health2.stdout.strip() != "200":
-            logger.status(
-                "benchmark",
-                f"nginx still down after restart (HTTP {health2.stdout.strip()})",
-            )
 
     # Remove stale JSON files to prevent reading cached results from prior runs
     for wl in HACKATHON_WORKLOADS:

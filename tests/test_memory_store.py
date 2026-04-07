@@ -616,8 +616,13 @@ def test_update_knowledge_confidence_confirmed(monkeypatch):
 def test_update_knowledge_confidence_contradicted(monkeypatch):
     store, conn = _setup(monkeypatch)
     store._update_knowledge_confidence("kid-1", "contradicted")
-    _, params = conn.executed[-1]
+    # confidence update is second-to-last; auto-deprecation query is last
+    _, params = conn.executed[-2]
     assert params[0] == pytest.approx(-0.15)
+    # auto-deprecation query should target the same knowledge_id
+    depr_query, depr_params = conn.executed[-1]
+    assert "deprecated" in depr_query
+    assert depr_params[0] == "kid-1"
 
 
 def test_update_knowledge_confidence_partial(monkeypatch):

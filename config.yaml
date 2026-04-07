@@ -241,4 +241,4 @@ slack:
 
 telemetry:
   langfuse:
-    enabled: true
+    enabled: false 

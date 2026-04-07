@@ -866,6 +866,16 @@ class TiDBStore:
                 """,
                 (delta, knowledge_id),
             )
+            # Auto-deprecate knowledge that falls below confidence threshold
+            if outcome == "contradicted":
+                cur.execute(
+                    """
+                    UPDATE knowledge
+                    SET status = 'deprecated'
+                    WHERE id = %s AND confidence < 0.2 AND status = 'active'
+                    """,
+                    (knowledge_id,),
+                )
 
     def get_validations(self, knowledge_id: str) -> list[dict]:
         with self._cursor() as cur:
