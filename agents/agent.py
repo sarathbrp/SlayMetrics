@@ -2212,6 +2212,11 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
         "You are a RHEL system administrator. The DUT (device under test) "
         "is failing to serve some workload URLs correctly. "
         "Diagnose the root cause and provide exact shell commands to fix it.\n\n"
+        "IMPORTANT RULES:\n"
+        "- Do NOT insert directives that already exist in the config file. "
+        "Use 'sed -i s/old/new/' to REPLACE existing values, never append duplicates.\n"
+        "- For nginx, always use 'sed -i' to modify existing directives in-place.\n"
+        "- Always run 'nginx -t' before 'systemctl restart nginx' to validate.\n\n"
         "Return strict JSON with keys:\n"
         '- "diagnosis": one-sentence root cause\n'
         '- "fixes": list of shell commands to run on the DUT to fix the issue\n\n'
@@ -2241,6 +2246,13 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
             if not cmd_str or cmd_str.startswith("#"):
                 continue
             tool_call("preflight_fix", cmd_str[:100])
+            # Guard: validate nginx config before restart/reload to avoid downtime
+            if "restart nginx" in cmd_str or "reload nginx" in cmd_str:
+                test_r = ssh.execute("nginx -t 2>&1", timeout=10)
+                if "syntax is ok" not in test_r.stdout and "test is successful" not in test_r.stdout:
+                    tool_result("preflight_fix", f"SKIPPED restart — nginx -t failed: {test_r.stdout[:150]}")
+                    fixes_applied.append({"command": cmd_str, "ok": False, "output": "skipped: config invalid"})
+                    continue
             cmd_result = ssh.execute(cmd_str, timeout=120)
             fixes_applied.append(
                 {
