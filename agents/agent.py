@@ -32,7 +32,7 @@ class GraphState(TypedDict):
 class DiagnosisOutput:
     """Canonical internal diagnosis result built in Python after the graph run."""
 
-    nginx_applied: bool
+    service_applied: bool
     system_applied: bool
     after_rps: float = 0.0
     improvement_pct: float = 0.0
@@ -58,7 +58,7 @@ SYSTEM_PROMPT = """\
 You are SlayMetricsAgent.
 
 Diagnostic sequence:
-1. Inspect NGINX configuration first.
+1. Inspect service configuration first.
 2. Inspect RHEL/kernel/system tuning second.
 3. Inspect IRQ distribution and CPU affinity last.
 4. Save structured RCA via save_rca after all three stages are reviewed.
@@ -68,14 +68,14 @@ Diagnostic sequence:
 Do not benchmark or apply changes during planning. Python will do one combined apply
 and one benchmark after planning is complete.
 
-For apply_nginx_tuning and apply_system_tuning:
+For apply_service_tuning and apply_system_tuning:
 - Pass a structured object under the changes field
 - Example: {"changes":{"access_log":"off","listen_backlog":"65535"}}
 - If needed, you may also pass directive names directly as tool arguments instead of nesting them
 
 For save_findings:
 - Pass a structured list under the findings field
-- Example: {"findings":[{"parameter":"nginx.access_log","before_value":"on","after_value":"off"}]}
+- Example: {"findings":[{"parameter":"service.access_log","before_value":"on","after_value":"off"}]}
 
 For save_rca:
 - Pass a structured list under the records field
@@ -87,10 +87,10 @@ For save_recommendations:
 - Pass a structured list under the recommendations field
 - Each recommendation must include title, recommendation, rationale,
   expected_benefit, risk_level, validation, scope, changes
-- scope must be nginx or system
+- scope must be service or system
 - changes must be a structured object of parameter -> target value
 - risk_level should be low, medium, or high
-- Example: {"recommendations":[{"title":"Raise limit","scope":"nginx","changes":{"aio":"threads"}}]}
+- Example: {"recommendations":[{"title":"Raise limit","scope":"service","changes":{"aio":"threads"}}]}
 
 Use the inspect tool outputs as the source of truth for current values and candidate target values.
 Do not invent target values outside the inspect outputs.
@@ -98,12 +98,12 @@ Do not invent target values outside the inspect outputs.
 Do NOT apply gzip — test files are random binary data, compression wastes CPU.
 
 Rules:
-- Stage 1 must focus on NGINX configuration only.
+- Stage 1 must focus on service configuration only.
 - Stage 2 must focus on RHEL/kernel/system tuning only.
 - Stage 3 must focus on IRQ distribution / CPU affinity evidence only.
 - Only recommend IRQ-related action if the IRQ stage evidence supports it.
 - Skip already-applied fixes, no packages, no reboot, no pre-fix benchmark.
-- Do not call apply_nginx_tuning, apply_system_tuning, run_benchmark,
+- Do not call apply_service_tuning, apply_system_tuning, run_benchmark,
   or save_findings yourself; Python will execute saved recommendations
   after you finish planning.
 """
@@ -192,7 +192,7 @@ class DiagnosisWorkflow:
 
 def build(model, config=None) -> DiagnosisWorkflow:
     state: dict[str, Any] = {
-        "nginx_applied": False,
+        "service_applied": False,
         "system_applied": False,
         "after_rps": 0.0,
         "after_p99_ms": 0.0,
@@ -291,11 +291,11 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
     _tuning_cfg = (config or {}).get("tuning") or {}
     # Build allowlists from new config categories (webserver_targets, kernel_targets)
-    # with backward compat for old nginx_targets/system_targets
-    nginx_targets: dict[str, str] = {
+    # with backward compat for old service_targets/system_targets
+    service_targets: dict[str, str] = {
         str(k): str(v)
         for k, v in (
-            _tuning_cfg.get("webserver_targets") or _tuning_cfg.get("nginx_targets") or {}
+            _tuning_cfg.get("webserver_targets") or _tuning_cfg.get("service_targets") or {}
         ).items()
     }
     system_targets: dict[str, str] = {
@@ -358,7 +358,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
         )
         current = {
             "irq_lines": interrupts.strip()[:2000] or "no ethernet IRQs found",
-            "nginx_worker_cores": sorted(set(worker_cores)),
+            "service_worker_cores": sorted(set(worker_cores)),
             "worker_core_spread": len(set(worker_cores)),
             "telemetry_run_queue_max": summary.get("run_queue_max", 0),
             "telemetry_rx_drop_delta": summary.get("rx_drop_delta", 0),
@@ -404,46 +404,39 @@ def build(model, config=None) -> DiagnosisWorkflow:
         state["irq_inspection"] = result
         return result
 
-    def inspect_nginx_impl(deps: AgentDeps) -> dict:
-        tool_call("inspect", "nginx config — stage 1 analysis")
-        raw = deps.ssh.execute("nginx -T 2>/dev/null").stdout
-        current: dict[str, str] = {}
-        for directive in nginx_targets:
-            if directive == "listen_backlog":
-                match = re.search(r"listen\s+.*backlog=(\d+)", raw)
-                current[directive] = match.group(1) if match else "not set"
-            else:
-                match = re.search(rf"^\s*{directive}\s+(.+?);", raw, re.MULTILINE)
-                current[directive] = match.group(1).strip() if match else "not set"
+    def inspect_service_impl(deps: AgentDeps) -> dict:
+        svc_name = (deps.config.get("service") or {}).get("name", "service")
+        tool_call("inspect", f"{svc_name} config — stage 1 analysis")
 
-        needs_fixing = {}
-        already_ok = []
-        for parameter, target in nginx_targets.items():
-            cur = current.get(parameter, "not set")
-            if cur == "not set" or cur != target:
-                needs_fixing[parameter] = {"current": cur, "target": target}
-            else:
-                already_ok.append(parameter)
+        # Delegate to adapter — each adapter knows how to inspect its own service
+        adapter_result = deps.adapter.inspect(service_targets)
+        needs_fixing = adapter_result.get("needs_fixing", {})
+        current = adapter_result.get("current", {})
+        ok_count = adapter_result.get("ok_count", 0)
 
-        result = {"needs_fixing": needs_fixing, "already_ok": already_ok, "current": current}
+        result = {
+            "needs_fixing": needs_fixing,
+            "already_ok": [p for p in service_targets if p not in needs_fixing],
+            "current": current,
+        }
         _langfuse_event(
             deps,
-            "tool.inspect_nginx_config",
-            input={"directive_count": len(nginx_targets)},
+            "tool.inspect_service_config",
+            input={"directive_count": len(service_targets)},
             output=result,
         )
         deps.token_counter.tool_calls += 1
         deps.memory.save_context(
             deps.session_id,
             "command_output",
-            "inspect_nginx",
+            "inspect_service",
             str(result),
-            f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} ok",
+            f"{svc_name}: {len(needs_fixing)} need fixing, {ok_count} ok",
         )
         tool_result(
-            "inspect", f"nginx: {len(needs_fixing)} need fixing, {len(already_ok)} already ok"
+            "inspect", f"{svc_name}: {len(needs_fixing)} need fixing, {ok_count} already ok"
         )
-        state["nginx_inspection"] = result
+        state["service_inspection"] = result
         return result
 
     def inspect_system_impl(deps: AgentDeps) -> dict:
@@ -508,16 +501,16 @@ def build(model, config=None) -> DiagnosisWorkflow:
         state["system_inspection"] = result
         return result
 
-    def apply_nginx_impl(
+    def apply_service_impl(
         deps: AgentDeps, changes: dict[str, str] | str | None, **kwargs: Any
     ) -> dict:
-        normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_nginx")
+        normalized_changes, parse_error = _coerce_tool_changes(changes, kwargs, "apply_service")
         if parse_error:
-            tool_call("apply_nginx", "invalid input payload")
-            tool_result("apply_nginx", f"FAILED: {parse_error}")
+            tool_call("apply_service", "invalid input payload")
+            tool_result("apply_service", f"FAILED: {parse_error}")
             _langfuse_event(
                 deps,
-                "tool.apply_nginx_tuning",
+                "tool.apply_service_tuning",
                 input={"changes": changes, "kwargs": kwargs},
                 output={"error": parse_error},
                 level="ERROR",
@@ -533,11 +526,11 @@ def build(model, config=None) -> DiagnosisWorkflow:
             changes_dict = {key: value for key, value in changes_dict.items() if key in allowed}
             if unsupported and not changes_dict:
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
-                tool_call("apply_nginx", "unsupported directives")
-                tool_result("apply_nginx", f"FAILED: {error}")
+                tool_call("apply_service", "unsupported directives")
+                tool_result("apply_service", f"FAILED: {error}")
                 _langfuse_event(
                     deps,
-                    "tool.apply_nginx_tuning",
+                    "tool.apply_service_tuning",
                     input={"changes": changes_dict, "unsupported": unsupported},
                     output={"error": error},
                     level="ERROR",
@@ -545,7 +538,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 deps.token_counter.tool_calls += 1
                 return {"applied": [], "failed": unsupported, "reload": "FAILED", "error": error}
 
-        tool_call("apply_nginx", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
+        tool_call("apply_service", f"{len(changes_dict)} changes: {', '.join(changes_dict.keys())}")
 
         config_path = deps.config["service"]["config_path"]
         batch_backup = f"/tmp/slay_nginx_batch_{deps.session_id}.conf"
@@ -574,10 +567,10 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     f"applied={applied} failed={failed}",
                     "nginx batch apply",
                 )
-                tool_result("apply_nginx", f"FAILED: {result['error']}")
+                tool_result("apply_service", f"FAILED: {result['error']}")
                 _langfuse_event(
                     deps,
-                    "tool.apply_nginx_tuning",
+                    "tool.apply_service_tuning",
                     input={"changes": changes_dict},
                     output=result,
                     level="ERROR",
@@ -602,10 +595,10 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 f"applied={applied} failed={failed}",
                 "nginx batch apply failed",
             )
-            tool_result("apply_nginx", f"FAILED: {error_msg}")
+            tool_result("apply_service", f"FAILED: {error_msg}")
             _langfuse_event(
                 deps,
-                "tool.apply_nginx_tuning",
+                "tool.apply_service_tuning",
                 input={"changes": changes_dict},
                 output=result,
                 level="ERROR",
@@ -618,7 +611,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
             result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
         deps.token_counter.tool_calls += 1
-        state["nginx_applied"] = state["nginx_applied"] or bool(applied and reload_ok)
+        state["service_applied"] = state["service_applied"] or bool(applied and reload_ok)
         summary = f"applied={applied} failed={failed} reload={'OK' if reload_ok else 'FAILED'}"
         deps.memory.save_context(
             deps.session_id,
@@ -629,11 +622,11 @@ def build(model, config=None) -> DiagnosisWorkflow:
         )
         _langfuse_event(
             deps,
-            "tool.apply_nginx_tuning",
+            "tool.apply_service_tuning",
             input={"changes": changes_dict},
             output=result,
         )
-        tool_result("apply_nginx", summary)
+        tool_result("apply_service", summary)
         return result
 
     def apply_system_impl(
@@ -993,7 +986,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
             changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
             if parse_error:
                 changes = {}
-            allowed_params = set(nginx_targets) if scope == "nginx" else set(system_targets)
+            allowed_params = set(service_targets) if scope == "nginx" else set(system_targets)
             filtered_changes = {
                 _resolve_param_alias(key): value
                 for key, value in (changes or {}).items()
@@ -1169,8 +1162,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
     def _verify_applied_changes(
         deps: AgentDeps,
-        nginx_applied: list[str] | Any,
-        nginx_changes: dict[str, str],
+        service_applied: list[str] | Any,
+        service_changes: dict[str, str],
         system_applied: dict[str, str],
     ) -> dict[str, Any]:
         """Re-read DUT state and verify changes actually took effect."""
@@ -1178,11 +1171,11 @@ def build(model, config=None) -> DiagnosisWorkflow:
         mismatches: list[dict[str, str]] = []
         fixed: list[str] = []
 
-        # ── Verify nginx directives via nginx -T ────────────────────────
-        if nginx_applied:
+        # ── Verify service directives ────────────────────────────────────
+        if service_applied:
             raw = ssh.execute("nginx -T 2>/dev/null").stdout
-            for param in nginx_applied:
-                expected = nginx_changes.get(param, "")
+            for param in service_applied:
+                expected = service_changes.get(param, "")
 
                 # Skip verify for params where "remove" means absence is correct
                 if expected == "remove" and param in ("limit_req", "limit_conn"):
@@ -1329,7 +1322,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
     ) -> tuple[dict[str, str], dict[str, str]]:
         """Extract nginx and system changes from recommendations.
 
-        Uses nginx_targets/system_targets keys as anchors — scans all text
+        Uses service_targets/system_targets keys as anchors — scans all text
         fields in each recommendation for known parameter names, extracts
         values. Falls back to target defaults if value is unclear.
         No format-specific parsing. Works with ANY LLM output shape.
@@ -1341,7 +1334,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
         all_text = json.dumps(raw_recommendations, ensure_ascii=False)
 
         # For each known target, check if any recommendation mentions it
-        for param, default_value in nginx_targets.items():
+        for param, default_value in service_targets.items():
             if param not in all_text:
                 continue
             # Find the recommendation that mentions this param
@@ -1437,13 +1430,13 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         return None
 
-    def _batch_apply_nginx(deps: AgentDeps, changes: dict[str, str]) -> dict:
+    def _batch_apply_service(deps: AgentDeps, changes: dict[str, str]) -> dict:
         """Apply all nginx changes in a single operation."""
         if not changes:
             return {"applied": [], "failed": [], "reload": "SKIPPED"}
 
         tool_call(
-            "apply_nginx",
+            "apply_service",
             f"batch {len(changes)} directives: {', '.join(changes.keys())}",
         )
 
@@ -1498,16 +1491,16 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         result = {"applied": applied, "failed": failed, "reload": reload_status}
         tool_result(
-            "apply_nginx",
+            "apply_service",
             f"applied={applied} failed={failed} reload={reload_status}",
         )
 
         deps.token_counter.tool_calls += 1
-        state["nginx_applied"] = state["nginx_applied"] or bool(applied)
+        state["service_applied"] = state["service_applied"] or bool(applied)
         deps.memory.save_context(
             deps.session_id,
             "command_output",
-            f"batch_apply_nginx:{','.join(changes.keys())}"[:250],
+            f"batch_apply_service:{','.join(changes.keys())}"[:250],
             json.dumps(result),
             f"nginx batch: {len(applied)} applied, {len(failed)} failed",
         )
@@ -1787,8 +1780,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
         # 5. Webserver LAST (restarts nginx — all caps must be lifted first)
         web_changes = changes_by_cat.get("webserver", {})
         if web_changes:
-            results["webserver"] = _batch_apply_nginx(deps, web_changes)
-            state["nginx_applied"] = True
+            results["webserver"] = _batch_apply_service(deps, web_changes)
+            state["service_applied"] = True
 
         # Log results per category
         for cat, result in results.items():
@@ -1812,8 +1805,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
         kern_applied = results.get("kernel", {}).get("applied", {})
         _verify_applied_changes(
             deps,
-            nginx_applied=web_applied,
-            nginx_changes=web_changes,
+            service_applied=web_applied,
+            service_changes=web_changes,
             system_applied=kern_applied,
         )
 
@@ -1898,8 +1891,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         return {"results": results, "findings": findings}
 
-    async def inspect_nginx_config(ctx) -> dict:
-        return inspect_nginx_impl(ctx.deps)
+    async def inspect_service_config(ctx) -> dict:
+        return inspect_service_impl(ctx.deps)
 
     async def inspect_system_tuning(ctx) -> dict:
         return inspect_system_impl(ctx.deps)
@@ -1907,10 +1900,10 @@ def build(model, config=None) -> DiagnosisWorkflow:
     async def inspect_irq_distribution(ctx) -> dict:
         return inspect_irq_impl(ctx.deps)
 
-    async def apply_nginx_tuning(
+    async def apply_service_tuning(
         ctx, changes: dict[str, str] | str | None = None, **kwargs: Any
     ) -> dict:
-        return apply_nginx_impl(ctx.deps, changes, **kwargs)
+        return apply_service_impl(ctx.deps, changes, **kwargs)
 
     async def apply_system_tuning(
         ctx, changes: dict[str, str] | str | None = None, **kwargs: Any
@@ -1936,9 +1929,9 @@ def build(model, config=None) -> DiagnosisWorkflow:
         from langchain_core.tools import tool
 
         @tool
-        def inspect_nginx_config() -> dict:
+        def inspect_service_config() -> dict:
             """Inspect nginx config and return only what needs fixing vs proven targets."""
-            return inspect_nginx_impl(deps)
+            return inspect_service_impl(deps)
 
         @tool
         def inspect_system_tuning() -> dict:
@@ -1951,9 +1944,9 @@ def build(model, config=None) -> DiagnosisWorkflow:
             return inspect_irq_impl(deps)
 
         @tool
-        def apply_nginx_tuning(changes: dict[str, Any] | str | None = None) -> dict:
+        def apply_service_tuning(changes: dict[str, Any] | str | None = None) -> dict:
             """Apply multiple nginx config changes from a structured changes object."""
-            return apply_nginx_impl(deps, changes)
+            return apply_service_impl(deps, changes)
 
         @tool
         def apply_system_tuning(changes: dict[str, Any] | str | None = None) -> dict:
@@ -1986,7 +1979,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
             return save_recommendations_impl(deps, recommendations)
 
         return [
-            inspect_nginx_config,
+            inspect_service_config,
             inspect_system_tuning,
             inspect_irq_distribution,
             save_rca,
@@ -1995,12 +1988,12 @@ def build(model, config=None) -> DiagnosisWorkflow:
         ]
 
     test_tools = {
-        "inspect_nginx_config": inspect_nginx_config,
+        "inspect_service_config": inspect_service_config,
         "inspect_system_tuning": inspect_system_tuning,
         "inspect_irq_distribution": inspect_irq_distribution,
         "save_rca": save_rca,
         "save_recommendations": save_recommendations,
-        "apply_nginx_tuning": apply_nginx_tuning,
+        "apply_service_tuning": apply_service_tuning,
         "apply_system_tuning": apply_system_tuning,
         "run_benchmark": run_benchmark,
         "query_memory": query_memory,
@@ -2368,7 +2361,7 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
         notes = f"{notes} Guardrail: {guardrail_failure}"
 
     return DiagnosisOutput(
-        nginx_applied=bool(state.get("nginx_applied", False)),
+        service_applied=bool(state.get("service_applied", False)),
         system_applied=bool(state.get("system_applied", False)),
         after_rps=after_rps,
         improvement_pct=improvement_pct,
@@ -2632,12 +2625,14 @@ async def _run_debate_planner(
     _kern_llm = _filter_inspection_for_llm(kernel_data)
 
     _sys_line = getattr(deps, "system_fingerprint", "") or ""
-    from core.prompts import nginx_expert as nginx_expert_prompt
+    from core.prompts import service_expert as service_expert_prompt
     from core.prompts import rhel_expert as rhel_expert_prompt
 
-    nginx_prompt = nginx_expert_prompt.build(
+    _profile = getattr(deps, "service_profile", None)
+    service_prompt = service_expert_prompt.build(
         system_line=_sys_line,
-        webserver_inspection=_web_llm,
+        service_inspection=_web_llm,
+        profile=_profile,
     )
     rhel_prompt = rhel_expert_prompt.build(
         system_line=_sys_line,
@@ -2647,14 +2642,15 @@ async def _run_debate_planner(
         storage_data=storage_data,
     )
 
-    (nginx_analysis, nginx_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
-        asyncio.to_thread(_invoke_json_planner, model, "planner.nginx_expert", nginx_prompt, deps),
+    _svc_name = _profile.name if _profile else "service"
+    (service_analysis, svc_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
+        asyncio.to_thread(_invoke_json_planner, model, f"planner.{_svc_name}_expert", service_prompt, deps),
         asyncio.to_thread(_invoke_json_planner, model, "planner.rhel_expert", rhel_prompt, deps),
     )
     if _planner_debug_enabled(deps):
         tool_result(
             "debug",
-            f"nginx_expert raw:\n{json.dumps(nginx_analysis, indent=2, ensure_ascii=False)}",
+            f"{_svc_name}_expert raw:\n{json.dumps(service_analysis, indent=2, ensure_ascii=False)}",
         )
         tool_result(
             "debug",
@@ -2665,15 +2661,16 @@ async def _run_debate_planner(
 
     synth_prompt = synthesizer_prompt.build(
         system_fingerprint=getattr(deps, "system_fingerprint", "") or "unknown",
-        nginx_analysis=nginx_analysis,
+        service_analysis=service_analysis,
         rhel_analysis=rhel_analysis,
+        service_name=_svc_name.upper(),
     )
     synthesis, synth_usage = _invoke_json_planner(model, "planner.synthesizer", synth_prompt, deps)
     if _planner_debug_enabled(deps):
         tool_result("debug", f"synthesizer raw:\n{json.dumps(synthesis, indent=2, ensure_ascii=False)}")
 
     _iter = getattr(deps, "iteration", 0)
-    _save_planner_artifact(deps, "nginx_expert", nginx_analysis, iteration=_iter)
+    _save_planner_artifact(deps, f"{_svc_name}_expert", service_analysis, iteration=_iter)
     _save_planner_artifact(deps, "rhel_expert", rhel_analysis, iteration=_iter)
     _save_planner_artifact(deps, "synthesizer", synthesis, iteration=_iter)
     _obs_result = _run_observational_debate_eval(
@@ -2681,7 +2678,7 @@ async def _run_debate_planner(
         model,
         iteration=_iter,
         inspection=all_inspection,
-        nginx_analysis=nginx_analysis,
+        service_analysis=service_analysis,
         rhel_analysis=rhel_analysis,
         synthesis=synthesis,
     )
@@ -2698,7 +2695,7 @@ async def _run_debate_planner(
     # ── 4th agent: apply_planner ─────────────────────────────────────
     # Group all recommendations into 5 categories matching our tools.
     _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
-    _web_tgt = _tuning.get("webserver_targets") or {}
+    _web_tgt = _tuning.get("service_targets") or _tuning.get("webserver_targets") or {}
     _kern_tgt = _tuning.get("kernel_targets") or {}
     _res_tgt = _tuning.get("resource_limits_targets") or {}
     _net_tgt = _tuning.get("network_targets") or {}
@@ -2706,7 +2703,7 @@ async def _run_debate_planner(
     from core.prompts import apply_planner as apply_planner_prompt
 
     apply_prompt = apply_planner_prompt.build(
-        webserver_targets=_web_tgt,
+        service_targets=_web_tgt,
         kernel_targets=_kern_tgt,
         resource_limits_targets=_res_tgt,
         network_targets=_net_tgt,
@@ -2762,13 +2759,13 @@ async def _run_debate_planner(
         agent_state["apply_plan"] = apply_plan
 
     total_in = (
-        nginx_usage["input_tokens"]
+        svc_usage["input_tokens"]
         + rhel_usage["input_tokens"]
         + synth_usage["input_tokens"]
         + apply_usage["input_tokens"]
     )
     total_out = (
-        nginx_usage["output_tokens"]
+        svc_usage["output_tokens"]
         + rhel_usage["output_tokens"]
         + synth_usage["output_tokens"]
         + apply_usage["output_tokens"]
@@ -3365,12 +3362,11 @@ def _save_planner_artifact(
         f"{iter_label} planner output",
     )
     file_map = {
-        "nginx_expert": "01_nginx_expert",
         "rhel_expert": "02_rhel_expert",
         "synthesizer": "03_synthesizer",
         "apply_planner": "04_apply_planner",
     }
-    base = file_map.get(source, source)
+    base = file_map.get(source, f"01_{source}" if source.endswith("_expert") else source)
     if iteration:
         filename = f"iter{iteration}_{base}.md"
     else:
@@ -3393,7 +3389,7 @@ def _run_observational_debate_eval(
     *,
     iteration: int,
     inspection: dict[str, Any],
-    nginx_analysis: dict[str, Any],
+    service_analysis: dict[str, Any],
     rhel_analysis: dict[str, Any],
     synthesis: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -3417,7 +3413,7 @@ def _run_observational_debate_eval(
         "iteration": iteration,
         "system": system,
         "inspection": inspection,
-        "nginx_expert": nginx_analysis,
+        "service_expert": service_analysis,
         "rhel_expert": rhel_analysis,
         "synthesizer": synthesis,
         "requested_format": "json",
@@ -3595,9 +3591,9 @@ def save_iteration_summary(
     # Applied changes
     lines.extend(["", "## Applied Changes", ""])
     if diagnosis:
-        nginx_applied = getattr(diagnosis, "nginx_applied", False)
+        svc_applied = getattr(diagnosis, "service_applied", False)
         system_applied = getattr(diagnosis, "system_applied", False)
-        lines.append(f"- Nginx applied: {nginx_applied}")
+        lines.append(f"- Service applied: {svc_applied}")
         lines.append(f"- System applied: {system_applied}")
         recs = getattr(diagnosis, "recommendations", []) or []
         if recs:

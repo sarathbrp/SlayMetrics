@@ -5,6 +5,7 @@ from typing import Any
 
 from adapters.base import ServiceAdapter
 from memory.tidb_store import TiDBStore
+from services import ServiceProfile
 from tools.ssh import LocalClient, SSHClient
 
 
@@ -96,6 +97,7 @@ class AgentDeps:
     token_counter: TokenCounter = field(default_factory=TokenCounter)
     langfuse: Any | None = None
     system_fingerprint: str = ""
+    service_profile: ServiceProfile | None = None
 
     def __post_init__(self) -> None:
         if self.bench is None:

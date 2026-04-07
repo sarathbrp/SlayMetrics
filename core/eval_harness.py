@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-AGENT_WEIGHTS = {"nginx": 0.4, "rhel": 0.4, "synthesizer": 0.2}
+AGENT_WEIGHTS = {"service": 0.4, "rhel": 0.4, "synthesizer": 0.2}
 PASS_THRESHOLDS = {"self_correct": 0.5, "recommended_improvements": 1.0}
 GOLDEN_RANGES = {
     "net.core.somaxconn": (32768, 65535),
@@ -37,14 +37,14 @@ KNOWN_SYNTH_KEY_ALIASES = {
     "selinux": "selinux",
     "system.slice.cpuweight": "cgroup_cpu_weight",
     "user.slice.cpuweight": "cgroup_cpu_weight",
-    "nginx.service.cpuweight": "cgroup_cpu_weight",
-    "nginx.service.ioweight": "cgroup_io_weight",
+    "service.cpuweight": "cgroup_cpu_weight",
+    "service.ioweight": "cgroup_io_weight",
     "conntrack_max": "net.netfilter.nf_conntrack_max",
     "iptablesdropruleonport80": "iptables_drop_rules",
     "iptables.port80_drop": "iptables_drop_rules",
     "numaplacement": "numa_policy",
-    "nginx.cpuaffinity": "numa_policy",
-    "nginx.numanode": "numa_policy",
+    "service.cpuaffinity": "numa_policy",
+    "service.numanode": "numa_policy",
     "tc.qdisc": "tc_rules",
 }
 DRIFT_SENSITIVE_PARAMS = {
@@ -101,7 +101,7 @@ def build_case_bundle_from_session(
     prefix = f"iter{target_iteration}_" if target_iteration else ""
 
     inspection = _load_context_json(by_source, "compound_inspection") or {}
-    nginx_expert = _load_context_json(by_source, f"{prefix}nginx_expert") or {}
+    service_expert = _load_context_json(by_source, f"{prefix}service_expert") or {}
     rhel_expert = _load_context_json(by_source, f"{prefix}rhel_expert") or {}
     synthesizer = _load_context_json(by_source, f"{prefix}synthesizer") or {}
 
@@ -120,7 +120,7 @@ def build_case_bundle_from_session(
         "iteration": target_iteration,
         "system": system,
         "inspection": inspection,
-        "nginx_expert": nginx_expert,
+        "service_expert": service_expert,
         "rhel_expert": rhel_expert,
         "synthesizer": synthesizer,
     }
@@ -131,44 +131,44 @@ def evaluate_case_bundle(
     *,
     synth_judge: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    nginx_findings = evaluate_nginx(bundle)
+    service_findings = evaluate_service(bundle)
     rhel_findings = evaluate_rhel(bundle)
     synth_findings = evaluate_synthesizer(bundle, synth_judge=synth_judge)
 
-    nginx_score = _score_findings(nginx_findings)
+    service_score = _score_findings(service_findings)
     rhel_score = _score_findings(rhel_findings)
     synthesizer_score = _score_findings(synth_findings)
 
     total_score = round(
-        (nginx_score * AGENT_WEIGHTS["nginx"])
+        (service_score * AGENT_WEIGHTS["service"])
         + (rhel_score * AGENT_WEIGHTS["rhel"])
         + (synthesizer_score * AGENT_WEIGHTS["synthesizer"]),
         3,
     )
     action = _action_for_score(total_score)
-    findings = nginx_findings + rhel_findings + synth_findings
+    findings = service_findings + rhel_findings + synth_findings
     return {
         "session_id": bundle.get("session_id"),
         "iteration": bundle.get("iteration"),
-        "nginx_score": nginx_score,
+        "service_score": service_score,
         "rhel_score": rhel_score,
         "synthesizer_score": synthesizer_score,
         "total_score": total_score,
         "action": action,
         "findings": findings,
         "summary": (
-            f"nginx={nginx_score:.2f}, rhel={rhel_score:.2f}, "
+            f"service={service_score:.2f}, rhel={rhel_score:.2f}, "
             f"synthesizer={synthesizer_score:.2f}, total={total_score:.2f} → {action}"
         ),
     }
 
 
-def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+def evaluate_service(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     inspection = bundle.get("inspection") or {}
     system = bundle.get("system") or {}
-    nginx_output = bundle.get("nginx_expert") or {}
-    targets = _extract_setting_targets(nginx_output)
+    service_output = bundle.get("service_expert") or {}
+    targets = _extract_setting_targets(service_output)
     current = (inspection.get("webserver") or {}).get("current") or {}
 
     effective_cpu_budget = _effective_cpu_budget(system)
@@ -193,12 +193,12 @@ def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     ):
         findings.append(
             _finding(
-                "nginx",
-                "nginx.recommendation_consistency",
+                "service",
+                "service.recommendation_consistency",
                 "fail",
                 -0.4,
-                "Critical Nginx numeric target is missing or unparsable.",
-                evidence_refs=["nginx_expert", "inspection.webserver.current"],
+                "Critical service numeric target is missing or unparsable.",
+                evidence_refs=["service_expert", "inspection.webserver.current"],
             )
         )
         return findings
@@ -210,8 +210,8 @@ def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
     if worker_rlimit_nofile < required_nofile:
         findings.append(
             _finding(
-                "nginx",
-                "nginx.fd_capacity",
+                "service",
+                "service.fd_capacity",
                 "fail",
                 -0.5,
                 (
@@ -224,7 +224,7 @@ def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
                     f"({required_nofile}). Recommended Target: {correction_nofile}."
                 ),
                 evidence_refs=[
-                    "nginx_expert.rca_records",
+                    "service_expert.rca_records",
                     "inspection.webserver.current.worker_rlimit_nofile",
                 ],
             )
@@ -234,8 +234,8 @@ def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
         if effective_worker_processes > effective_cpu_budget:
             findings.append(
                 _finding(
-                    "nginx",
-                    "nginx.hardware_saturation",
+                    "service",
+                    "service.hardware_saturation",
                     "fail",
                     -0.5,
                     (
@@ -253,8 +253,8 @@ def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
         elif effective_worker_processes < effective_cpu_budget:
             findings.append(
                 _finding(
-                    "nginx",
-                    "nginx.hardware_saturation",
+                    "service",
+                    "service.hardware_saturation",
                     "warn",
                     -0.1,
                     (
@@ -270,16 +270,16 @@ def evaluate_nginx(bundle: dict[str, Any]) -> list[dict[str, Any]]:
                 )
             )
 
-    conflicts = _detect_conflicting_settings(nginx_output)
+    conflicts = _detect_conflicting_settings(service_output)
     if conflicts:
         findings.append(
             _finding(
-                "nginx",
-                "nginx.recommendation_consistency",
+                "service",
+                "service.recommendation_consistency",
                 "fail",
                 -0.4,
-                f"Conflicting Nginx recommendations found: {', '.join(conflicts)}.",
-                evidence_refs=["nginx_expert.recommendations", "nginx_expert.rca_records"],
+                f"Conflicting service recommendations found: {', '.join(conflicts)}.",
+                evidence_refs=["service_expert.recommendations", "service_expert.rca_records"],
             )
         )
 
@@ -458,7 +458,7 @@ def _evaluate_synth_deterministic(bundle: dict[str, Any]) -> list[dict[str, Any]
     synth_output = bundle.get("synthesizer") or {}
     synth_targets = _extract_setting_targets(synth_output)
     expert_targets = {
-        **_extract_setting_targets(bundle.get("nginx_expert") or {}),
+        **_extract_setting_targets(bundle.get("service_expert") or {}),
         **_extract_setting_targets(bundle.get("rhel_expert") or {}),
     }
 
@@ -477,7 +477,7 @@ def _evaluate_synth_deterministic(bundle: dict[str, Any]) -> list[dict[str, Any]
                 "warn",
                 score_delta,
                 "Synthesizer changed expert target values for: " + ", ".join(sorted(drifted)[:5]),
-                evidence_refs=["nginx_expert", "rhel_expert", "synthesizer"],
+                evidence_refs=["service_expert", "rhel_expert", "synthesizer"],
             )
         )
 
@@ -533,7 +533,7 @@ def llm_synth_judge(
         "You are grading a synthesis artifact. Return strict JSON with keys "
         "hallucination, critical_omission, merge_fidelity, format_validity. "
         "Each key must contain {pass: bool, message: str, evidence_refs: list[str]}.\n\n"
-        f"NGINX expert:\n{json.dumps(bundle.get('nginx_expert') or {}, ensure_ascii=True)}\n\n"
+        f"Service expert:\n{json.dumps(bundle.get('service_expert') or {}, ensure_ascii=True)}\n\n"
         f"RHEL expert:\n{json.dumps(bundle.get('rhel_expert') or {}, ensure_ascii=True)}\n\n"
         f"Synthesizer:\n{json.dumps(bundle.get('synthesizer') or {}, ensure_ascii=True)}\n\n"
         f"Requested format: {bundle.get('requested_format') or 'json'}"
@@ -597,7 +597,7 @@ def main(argv: list[str] | None = None) -> int:
                 "eval",
                 (
                     "Synthesizer judge unavailable; continuing with "
-                    "deterministic nginx/rhel evals only."
+                    "deterministic service/rhel evals only."
                 ),
                 "warn",
             )
@@ -686,7 +686,7 @@ def _critical_missing_targets(bundle: dict[str, Any]) -> list[str]:
     inspection = bundle.get("inspection") or {}
     synth_targets = _extract_setting_targets(bundle.get("synthesizer") or {})
     expert_targets = {
-        **_extract_setting_targets(bundle.get("nginx_expert") or {}),
+        **_extract_setting_targets(bundle.get("service_expert") or {}),
         **_extract_setting_targets(bundle.get("rhel_expert") or {}),
     }
     missing: list[str] = []

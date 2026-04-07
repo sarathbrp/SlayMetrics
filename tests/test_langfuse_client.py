@@ -115,7 +115,7 @@ def test_langfuse_client_traces_events_and_generations(monkeypatch):
         client.event("benchmark_evidence", output={"rps": 1.0})
         with client.generation("nginx_expert", model="gpt-oss-120b", input={"messages": []}):
             client.update_generation(output={"summary": "ok"}, usage_details={"prompt_tokens": 1})
-        with client.tool_span("tool.inspect_nginx_config", input={"directive_count": 13}):
+        with client.tool_span("tool.inspect_service_config", input={"directive_count": 13}):
             client.update_span(output={"needs_fixing": 12})
         client.update_span(output={"done": True})
     client.flush()

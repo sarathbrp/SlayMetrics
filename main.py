@@ -12,6 +12,7 @@ import yaml
 
 from adapters import load_adapter
 from agents import AgentDeps, TokenCounter
+from services import load_profile
 from core import log as logger
 from memory.embeddings import from_config as embedder_from_config
 from memory.tidb_store import from_config as tidb_from_config
@@ -225,6 +226,8 @@ async def main(
     logger.status("main", f"Bench: {bench_host} via {bench_mode}")
 
     adapter = load_adapter(cfg, ssh, bench=bench)
+    service_profile = load_profile(cfg["service"]["name"])
+    logger.status("main", f"Service profile: {service_profile.name} ({service_profile.type})")
     model = get_model(cfg)
 
     profile_name = cfg["llm"]["active_profile"]
@@ -267,6 +270,7 @@ async def main(
         config=cfg,
         token_counter=token_counter,
         langfuse=langfuse,
+        service_profile=service_profile,
     )
 
     try:

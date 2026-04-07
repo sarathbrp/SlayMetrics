@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from adapters.base import BenchmarkResult, ServiceAdapter
 from tools.ssh import SSHClient
@@ -44,6 +45,39 @@ class RedisAdapter(ServiceAdapter):
     def reload(self) -> bool:
         result = self._ssh.execute(f"systemctl reload {self._cfg['systemd_unit']}")
         return result.ok
+
+    def inspect(self, targets: dict[str, str]) -> dict[str, Any]:
+        """Inspect Redis configuration against targets."""
+        raw = self._ssh.execute("redis-cli CONFIG GET '*' 2>/dev/null", timeout=10).stdout
+
+        current: dict[str, str] = {}
+        lines = raw.splitlines()
+        for i in range(0, len(lines) - 1, 2):
+            current[lines[i].strip()] = lines[i + 1].strip()
+
+        needs_fixing: dict[str, dict[str, str]] = {}
+        already_ok: list[str] = []
+        for param, target in targets.items():
+            cur = current.get(param, "not set")
+            if cur != target:
+                needs_fixing[param] = {"current": cur, "target": target}
+            else:
+                already_ok.append(param)
+
+        return {
+            "category": "cache",
+            "needs_fixing": needs_fixing,
+            "ok_count": len(already_ok),
+            "current": current,
+        }
+
+    def get_service_info(self) -> dict[str, str]:
+        return {
+            "process_name": "redis-server",
+            "binary_path": "/usr/bin/redis-server",
+            "systemd_unit": self._cfg.get("systemd_unit", "redis.service"),
+            "config_path": self._cfg.get("config_path", "/etc/redis/redis.conf"),
+        }
 
     def get_hypothesis_queue(self) -> list[dict]:
         return [

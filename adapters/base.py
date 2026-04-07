@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -50,3 +51,14 @@ class ServiceAdapter(ABC):
     @abstractmethod
     def get_hypothesis_queue(self) -> list[dict]:
         """Return ordered list of {name, priority} hypotheses to test."""
+
+    @abstractmethod
+    def inspect(self, targets: dict[str, str]) -> dict[str, Any]:
+        """Inspect current service configuration against targets.
+
+        Returns {category, needs_fixing, ok_count, current}.
+        """
+
+    @abstractmethod
+    def get_service_info(self) -> dict[str, str]:
+        """Return service metadata: process_name, binary_path, systemd_unit, config_path."""

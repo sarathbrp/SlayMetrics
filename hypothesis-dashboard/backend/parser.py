@@ -462,7 +462,7 @@ def load_session(data_dir: str, session_id: str) -> dict:
 
             # Expert analyses
             for agent, num in [
-                ("nginx_expert", "01"),
+                ("service_expert", "01"),
                 ("rhel_expert", "02"),
                 ("synthesizer", "03"),
                 ("apply_planner", "04"),
@@ -776,7 +776,7 @@ def _parse_summary_md(text: str) -> dict:
     # Extract nginx/system applied booleans
     for line in text.splitlines():
         if "Nginx applied:" in line:
-            result["nginx_applied"] = "True" in line
+            result["service_applied"] = "True" in line
         if "System applied:" in line:
             result["system_applied"] = "True" in line
 
@@ -1335,13 +1335,13 @@ def _collect_precise_applied(iterations: list[dict]) -> dict[str, str]:
         planner = (iteration.get("apply_planner") or {}).get("payload") or {}
         if not isinstance(planner, dict):
             continue
-        nginx_applied = bool(summary.get("nginx_applied"))
+        service_applied = bool(summary.get("service_applied"))
         system_applied = bool(summary.get("system_applied"))
         for category, changes in planner.items():
             if not isinstance(changes, dict):
                 continue
             normalized_category = str(category).strip().lower()
-            if normalized_category in {"nginx", "webserver"} and not nginx_applied:
+            if normalized_category in {"nginx", "webserver"} and not service_applied:
                 continue
             if (
                 normalized_category in {"system", "kernel", "resource_limits", "network", "storage"}
@@ -1408,11 +1408,11 @@ def _normalize_tidb_parameter(parameter: str) -> str:
 def _scope_for_parameter(parameter: str) -> str:
     raw = parameter.strip()
     if raw.startswith("webserver."):
-        return "nginx"
+        return "service"
     if raw.startswith(("kernel.", "resource_limits.", "network.", "storage.")):
         return "system"
     if raw in PRECISE_BUNDLE_MAP:
-        return "nginx" if PRECISE_BUNDLE_MAP[raw].startswith("nginx") else "system"
+        return "service" if PRECISE_BUNDLE_MAP[raw].startswith("nginx") else "system"
     return "unknown"
 
 
@@ -1437,9 +1437,9 @@ def _format_tidb_timestamp(value: object) -> str:
 def _collect_param_sources(iterations: list[dict]) -> dict[str, set[str]]:
     result: dict[str, set[str]] = defaultdict(set)
     for iteration in iterations:
-        nginx_payload = (iteration.get("nginx_expert") or {}).get("payload") or {}
-        for parameter in _extract_nginx_expert_params(nginx_payload):
-            result[parameter].add("nginx_expert")
+        service_payload = (iteration.get("service_expert") or {}).get("payload") or {}
+        for parameter in _extract_service_expert_params(service_payload):
+            result[parameter].add("service_expert")
         rhel_payload = (iteration.get("rhel_expert") or {}).get("payload") or {}
         for parameter in _extract_rhel_expert_params(rhel_payload):
             result[parameter].add("rhel_expert")
@@ -1449,7 +1449,7 @@ def _collect_param_sources(iterations: list[dict]) -> dict[str, set[str]]:
     return result
 
 
-def _extract_nginx_expert_params(payload: dict) -> set[str]:
+def _extract_service_expert_params(payload: dict) -> set[str]:
     params: set[str] = set()
     for item in payload.get("recommendations", []) if isinstance(payload, dict) else []:
         if isinstance(item, dict) and item.get("setting"):

@@ -206,12 +206,12 @@ async def run(model, deps: AgentDeps) -> str:
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 3: Collecting service configuration...")
     config_data = deps.adapter.get_config()
-    nginx_config = config_data.get("raw", "")
+    service_config = config_data.get("raw", "")
     memory.save_context(
-        session_id, "command_output", "service_config", nginx_config, "current service config"
+        session_id, "command_output", "service_config", service_config, "current service config"
     )
     logger.status(
-        "collector", f"Config: {config_data.get('path', 'unknown')} ({len(nginx_config)} chars)"
+        "collector", f"Config: {config_data.get('path', 'unknown')} ({len(service_config)} chars)"
     )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -313,9 +313,9 @@ async def run(model, deps: AgentDeps) -> str:
             diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
 
         # Check if any changes were applied
-        nginx_applied = getattr(diagnosis, "nginx_applied", False)
+        service_applied = getattr(diagnosis, "service_applied", False)
         system_applied = getattr(diagnosis, "system_applied", False)
-        if not nginx_applied and not system_applied:
+        if not service_applied and not system_applied:
             decision = "No changes applied — stopping"
             logger.status("iteration", f"Iteration {iteration}: {decision}")
             diagnosis_agent.save_iteration_summary(
@@ -435,7 +435,7 @@ async def run(model, deps: AgentDeps) -> str:
             "diagnosis_completed",
             output={
                 "notes": notes,
-                "nginx_applied": getattr(diagnosis, "nginx_applied", False),
+                "service_applied": getattr(diagnosis, "service_applied", False),
                 "system_applied": getattr(diagnosis, "system_applied", False),
                 "recommendation_count": len(getattr(diagnosis, "recommendations", []) or []),
                 "rca_count": len(getattr(diagnosis, "rca_records", []) or []),
@@ -622,7 +622,7 @@ async def run(model, deps: AgentDeps) -> str:
     )
 
     total_improvement = ((best_rps - baseline_rps) / baseline_rps * 100) if baseline_rps else 0.0
-    nginx_applied = getattr(diagnosis, "nginx_applied", "unknown")
+    service_applied = getattr(diagnosis, "service_applied", "unknown")
     system_applied = getattr(diagnosis, "system_applied", "unknown")
     hypothesis_path = f"hypothesis/{session_id}/"
     log_file_path = logger.get_log_path()
@@ -632,7 +632,7 @@ async def run(model, deps: AgentDeps) -> str:
         f"Baseline (small): {baseline_rps:.1f} req/sec\n"
         f"Best (small):     {best_rps:.1f} req/sec\n"
         f"Improvement: {total_improvement:+.1f}%\n"
-        f"Nginx applied: {nginx_applied}, System applied: {system_applied}\n"
+        f"Service applied: {service_applied}, System applied: {system_applied}\n"
         f"Tokens used: {deps.token_counter.summary()}\n"
         f"Report: {report_path}\n"
         f"Log: {log_file_path}\n"
@@ -752,8 +752,8 @@ def _build_telemetry_summary(entries: list[dict]) -> str:
             )
             continue
         lines.append(
-            f"- {source}: workers={summary.get('nginx_worker_count', 0)}, "
-            f"cores={summary.get('nginx_worker_cores', [])}, "
+            f"- {source}: workers={summary.get('service_worker_count', 0)}, "
+            f"cores={summary.get('service_worker_cores', [])}, "
             f"somaxconn={summary.get('somaxconn', 'unknown')}, "
             f"syn_backlog={summary.get('tcp_max_syn_backlog', 'unknown')}, "
             f"ports={summary.get('ip_local_port_range', 'unknown')}, "
@@ -944,8 +944,8 @@ def _build_benchmark_evidence(baselines: dict, telemetry_entries: list[dict]) ->
         "baseline_large_p99_ms": baseline_large.get("p99", 0.0),
         "baseline_mixed_rps": baseline_mixed.get("rps", 0.0),
         "baseline_mixed_p99_ms": baseline_mixed.get("p99", 0.0),
-        "baseline_pre_workers": pre_summary.get("nginx_worker_count", 0),
-        "baseline_post_workers": post_summary.get("nginx_worker_count", 0),
+        "baseline_pre_workers": pre_summary.get("service_worker_count", 0),
+        "baseline_post_workers": post_summary.get("service_worker_count", 0),
         "somaxconn": post_summary.get("somaxconn", pre_summary.get("somaxconn", "unknown")),
         "tcp_max_syn_backlog": post_summary.get(
             "tcp_max_syn_backlog", pre_summary.get("tcp_max_syn_backlog", "unknown")

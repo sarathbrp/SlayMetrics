@@ -123,14 +123,15 @@ def inspect_kernel(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> dic
 
 
 def inspect_resource_limits(
-    ssh: LocalClient | SSHClient, targets: dict[str, str]
+    ssh: LocalClient | SSHClient, targets: dict[str, str],
+    systemd_unit: str = "nginx.service",
 ) -> dict[str, Any]:
     """Category 3: Inspect cgroups, systemd limits, ulimits, background hogs."""
     findings: dict[str, Any] = {}
 
     # Systemd service limits (parse only, don't store raw output)
     svc_limits = ssh.execute(
-        "systemctl show nginx.service 2>/dev/null"
+        f"systemctl show {systemd_unit} 2>/dev/null"
         " | grep -E 'LimitNOFILE|LimitNPROC|CPUQuota|MemoryMax|MemoryLimit"
         "|IOWeight|CPUWeight'",
         timeout=5,
@@ -145,7 +146,7 @@ def inspect_resource_limits(
 
     # Cgroup CPU (parse percentage only)
     cgroup_cpu = ssh.execute(
-        "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null || echo 'max 100000'",
+        f"cat /sys/fs/cgroup/system.slice/{systemd_unit}/cpu.max 2>/dev/null || echo 'max 100000'",
         timeout=5,
     ).stdout.strip()
     cpu_parts = cgroup_cpu.split()
@@ -158,7 +159,7 @@ def inspect_resource_limits(
 
     # Cgroup memory (parse to MB)
     cgroup_mem = ssh.execute(
-        "cat /sys/fs/cgroup/system.slice/nginx.service/memory.max 2>/dev/null || echo 'max'",
+        f"cat /sys/fs/cgroup/system.slice/{systemd_unit}/memory.max 2>/dev/null || echo 'max'",
         timeout=5,
     ).stdout.strip()
     if cgroup_mem != "max":
@@ -173,9 +174,10 @@ def inspect_resource_limits(
     cpu_weight_match = re.search(r"CPUWeight=(\d+)", svc_limits)
     findings["cgroup_cpu_weight"] = cpu_weight_match.group(1) if cpu_weight_match else "100"
 
-    # NUMA policy check — detect NIC node and whether nginx is bound to it
+    # NUMA policy check — detect NIC node and whether service is bound to it
+    svc_unit_name = systemd_unit.replace(".service", "")
     numa_dropin = ssh.execute(
-        "cat /etc/systemd/system/nginx.service.d/numa.conf 2>/dev/null || echo 'none'",
+        f"cat /etc/systemd/system/{systemd_unit}.d/numa.conf 2>/dev/null || echo 'none'",
         timeout=5,
     ).stdout.strip()
     if "interleave" in numa_dropin:
@@ -193,9 +195,10 @@ def inspect_resource_limits(
     ).stdout.strip()
     findings["nic_numa_node"] = nic_numa
 
-    # Check if nginx workers have memory on the wrong NUMA node
+    # Check if service workers have memory on the wrong NUMA node
+    process_name = systemd_unit.replace(".service", "")
     numa_maps = ssh.execute(
-        "cat /proc/$(pgrep -n nginx)/numa_maps 2>/dev/null"
+        f"cat /proc/$(pgrep -n {process_name})/numa_maps 2>/dev/null"
         " | awk '{for(i=1;i<=NF;i++) if($i~/^N[0-9]/) print $i}'"
         " | sort | uniq -c | sort -rn | head -4",
         timeout=5,
@@ -234,7 +237,7 @@ def inspect_resource_limits(
     if numa_pol == "interleave":
         problems.append("NUMA interleave policy active (worst for locality)")
     elif numa_pol == "default" and targets.get("numa_policy") == "bind_nic":
-        problems.append(f"nginx not pinned to NIC NUMA node {findings.get('nic_numa_node', '?')}")
+        problems.append(f"service not pinned to NIC NUMA node {findings.get('nic_numa_node', '?')}")
     # Check numa_maps for cross-node memory
     numa_maps = findings.get("numa_maps_summary", "")
     if numa_maps and findings.get("nic_numa_node", "-1") != "-1":
@@ -242,7 +245,7 @@ def inspect_resource_limits(
         wrong_node = f"N{1 - int(nic_node)}" if nic_node.isdigit() else ""
         if wrong_node and wrong_node in numa_maps:
             problems.append(
-                f"nginx has memory on wrong NUMA node ({wrong_node}), NIC on N{nic_node}"
+                f"service has memory on wrong NUMA node ({wrong_node}), NIC on N{nic_node}"
             )
     if findings.get("hog_detected"):
         problems.append(f"background hogs detected: {findings.get('hog_summary', '')}")
@@ -372,17 +375,37 @@ def inspect_storage(ssh: LocalClient | SSHClient, targets: dict[str, str]) -> di
     }
 
 
-def inspect_all(ssh: LocalClient | SSHClient, config: dict[str, Any]) -> dict[str, Any]:
+def inspect_all(
+    ssh: LocalClient | SSHClient, config: dict[str, Any],
+    adapter: Any | None = None,
+) -> dict[str, Any]:
     """Compound inspect: run all 5 categories and return unified result."""
     tuning = config.get("tuning") or {}
-    system = inspect_system_metadata(ssh)
+    svc_cfg = config.get("service") or {}
+    systemd_unit = svc_cfg.get("systemd_unit", "nginx.service")
+
+    # Service-specific targets: prefer service_targets, fall back to webserver_targets
+    svc_targets = (
+        tuning.get("service_targets")
+        or tuning.get("webserver_targets")
+        or {}
+    )
+
+    system = inspect_system_metadata(ssh, systemd_unit=systemd_unit)
+
+    # Delegate service inspection to adapter if available, else use legacy function
+    if adapter is not None:
+        webserver_result = adapter.inspect(svc_targets)
+    else:
+        webserver_result = inspect_webserver(ssh, svc_targets)
 
     results = {
         "system": system,
-        "webserver": inspect_webserver(ssh, tuning.get("webserver_targets") or {}),
+        "webserver": webserver_result,
         "kernel": inspect_kernel(ssh, tuning.get("kernel_targets") or {}),
         "resource_limits": inspect_resource_limits(
-            ssh, tuning.get("resource_limits_targets") or {}
+            ssh, tuning.get("resource_limits_targets") or {},
+            systemd_unit=systemd_unit,
         ),
         "network": inspect_network(ssh, tuning.get("network_targets") or {}),
         "storage": inspect_storage(ssh, tuning.get("storage_targets") or {}),
@@ -402,15 +425,17 @@ def inspect_all(ssh: LocalClient | SSHClient, config: dict[str, Any]) -> dict[st
     return results
 
 
-def inspect_system_metadata(ssh: LocalClient | SSHClient) -> dict[str, Any]:
+def inspect_system_metadata(
+    ssh: LocalClient | SSHClient, systemd_unit: str = "nginx.service",
+) -> dict[str, Any]:
     os_cpu_raw = ssh.execute("nproc 2>/dev/null || echo 0", timeout=5).stdout.strip()
     cpu_max_raw = ssh.execute(
-        "cat /sys/fs/cgroup/system.slice/nginx.service/cpu.max 2>/dev/null || echo 'max 100000'",
+        f"cat /sys/fs/cgroup/system.slice/{systemd_unit}/cpu.max 2>/dev/null || echo 'max 100000'",
         timeout=5,
     ).stdout.strip()
     cpuset_raw = ssh.execute(
-        "cat /sys/fs/cgroup/system.slice/nginx.service/cpuset.cpus.effective 2>/dev/null || "
-        "cat /sys/fs/cgroup/system.slice/nginx.service/cpuset.cpus 2>/dev/null || echo ''",
+        f"cat /sys/fs/cgroup/system.slice/{systemd_unit}/cpuset.cpus.effective 2>/dev/null || "
+        f"cat /sys/fs/cgroup/system.slice/{systemd_unit}/cpuset.cpus 2>/dev/null || echo ''",
         timeout=5,
     ).stdout.strip()
 

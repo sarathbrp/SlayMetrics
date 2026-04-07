@@ -22,11 +22,11 @@ class FakeMemory:
         return [
             {
                 "source": "baseline:series",
-                "content": '{"summary":{"sample_count":5,"duration_sec":4,"run_queue_avg":1.2,"run_queue_max":3,"rx_drop_delta":2,"rx_drop_rate_per_sec":0.5,"worker_core_spread_max":4},"first_sample":{"nginx_worker_count":112,"nginx_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":900,"mem_used_mb":1000,"vmstat_run_queue":1,"vmstat_blocked":0},"last_sample":{"nginx_worker_count":112,"nginx_worker_cores":[0,1,2,3],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":2,"tx_drop_total":0,"tcp_established":1024,"mem_used_mb":1001,"vmstat_run_queue":3,"vmstat_blocked":0}}',
+                "content": '{"summary":{"sample_count":5,"duration_sec":4,"run_queue_avg":1.2,"run_queue_max":3,"rx_drop_delta":2,"rx_drop_rate_per_sec":0.5,"worker_core_spread_max":4},"first_sample":{"service_worker_count":112,"service_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":900,"mem_used_mb":1000,"vmstat_run_queue":1,"vmstat_blocked":0},"last_sample":{"service_worker_count":112,"service_worker_cores":[0,1,2,3],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":2,"tx_drop_total":0,"tcp_established":1024,"mem_used_mb":1001,"vmstat_run_queue":3,"vmstat_blocked":0}}',
             },
             {
                 "source": "baseline:post",
-                "content": '{"summary":{"nginx_worker_count":112,"nginx_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":1024}}',
+                "content": '{"summary":{"service_worker_count":112,"service_worker_cores":[0,1],"somaxconn":"4096","tcp_max_syn_backlog":"1024","ip_local_port_range":"32768 60999","rx_drop_total":0,"tx_drop_total":0,"tcp_established":1024}}',
             }
         ]
 
@@ -114,6 +114,13 @@ class FakeAdapter:
     def reload(self):
         return True
 
+    def inspect(self, targets):
+        return {"category": "webserver", "needs_fixing": {}, "ok_count": 0, "current": {}}
+
+    def get_service_info(self):
+        return {"process_name": "nginx", "binary_path": "/usr/sbin/nginx",
+                "systemd_unit": "nginx.service", "config_path": "/etc/nginx/nginx.conf"}
+
 
 class FakeSSH:
     def execute(self, command, timeout=None):
@@ -177,7 +184,7 @@ def test_orchestrator_reuses_stored_baseline(monkeypatch):
             return [
                 {
                     "source": "baseline:series",
-                    "content": '{"summary":{"sample_count":3,"duration_sec":2,"run_queue_avg":0.5,"run_queue_max":1,"rx_drop_delta":1,"rx_drop_rate_per_sec":0.1,"worker_core_spread_max":8},"first_sample":{"nginx_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":10,"tx_drop_total":0,"tcp_established":90},"last_sample":{"nginx_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":11,"tx_drop_total":0,"tcp_established":95}}',
+                    "content": '{"summary":{"sample_count":3,"duration_sec":2,"run_queue_avg":0.5,"run_queue_max":1,"rx_drop_delta":1,"rx_drop_rate_per_sec":0.1,"worker_core_spread_max":8},"first_sample":{"service_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":10,"tx_drop_total":0,"tcp_established":90},"last_sample":{"service_worker_count":113,"somaxconn":"4096","tcp_max_syn_backlog":"1024","rx_drop_total":11,"tx_drop_total":0,"tcp_established":95}}',
                 }
             ]
         return []
@@ -195,7 +202,7 @@ def test_orchestrator_reuses_stored_baseline(monkeypatch):
                 notes="planned",
                 recommendations=[],
                 rca_records=[],
-                nginx_applied=False,
+                service_applied=False,
                 system_applied=False,
                 after_rps=0.0,
             ),
@@ -352,7 +359,7 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         lambda *a, **k: {
             "scope": k["scope"],
             "ok": True,
-            "csv_content": "timestamp,nginx_worker_count,nginx_worker_cores,somaxconn,tcp_max_syn_backlog,ip_local_port_range,rx_drop_total,tx_drop_total,tcp_established,mem_used_mb,vmstat_run_queue,vmstat_blocked\n1,112,\"0,1\",4096,1024,\"32768 60999\",0,0,900,1000,1,0\n2,112,\"0,1,2,3\",4096,1024,\"32768 60999\",2,0,1024,1001,3,0\n",
+            "csv_content": "timestamp,service_worker_count,service_worker_cores,somaxconn,tcp_max_syn_backlog,ip_local_port_range,rx_drop_total,tx_drop_total,tcp_established,mem_used_mb,vmstat_run_queue,vmstat_blocked\n1,112,\"0,1\",4096,1024,\"32768 60999\",0,0,900,1000,1,0\n2,112,\"0,1,2,3\",4096,1024,\"32768 60999\",2,0,1024,1001,3,0\n",
             "summary": {
                 "sample_count": 2,
                 "duration_sec": 1,
@@ -361,8 +368,8 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
                 "rx_drop_delta": 2,
                 "rx_drop_rate_per_sec": 2.0,
                 "first_sample": {
-                    "nginx_worker_count": 112,
-                    "nginx_worker_cores": [0, 1],
+                    "service_worker_count": 112,
+                    "service_worker_cores": [0, 1],
                     "somaxconn": "4096",
                     "tcp_max_syn_backlog": "1024",
                     "ip_local_port_range": "32768 60999",
@@ -374,8 +381,8 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
                     "vmstat_blocked": 0,
                 },
                 "last_sample": {
-                    "nginx_worker_count": 112,
-                    "nginx_worker_cores": [0, 1, 2, 3],
+                    "service_worker_count": 112,
+                    "service_worker_cores": [0, 1, 2, 3],
                     "somaxconn": "4096",
                     "tcp_max_syn_backlog": "1024",
                     "ip_local_port_range": "32768 60999",
@@ -500,7 +507,7 @@ def test_orchestrator_optimization_mode_reverts_failed_group(monkeypatch, tmp_pa
                 notes="planned",
                 recommendations=[],
                 rca_records=[],
-                nginx_applied=True,
+                service_applied=True,
                 system_applied=False,
             ),
         ),

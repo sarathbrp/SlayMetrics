@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from adapters.base import BenchmarkResult, ServiceAdapter
 from tools.ssh import SSHClient
@@ -45,6 +46,42 @@ class PostgresAdapter(ServiceAdapter):
     def reload(self) -> bool:
         result = self._ssh.execute(f"systemctl reload {self._cfg['systemd_unit']}")
         return result.ok
+
+    def inspect(self, targets: dict[str, str]) -> dict[str, Any]:
+        """Inspect PostgreSQL configuration against targets."""
+        raw = self._ssh.execute(
+            "psql -U postgres -tA -c 'SHOW ALL;' 2>/dev/null", timeout=10
+        ).stdout
+
+        current: dict[str, str] = {}
+        for line in raw.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 2:
+                current[parts[0].strip()] = parts[1].strip()
+
+        needs_fixing: dict[str, dict[str, str]] = {}
+        already_ok: list[str] = []
+        for param, target in targets.items():
+            cur = current.get(param, "not set")
+            if cur != target:
+                needs_fixing[param] = {"current": cur, "target": target}
+            else:
+                already_ok.append(param)
+
+        return {
+            "category": "database",
+            "needs_fixing": needs_fixing,
+            "ok_count": len(already_ok),
+            "current": current,
+        }
+
+    def get_service_info(self) -> dict[str, str]:
+        return {
+            "process_name": "postgres",
+            "binary_path": "/usr/bin/postgres",
+            "systemd_unit": self._cfg.get("systemd_unit", "postgresql.service"),
+            "config_path": self._cfg.get("config_path", "/var/lib/pgsql/data/postgresql.conf"),
+        }
 
     def get_hypothesis_queue(self) -> list[dict]:
         return [

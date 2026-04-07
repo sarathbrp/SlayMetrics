@@ -150,9 +150,9 @@ def _ctx():
     return SimpleNamespace(deps=deps)
 
 
-def test_apply_nginx_tuning_accepts_json_string_changes():
+def test_apply_service_tuning_accepts_json_string_changes():
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     ctx = _ctx()
 
     result = asyncio.run(
@@ -180,9 +180,9 @@ def test_inspect_irq_distribution_uses_telemetry_window_summary():
     assert result["current"]["telemetry_rx_drop_delta"] == 10
 
 
-def test_apply_nginx_tuning_invalid_json_returns_structured_error():
+def test_apply_service_tuning_invalid_json_returns_structured_error():
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     ctx = _ctx()
 
     result = asyncio.run(tool(ctx, '{"sendfile":"on"'))
@@ -205,9 +205,9 @@ def test_apply_system_tuning_invalid_json_returns_structured_error():
     assert "invalid JSON" in result["failed"]["_input"]
 
 
-def test_apply_nginx_tuning_rejects_unsupported_directives():
+def test_apply_service_tuning_rejects_unsupported_directives():
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     ctx = _ctx()
 
     result = asyncio.run(tool(ctx, {"upstream_read_timeout": "5s", "sendfile": "on"}))
@@ -219,9 +219,9 @@ def test_apply_nginx_tuning_rejects_unsupported_directives():
     assert ctx.deps.adapter.applied == [("sendfile", "on")]
 
 
-def test_apply_nginx_tuning_accepts_top_level_kwargs_shape():
+def test_apply_service_tuning_accepts_top_level_kwargs_shape():
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     ctx = _ctx()
 
     result = asyncio.run(tool(ctx, access_log="off", sendfile="on"))
@@ -241,9 +241,9 @@ def test_apply_system_tuning_accepts_top_level_kwargs_shape():
     assert result["applied"].get("transparent_hugepage") == "never"
 
 
-def test_apply_nginx_tuning_strips_leading_dot_from_keys():
+def test_apply_service_tuning_strips_leading_dot_from_keys():
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     ctx = _ctx()
 
     result = asyncio.run(tool(ctx, **{".sendfile": "on"}))
@@ -252,9 +252,9 @@ def test_apply_nginx_tuning_strips_leading_dot_from_keys():
     assert result["applied"] == ["sendfile"]
 
 
-def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
+def test_apply_service_tuning_applies_supported_subset_and_reports_unsupported():
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     ctx = _ctx()
 
     result = asyncio.run(
@@ -276,7 +276,7 @@ def test_apply_nginx_tuning_applies_supported_subset_and_reports_unsupported():
     assert ("sendfile", "on") in ctx.deps.adapter.applied
 
 
-def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
+def test_apply_service_tuning_restores_pre_batch_snapshot_on_failure():
     class FailingAdapter(FakeAdapter):
         def __init__(self, ssh: FakeSSH):
             super().__init__()
@@ -294,7 +294,7 @@ def test_apply_nginx_tuning_restores_pre_batch_snapshot_on_failure():
     ctx = _ctx()
     ctx.deps.adapter = FailingAdapter(ctx.deps.ssh)
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
 
     result = asyncio.run(tool(ctx, {"sendfile": "on", "keepalive_requests": "1000"}))
 
@@ -359,7 +359,7 @@ def test_save_findings_derives_run_level_delta_when_model_omits_it():
 
 def test_diagnosis_output_coerces_granite_friendly_shapes():
     output = DiagnosisOutput(
-        nginx_applied=True,
+        service_applied=True,
         system_applied=True,
         after_rps="1918406.5",
         improvement_pct=None,
@@ -613,7 +613,7 @@ def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": True,
+            "service_applied": True,
             "system_applied": True,
             "after_rps": 150.0,
             "findings": [{"parameter": "nginx.access_log"}],
@@ -629,7 +629,7 @@ def test_run_builds_diagnosis_output_from_tool_state(monkeypatch):
 
     output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
 
-    assert output.nginx_applied is True
+    assert output.service_applied is True
     assert output.system_applied is True
     assert output.after_rps == 150.0
     assert output.improvement_pct == 50.0
@@ -655,7 +655,7 @@ def test_run_does_not_double_count_usage(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": True,
+            "service_applied": True,
             "system_applied": True,
             "after_rps": 150.0,
             "findings": [],
@@ -685,7 +685,7 @@ def test_run_uses_debate_planner_mode(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -729,7 +729,7 @@ def test_run_normalizes_single_planner_mode_to_deterministic(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -813,7 +813,7 @@ def test_observational_debate_eval_logs_and_persists(monkeypatch):
         "model",
         iteration=1,
         inspection={"system": {"os_cpu_count": 112, "ram_gb": 502}},
-        nginx_analysis={"summary": "n"},
+        service_analysis={"summary": "n"},
         rhel_analysis={"summary": "r"},
         synthesis={"summary": "s"},
     )
@@ -1018,7 +1018,7 @@ def test_run_applies_saved_recommendations(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -1029,7 +1029,7 @@ def test_run_applies_saved_recommendations(monkeypatch):
             return FakeRunResult()
 
         def _apply_from_recommendations(self, deps):
-            self._slaymetrics_state["nginx_applied"] = True
+            self._slaymetrics_state["service_applied"] = True
             self._slaymetrics_state["system_applied"] = True
             self._slaymetrics_state["after_rps"] = 160.0
             self._slaymetrics_state["findings"] = [{"parameter": "nginx.sendfile"}]
@@ -1043,7 +1043,7 @@ def test_run_applies_saved_recommendations(monkeypatch):
 
     output = asyncio.run(diagnosis_agent.run("model", deps, "ctx"))
 
-    assert output.nginx_applied is True
+    assert output.service_applied is True
     assert output.system_applied is True
     assert output.after_rps == 160.0
     assert output.recommendations[0]["title"] == "Raise connection limits"

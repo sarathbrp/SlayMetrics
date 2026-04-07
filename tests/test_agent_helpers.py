@@ -4,7 +4,7 @@ Targets uncovered lines: _extract_changes_from_action, _extract_changes_from_com
 _coerce_records, _coerce_recommendations, _normalize_synthesized_recommendation,
 _coerce_float, _coerce_notes, _sanitize_debug_text, _extract_final_text,
 _aggregate_usage, _save_planner_artifact, _extract_json_dict, _resolve_model_name,
-_hypothesis_enabled, inspect_nginx_impl, inspect_system_tuning,
+_hypothesis_enabled, inspect_service_impl, inspect_system_tuning,
 apply_system_impl, apply_from_recommendations, save_rca_impl, and more.
 """
 from __future__ import annotations
@@ -88,6 +88,32 @@ class FakeAdapter:
     def apply_config(self, parameter: str, value: str) -> bool:
         self.applied.append((parameter, value))
         return True
+
+    def inspect(self, targets: dict) -> dict:
+        # Simulate nginx -T output matching FakeSSH
+        fake_current = {
+            "worker_connections": "1024",
+            "worker_rlimit_nofile": "65535",
+            "access_log": "/var/log/nginx/access.log main",
+            "tcp_nodelay": "on",
+            "listen_backlog": "511",
+        }
+        needs_fixing = {}
+        ok_count = 0
+        current = {}
+        for param, target in targets.items():
+            cur = fake_current.get(param, "not set")
+            current[param] = cur
+            if cur != target:
+                needs_fixing[param] = {"current": cur, "target": target}
+            else:
+                ok_count += 1
+        return {"category": "webserver", "needs_fixing": needs_fixing,
+                "ok_count": ok_count, "current": current}
+
+    def get_service_info(self) -> dict:
+        return {"process_name": "nginx", "binary_path": "/usr/sbin/nginx",
+                "systemd_unit": "nginx.service", "config_path": "/etc/nginx/nginx.conf"}
 
     def reload(self) -> bool:
         return True
@@ -681,13 +707,13 @@ def test_save_planner_artifact_unknown_source(tmp_path, monkeypatch):
 
 
 # ===========================================================================
-# inspect_nginx_impl
+# inspect_service_impl
 # ===========================================================================
 
-def test_inspect_nginx_impl():
+def test_inspect_service_impl():
     ctx = _ctx()
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["inspect_nginx_config"].function
+    tool = agent._function_toolset.tools["inspect_service_config"].function
     result = asyncio.run(tool(ctx))
 
     assert "needs_fixing" in result
@@ -927,7 +953,7 @@ def test_save_recommendations_rejects_invalid_scope_with_debug(monkeypatch):
 # ===========================================================================
 
 def test_diagnosis_output_defaults():
-    output = DiagnosisOutput(nginx_applied=False, system_applied=False)
+    output = DiagnosisOutput(service_applied=False, system_applied=False)
     assert output.after_rps == 0.0
     assert output.improvement_pct == 0.0
     assert output.notes == ""
@@ -936,7 +962,7 @@ def test_diagnosis_output_defaults():
 
 def test_diagnosis_output_none_rca():
     output = DiagnosisOutput(
-        nginx_applied=True, system_applied=False,
+        service_applied=True, system_applied=False,
         rca_records=None, recommendations=None,
     )
     assert output.rca_records == []
@@ -1042,7 +1068,7 @@ def test_run_generates_notes_from_findings_when_output_empty(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": True,
+            "service_applied": True,
             "system_applied": False,
             "after_rps": 120.0,
             "findings": [{"parameter": "nginx.sendfile"}, {"parameter": "nginx.access_log"}],
@@ -1073,7 +1099,7 @@ def test_run_generates_default_notes_when_empty_and_no_findings(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -1103,7 +1129,7 @@ def test_run_appends_guardrail_failure(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -1124,7 +1150,7 @@ def test_run_appends_guardrail_failure(monkeypatch):
 
 def test_run_with_tool_token_rows(monkeypatch):
     deps = _ctx().deps
-    deps.token_counter.add_tool_tokens("inspect_nginx", calls=2, call_input=100, call_output=50)
+    deps.token_counter.add_tool_tokens("inspect_service", calls=2, call_input=100, call_output=50)
 
     class FakeRunResult:
         output = "OK"
@@ -1135,7 +1161,7 @@ def test_run_with_tool_token_rows(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -1170,7 +1196,7 @@ def test_run_handles_get_profile_exception(monkeypatch):
 
     class FakeAgent:
         _slaymetrics_state = {
-            "nginx_applied": False,
+            "service_applied": False,
             "system_applied": False,
             "after_rps": 0.0,
             "findings": [],
@@ -1193,29 +1219,29 @@ def test_run_handles_get_profile_exception(monkeypatch):
 # apply_nginx_impl edge cases
 # ===========================================================================
 
-def test_apply_nginx_all_unsupported():
+def test_apply_service_all_unsupported():
     ctx = _ctx()
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     result = asyncio.run(tool(ctx, {"totally_fake": "1", "another_fake": "2"}))
     assert result["reload"] == "FAILED"
     assert "unsupported nginx directives" in result["error"]
 
-def test_apply_nginx_syntax_check_fails():
+def test_apply_service_syntax_check_fails():
     ctx = _ctx()
     ctx.deps.ssh = FakeSSH(outputs={
         "nginx -t 2>&1": SSHResult("nginx: configuration file test failed", "", 1),
     })
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     result = asyncio.run(tool(ctx, {"sendfile": "on"}))
     assert result["reload"] == "FAILED"
     assert "nginx -t failed" in result["error"]
 
-def test_apply_nginx_non_dict_payload():
+def test_apply_service_non_dict_payload():
     ctx = _ctx()
     agent = build("model", config=_TEST_CONFIG)
-    tool = agent._function_toolset.tools["apply_nginx_tuning"].function
+    tool = agent._function_toolset.tools["apply_service_tuning"].function
     result = asyncio.run(tool(ctx, [1, 2, 3]))
     assert result["reload"] == "FAILED"
     assert "must be a dictionary" in result["error"]

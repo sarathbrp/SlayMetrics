@@ -4,6 +4,7 @@ import json
 import os
 import re
 import uuid
+from typing import Any
 
 from adapters.base import BenchmarkResult, ServiceAdapter
 from tools.ssh import LocalClient, SSHClient
@@ -322,6 +323,60 @@ class NginxAdapter(ServiceAdapter):
             return False
         result = self._ssh.execute(f"systemctl reload {self._cfg['systemd_unit']}")
         return result.ok
+
+    def inspect(self, targets: dict[str, str]) -> dict[str, Any]:
+        """Inspect nginx configuration against targets."""
+        raw = self._ssh.execute("nginx -T 2>/dev/null", timeout=10).stdout
+
+        current: dict[str, str] = {}
+        needs_fixing: dict[str, dict[str, str]] = {}
+        already_ok: list[str] = []
+
+        for param, target in targets.items():
+            if param == "listen_backlog":
+                match = re.search(r"listen\s+.*backlog=(\d+)", raw)
+                current[param] = match.group(1) if match else "not set"
+            elif param == "error_log_level":
+                match = re.search(r"error_log\s+\S+\s+(\w+)\s*;", raw)
+                current[param] = match.group(1) if match else "warn"
+            elif param == "worker_processes":
+                match = re.search(r"worker_processes\s+(\S+)\s*;", raw)
+                current[param] = match.group(1).rstrip(";") if match else "auto"
+            elif param == "limit_rate":
+                match = re.search(r"limit_rate\s+(\S+)\s*;", raw)
+                current[param] = match.group(1).rstrip(";") if match else "0"
+            elif param == "directio":
+                match = re.search(r"directio\s+(\S+)\s*;", raw)
+                current[param] = match.group(1).rstrip(";") if match else "off"
+            elif param == "gzip_comp_level":
+                match = re.search(r"gzip_comp_level\s+(\S+)\s*;", raw)
+                current[param] = match.group(1).rstrip(";") if match else "1"
+            else:
+                match = re.search(rf"^\s*{re.escape(param)}\s+(.+?);", raw, re.MULTILINE)
+                current[param] = match.group(1).strip() if match else "not set"
+
+            cur = current.get(param, "not set")
+            if cur != target and cur != "not set":
+                needs_fixing[param] = {"current": cur, "target": target}
+            elif cur == "not set":
+                needs_fixing[param] = {"current": "not set", "target": target}
+            else:
+                already_ok.append(param)
+
+        return {
+            "category": "webserver",
+            "needs_fixing": needs_fixing,
+            "ok_count": len(already_ok),
+            "current": current,
+        }
+
+    def get_service_info(self) -> dict[str, str]:
+        return {
+            "process_name": "nginx",
+            "binary_path": "/usr/sbin/nginx",
+            "systemd_unit": self._cfg.get("systemd_unit", "nginx.service"),
+            "config_path": self._cfg.get("config_path", "/etc/nginx/nginx.conf"),
+        }
 
     def get_hypothesis_queue(self) -> list[dict]:
         return [

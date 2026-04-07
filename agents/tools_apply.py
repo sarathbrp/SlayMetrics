@@ -69,17 +69,22 @@ def apply_kernel(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[
     return _parse_script_result(result.stdout, changes)
 
 
-def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str]) -> dict[str, Any]:
+def apply_resource_limits(
+    ssh: LocalClient | SSHClient, changes: dict[str, str],
+    systemd_unit: str = "nginx.service",
+    binary_path: str = "/usr/sbin/nginx",
+) -> dict[str, Any]:
     """Category 3: Fix cgroups, systemd limits, kill background hogs."""
     if not changes:
         return {"applied": {}, "failed": {}, "actions": []}
 
     actions: list[str] = []
+    svc_name = systemd_unit.replace(".service", "")
 
     # Remove cgroup CPU cap (any value means "remove the cap" — LLM may say "max", "100%", etc.)
     if changes.get("cgroup_cpu"):
         ssh.execute(
-            "systemctl set-property nginx.service CPUQuota= 2>/dev/null || true",
+            f"systemctl set-property {systemd_unit} CPUQuota= 2>/dev/null || true",
             timeout=10,
         )
         actions.append("removed cgroup CPU cap")
@@ -87,7 +92,7 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     # Remove cgroup memory cap (any value means "remove the cap" — LLM may say "4G", "max", etc.)
     if changes.get("cgroup_memory"):
         ssh.execute(
-            "systemctl set-property nginx.service MemoryMax=infinity 2>/dev/null || true",
+            f"systemctl set-property {systemd_unit} MemoryMax=infinity 2>/dev/null || true",
             timeout=10,
         )
         actions.append("removed cgroup memory cap")
@@ -96,8 +101,8 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     nofile = changes.get("systemd_nofile")
     if nofile:
         ssh.execute(
-            "mkdir -p /etc/systemd/system/nginx.service.d && "
-            "cat > /etc/systemd/system/nginx.service.d/limits.conf << 'EOF'\n"
+            f"mkdir -p /etc/systemd/system/{systemd_unit}.d && "
+            f"cat > /etc/systemd/system/{systemd_unit}.d/limits.conf << 'EOF'\n"
             "[Service]\n"
             f"LimitNOFILE={nofile}\n"
             f"LimitNPROC={changes.get('systemd_nproc', 'infinity')}\n"
@@ -119,12 +124,12 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     io_w = changes.get("cgroup_io_weight")
     if io_w:
         ssh.execute(
-            f"systemctl set-property nginx.service IOWeight={io_w} 2>/dev/null || true",
+            f"systemctl set-property {systemd_unit} IOWeight={io_w} 2>/dev/null || true",
             timeout=10,
         )
         # Also remove any persistent override
         ssh.execute(
-            "rm -f /etc/systemd/system/nginx.service.d/50-IOWeight.conf 2>/dev/null || true",
+            f"rm -f /etc/systemd/system/{systemd_unit}.d/50-IOWeight.conf 2>/dev/null || true",
             timeout=5,
         )
         actions.append(f"cgroup IOWeight={io_w}")
@@ -133,11 +138,11 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     cpu_w = changes.get("cgroup_cpu_weight")
     if cpu_w:
         ssh.execute(
-            f"systemctl set-property nginx.service CPUWeight={cpu_w} 2>/dev/null || true",
+            f"systemctl set-property {systemd_unit} CPUWeight={cpu_w} 2>/dev/null || true",
             timeout=10,
         )
         ssh.execute(
-            "rm -f /etc/systemd/system/nginx.service.d/50-CPUWeight.conf 2>/dev/null || true",
+            f"rm -f /etc/systemd/system/{systemd_unit}.d/50-CPUWeight.conf 2>/dev/null || true",
             timeout=5,
         )
         actions.append(f"cgroup CPUWeight={cpu_w}")
@@ -146,12 +151,12 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     numa_policy = changes.get("numa_policy")
     if numa_policy == "remove":
         ssh.execute(
-            "rm -f /etc/systemd/system/nginx.service.d/numa.conf 2>/dev/null || true",
+            f"rm -f /etc/systemd/system/{systemd_unit}.d/numa.conf 2>/dev/null || true",
             timeout=5,
         )
         actions.append("removed NUMA interleave drop-in")
     elif numa_policy == "bind_nic":
-        # Detect NIC's NUMA node and pin nginx to it
+        # Detect NIC's NUMA node and pin service to it
         nic_node = ssh.execute(
             "cat /sys/class/net/$(ip route get 8.8.8.8 2>/dev/null"
             " | grep -oP 'dev \\K\\S+')/device/numa_node 2>/dev/null || echo 0",
@@ -160,17 +165,17 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
         if not nic_node.isdigit():
             nic_node = "0"
         ssh.execute(
-            "mkdir -p /etc/systemd/system/nginx.service.d && "
-            "cat > /etc/systemd/system/nginx.service.d/numa.conf << 'EOF'\n"
+            f"mkdir -p /etc/systemd/system/{systemd_unit}.d && "
+            f"cat > /etc/systemd/system/{systemd_unit}.d/numa.conf << 'EOF'\n"
             "[Service]\n"
             "ExecStart=\n"
             f"ExecStart=/usr/bin/numactl --cpunodebind={nic_node}"
-            f" --membind={nic_node} /usr/sbin/nginx -g 'daemon off;'\n"
+            f" --membind={nic_node} {binary_path} -g 'daemon off;'\n"
             "Type=simple\n"
             "EOF",
             timeout=5,
         )
-        actions.append(f"pinned nginx to NUMA node {nic_node} (NIC node)")
+        actions.append(f"pinned {svc_name} to NUMA node {nic_node} (NIC node)")
 
     # Kill background hogs (stress-ng, dd, fio, etc.)
     if changes.get("kill_background_hogs") == "true":
@@ -191,7 +196,7 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
         )
         actions.append("killed background hog processes")
 
-    # Reload systemd and restart nginx to pick up new limits
+    # Reload systemd and restart service to pick up new limits
     needs_restart = any(
         changes.get(k)
         for k in (
@@ -205,10 +210,10 @@ def apply_resource_limits(ssh: LocalClient | SSHClient, changes: dict[str, str])
     )
     if needs_restart:
         ssh.execute(
-            "systemctl daemon-reload && systemctl restart nginx 2>&1 || true",
+            f"systemctl daemon-reload && systemctl restart {svc_name} 2>&1 || true",
             timeout=15,
         )
-        actions.append("restarted nginx with new limits")
+        actions.append(f"restarted {svc_name} with new limits")
 
     return {"applied": changes, "failed": {}, "actions": actions}
 

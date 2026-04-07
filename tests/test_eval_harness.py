@@ -19,7 +19,7 @@ from agents.tools_inspect import (
 from core.eval_harness import (
     build_case_bundle_from_session,
     evaluate_case_bundle,
-    evaluate_nginx,
+    evaluate_service,
     evaluate_synthesizer,
 )
 from tools.ssh import SSHResult
@@ -61,7 +61,7 @@ def _bundle() -> dict:
             },
             "network": {"findings": {}},
         },
-        "nginx_expert": {
+        "service_expert": {
             "rca_records": [
                 {"setting": "worker_processes", "target": "auto"},
                 {"setting": "worker_connections", "target": "65536"},
@@ -78,18 +78,18 @@ def _bundle() -> dict:
     }
 
 
-def test_nginx_fd_capacity_fails_for_proxy_budget():
-    findings = evaluate_nginx(_bundle())
-    fd = next(f for f in findings if f["rule_id"] == "nginx.fd_capacity")
+def test_service_fd_capacity_fails_for_proxy_budget():
+    findings = evaluate_service(_bundle())
+    fd = next(f for f in findings if f["rule_id"] == "service.fd_capacity")
     assert fd["severity"] == "fail"
     assert "Recommended Target" in fd["correction"]
 
 
-def test_nginx_worker_budget_uses_cgroup_limit():
+def test_service_worker_budget_uses_cgroup_limit():
     bundle = _bundle()
-    bundle["nginx_expert"]["rca_records"][0]["target"] = "112"
-    findings = evaluate_nginx(bundle)
-    worker = next(f for f in findings if f["rule_id"] == "nginx.hardware_saturation")
+    bundle["service_expert"]["rca_records"][0]["target"] = "112"
+    findings = evaluate_service(bundle)
+    worker = next(f for f in findings if f["rule_id"] == "service.hardware_saturation")
     assert worker["severity"] == "fail"
     assert worker["correction"] == "Set worker_processes to 4."
 
@@ -105,7 +105,7 @@ def test_eval_bundle_aggregate_thresholds():
         },
     )
     assert result["action"] == "self_correct"
-    assert result["nginx_score"] < 1.0
+    assert result["service_score"] < 1.0
     assert result["synthesizer_score"] < 1.0
 
 
@@ -168,7 +168,7 @@ def test_inspect_network_includes_firewall_provenance():
 def test_synth_critical_omission_ignores_optional_absent_control():
     bundle = _bundle()
     bundle["inspection"]["webserver"]["current"]["limit_conn"] = "not set"
-    bundle["nginx_expert"] = {
+    bundle["service_expert"] = {
         "rca_records": [{"setting": "limit_conn", "target": "remove"}],
         "recommendations": [],
     }
@@ -193,7 +193,7 @@ def test_synth_critical_omission_ignores_optional_absent_control():
 
 def test_synth_deterministic_checks_flag_drift_keys_and_risk():
     bundle = _bundle()
-    bundle["nginx_expert"] = {
+    bundle["service_expert"] = {
         "rca_records": [{"setting": "worker_connections", "target": "65536"}],
         "recommendations": [],
     }
@@ -202,7 +202,7 @@ def test_synth_deterministic_checks_flag_drift_keys_and_risk():
         "recommendations": [
             {
                 "title": "Drifted worker connections",
-                "scope": "nginx",
+                "scope": "service",
                 "changes": {"worker_connections": "8192"},
                 "risk_level": "high",
             },
@@ -233,7 +233,7 @@ def test_synth_deterministic_checks_flag_drift_keys_and_risk():
 
 def test_synth_promotes_limit_rate_after_omission_and_ignores_limit_req():
     bundle = _bundle()
-    bundle["nginx_expert"] = {
+    bundle["service_expert"] = {
         "rca_records": [
             {"setting": "limit_rate_after", "target": "0"},
             {"setting": "limit_req", "target": "remove"},
@@ -292,7 +292,7 @@ def test_synth_alias_keys_are_flagged_as_normalization_issues():
 
 def test_synth_sensitive_drift_gets_stronger_penalty():
     bundle = _bundle()
-    bundle["nginx_expert"] = {
+    bundle["service_expert"] = {
         "rca_records": [
             {"setting": "tcp_nodelay", "target": "on"},
             {"setting": "multi_accept", "target": "on"},
@@ -304,7 +304,7 @@ def test_synth_sensitive_drift_gets_stronger_penalty():
         "recommendations": [
             {
                 "title": "Drifted transport",
-                "scope": "nginx",
+                "scope": "service",
                 "changes": {"tcp_nodelay": "off", "multi_accept": "off"},
                 "risk_level": "low",
             }

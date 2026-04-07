@@ -105,32 +105,47 @@ DEGRADATIONS = [
 ]
 
 
-def degrade(ssh: SSHClient) -> None:
+def _get_scenarios(service_name: str = "nginx") -> list[dict]:
+    """Load degradation scenarios from service profile, fall back to built-in."""
+    try:
+        from services import load_profile
+        profile = load_profile(service_name)
+        if profile.degrade_scenarios:
+            return profile.degrade_scenarios
+    except Exception:
+        pass
+    return DEGRADATIONS
+
+
+def degrade(ssh: SSHClient, service_name: str = "nginx") -> None:
+    scenarios = _get_scenarios(service_name)
     print("Applying degradations...\n")
-    for d in DEGRADATIONS:
+    for d in scenarios:
         print(f"  [{d['name']}] degrading...")
         ssh.execute(d["degrade"])
         verify = ssh.execute(d["verify"])
         print(f"    -> {verify.stdout.strip()}")
-    print(f"\nApplied {len(DEGRADATIONS)} degradations. System is now detuned.")
+    print(f"\nApplied {len(scenarios)} degradations. System is now detuned.")
 
 
-def restore(ssh: SSHClient) -> None:
+def restore(ssh: SSHClient, service_name: str = "nginx") -> None:
+    scenarios = _get_scenarios(service_name)
     print("Restoring system...\n")
-    for d in DEGRADATIONS:
+    for d in scenarios:
         if d["restore"]:
             print(f"  [{d['name']}] restoring...")
             ssh.execute(d["restore"])
             verify = ssh.execute(d["verify"])
             print(f"    -> {verify.stdout.strip()}")
-    print(f"\nRestored {len(DEGRADATIONS)} settings.")
+    print(f"\nRestored {len(scenarios)} settings.")
 
 
-def list_degradations() -> None:
+def list_degradations(service_name: str = "nginx") -> None:
+    scenarios = _get_scenarios(service_name)
     print("Available degradations:\n")
     print(f"  {'Name':<35} {'Agent Hypothesis':<35}")
     print(f"  {'-' * 35} {'-' * 35}")
-    for d in DEGRADATIONS:
+    for d in scenarios:
         print(f"  {d['name']:<35} {d['hypothesis']:<35}")
 
 

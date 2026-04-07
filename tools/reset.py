@@ -89,20 +89,37 @@ SYSCTL_DEFAULTS = {
 }
 
 
-def reset_system(client) -> None:
+def reset_system(client, cfg: dict | None = None) -> None:
     print("Resetting system to clean state...\n")
 
-    # 1. Restore default nginx.conf
-    print("  [nginx] Restoring default nginx.conf...")
-    client.execute(f"cat > /etc/nginx/nginx.conf << 'NGINX_EOF'\n{DEFAULT_NGINX_CONF}NGINX_EOF")
-    # Find nginx binary (may not be in PATH over SSH)
-    nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
-    r = client.execute(f"{nginx_bin} -t 2>&1")
-    if "syntax is ok" in r.stdout or "test is successful" in r.stdout:
-        client.execute("systemctl restart nginx")
-        print("  [nginx] Config restored and service restarted")
+    # Load service profile for defaults
+    svc_cfg = (cfg or {}).get("service") or {}
+    svc_name = svc_cfg.get("name", "nginx")
+    systemd_unit = svc_cfg.get("systemd_unit", "nginx.service")
+    config_path = svc_cfg.get("config_path", "/etc/nginx/nginx.conf")
+
+    try:
+        from services import load_profile
+        profile = load_profile(svc_name)
+        default_config = profile.default_config
+    except Exception:
+        default_config = DEFAULT_NGINX_CONF
+
+    # 1. Restore default service config
+    print(f"  [{svc_name}] Restoring default config...")
+    client.execute(f"cat > {config_path} << 'SVC_EOF'\n{default_config}SVC_EOF")
+    if svc_name == "nginx":
+        # nginx-specific: validate config before restart
+        nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
+        r = client.execute(f"{nginx_bin} -t 2>&1")
+        if "syntax is ok" in r.stdout or "test is successful" in r.stdout:
+            client.execute(f"systemctl restart {svc_name}")
+            print(f"  [{svc_name}] Config restored and service restarted")
+        else:
+            print(f"  [{svc_name}] WARNING: config test failed: {r.stdout[:100]}")
     else:
-        print(f"  [nginx] WARNING: config test failed: {r.stdout[:100]}")
+        client.execute(f"systemctl restart {svc_name}")
+        print(f"  [{svc_name}] Config restored and service restarted")
 
     # 2. Reset sysctl values
     print("  [sysctl] Restoring defaults...")
@@ -127,9 +144,9 @@ def reset_system(client) -> None:
 
     # 6. Remove systemd drop-ins and cgroup limits
     print("  [cgroup] Removing systemd drop-ins and cgroup limits...")
-    client.execute("rm -rf /etc/systemd/system/nginx.service.d/")
+    client.execute(f"rm -rf /etc/systemd/system/{systemd_unit}.d/")
     client.execute(
-        "systemctl set-property nginx.service "
+        f"systemctl set-property {systemd_unit} "
         "CPUQuota= CPUWeight= IOWeight= MemoryMax= 2>/dev/null || true"
     )
     client.execute("systemctl daemon-reload")
@@ -159,16 +176,8 @@ def reset_system(client) -> None:
 
     # 6. Verify
     print("\n  Verifying...")
-    r = client.execute("curl -s -o /dev/null -w '%{http_code}' http://localhost/")
-    print(f"  [nginx] HTTP status: {r.stdout.strip()}")
-    nginx_bin = client.execute("which nginx 2>/dev/null || echo /usr/sbin/nginx").stdout.strip()
-    r = client.execute(
-        f"{nginx_bin} -T 2>&1 | "
-        "grep -E 'worker_processes|sendfile|tcp_nopush|access_log"
-        "|worker_connections|open_file_cache|gzip|aio'"
-    )
-    for line in r.stdout.strip().splitlines():
-        print(f"  [nginx] {line.strip()}")
+    r = client.execute(f"systemctl is-active {svc_name} 2>/dev/null || echo inactive")
+    print(f"  [{svc_name}] Status: {r.stdout.strip()}")
 
     print("\n  System reset complete.")
 

@@ -116,8 +116,8 @@ def main() -> None:
     sections = {name: run(command) for name, command in COMMANDS}
     summary = {
         "interrupt_cpu_lines": count_interrupt_cpu_columns(sections["interrupts"]["output"]),
-        "nginx_worker_count": count_nginx_workers(sections["nginx_workers"]["output"]),
-        "nginx_worker_cores": extract_worker_cores(sections["nginx_workers"]["output"]),
+        "service_worker_count": count_nginx_workers(sections["nginx_workers"]["output"]),
+        "service_worker_cores": extract_worker_cores(sections["nginx_workers"]["output"]),
         "somaxconn": extract_sysctl_value(sections["tcp_limits"]["output"], "net.core.somaxconn"),
         "tcp_max_syn_backlog": extract_sysctl_value(
             sections["tcp_limits"]["output"], "net.ipv4.tcp_max_syn_backlog"

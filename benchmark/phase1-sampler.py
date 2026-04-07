@@ -116,8 +116,8 @@ def sample() -> dict[str, object]:
     vmstat = run("vmstat 1 2")
     return {
         "timestamp": int(time.time()),
-        "nginx_worker_count": count_nginx_workers(nginx_workers),
-        "nginx_worker_cores": extract_worker_cores(nginx_workers),
+        "service_worker_count": count_nginx_workers(nginx_workers),
+        "service_worker_cores": extract_worker_cores(nginx_workers),
         "somaxconn": extract_sysctl_value(tcp_limits, "net.core.somaxconn"),
         "tcp_max_syn_backlog": extract_sysctl_value(tcp_limits, "net.ipv4.tcp_max_syn_backlog"),
         "ip_local_port_range": extract_sysctl_value(tcp_limits, "net.ipv4.ip_local_port_range"),
@@ -140,8 +140,8 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "timestamp",
-        "nginx_worker_count",
-        "nginx_worker_cores",
+        "service_worker_count",
+        "service_worker_cores",
         "somaxconn",
         "tcp_max_syn_backlog",
         "ip_local_port_range",

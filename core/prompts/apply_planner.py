@@ -10,7 +10,7 @@ from typing import Any
 
 def build(
     *,
-    webserver_targets: dict[str, str],
+    service_targets: dict[str, str],
     kernel_targets: dict[str, str],
     resource_limits_targets: dict[str, str],
     network_targets: dict[str, str],
@@ -27,8 +27,8 @@ def build(
         "high-performance "
         "configuration payload. You must be aggressive in clearing bottlenecks.\n\n"
         "THE 5 CATEGORY SCHEMA (use EXACTLY these param names and values):\n"
-        '1. "webserver" — NGINX directives. '
-        f"Allowed: {', '.join(sorted(webserver_targets))}\n"
+        '1. "webserver" — Service-specific directives. '
+        f"Allowed: {', '.join(sorted(service_targets))}\n"
         "   ACTION PARAMS with EXACT values:\n"
         '     limit_req: "remove"  (removes all limit_req zones and directives)\n'
         '     limit_conn: "remove"  (removes all limit_conn zones and directives)\n'
