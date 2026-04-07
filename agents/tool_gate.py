@@ -90,18 +90,32 @@ def gate_and_execute(
 
 
 def _resolve_mode(scope: str, config: dict[str, Any]) -> str:
-    """Resolve approval mode: scope override → global → 'auto'."""
+    """Resolve approval mode: explicit scope override → global → 'auto'.
+
+    Scope override only wins if it's explicitly non-auto (e.g. 'interactive').
+    This lets CLI --approval-mode override config.yaml scope defaults.
+    """
     tools_cfg = config.get("tools") or {}
     scopes = tools_cfg.get("scopes") or {}
     scope_cfg = scopes.get(scope) or {}
 
-    # Scope-level override takes precedence
-    mode = scope_cfg.get("mode") or tools_cfg.get("approval_mode") or "auto"
+    global_mode = tools_cfg.get("approval_mode", "auto")
+    scope_mode = scope_cfg.get("mode")
+
+    # Scope override only applies if explicitly set to something other than auto
+    if scope_mode and scope_mode.strip().lower() != "auto":
+        mode = scope_mode
+    else:
+        mode = global_mode
+
     mode = mode.strip().lower()
 
     # Fall back to auto if stdin is not a TTY (CI/headless)
     if mode == "interactive" and not sys.stdin.isatty():
         mode = "auto"
+
+    if mode == "interactive":
+        logger.status("gate", f"[INTERACTIVE] {scope}: awaiting approval")
 
     return mode
 
