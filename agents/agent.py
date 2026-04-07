@@ -1472,17 +1472,16 @@ def build(model, config=None) -> DiagnosisWorkflow:
         # Use hard restart (not graceful reload) when error_log_level changed —
         # graceful reload keeps old debug-logging workers alive, causing OOM.
         if applied:
-            test = ssh.execute("nginx -t 2>&1")
-            if "syntax is ok" in test.stdout or "test is successful" in test.stdout:
+            if deps.adapter.validate_config():
                 if "error_log_level" in applied or "access_log" in applied:
-                    ssh.execute("systemctl restart nginx 2>&1")
+                    deps.adapter.restart()
                 else:
                     deps.adapter.reload()
                 reload_status = "OK"
             else:
                 # Rollback everything
                 ssh.execute(f"cp {config_path}.pre_batch {config_path}")
-                ssh.execute("nginx -s reload 2>&1 || true")
+                deps.adapter.reload()
                 reload_status = "FAILED"
                 failed = list(changes.keys())
                 applied = []
@@ -1753,35 +1752,36 @@ def build(model, config=None) -> DiagnosisWorkflow:
         # ── Apply order matters: remove cgroup/resource caps BEFORE restarting
         # nginx with more workers, otherwise nginx OOM-kills instantly.
 
-        # 1. Resource limits first (remove cgroup CPU/memory caps)
+        from agents.tool_gate import ToolAction, gate_and_execute
+
         res_changes = changes_by_cat.get("resource_limits", {})
-        if res_changes:
-            results["resource_limits"] = apply_resource_limits(ssh, res_changes)
-            state["system_applied"] = True
-
-        # 2. Kernel (sysctls, THP, SELinux, IRQ)
         kern_changes = changes_by_cat.get("kernel", {})
-        if kern_changes:
-            results["kernel"] = apply_kernel(ssh, kern_changes)
-            state["system_applied"] = True
-
-        # 3. Network (firewall, conntrack, tc)
         net_changes = changes_by_cat.get("network", {})
-        if net_changes:
-            results["network"] = apply_network(ssh, net_changes)
-            state["system_applied"] = True
-
-        # 4. Storage (I/O scheduler, readahead)
         stor_changes = changes_by_cat.get("storage", {})
-        if stor_changes:
-            results["storage"] = apply_storage(ssh, stor_changes)
-            state["system_applied"] = True
-
-        # 5. Webserver LAST (restarts nginx — all caps must be lifted first)
         web_changes = changes_by_cat.get("webserver", {})
-        if web_changes:
-            results["webserver"] = _batch_apply_service(deps, web_changes)
-            state["service_applied"] = True
+
+        # Apply in order: resource_limits → kernel → network → storage → webserver
+        _apply_steps = [
+            ("resource_limits", res_changes, lambda c=res_changes: apply_resource_limits(ssh, c)),
+            ("kernel", kern_changes, lambda c=kern_changes: apply_kernel(ssh, c)),
+            ("network", net_changes, lambda c=net_changes: apply_network(ssh, c)),
+            ("storage", stor_changes, lambda c=stor_changes: apply_storage(ssh, c)),
+            ("webserver", web_changes, lambda c=web_changes: _batch_apply_service(deps, c)),
+        ]
+        for scope, changes, executor in _apply_steps:
+            if not changes:
+                continue
+            action = ToolAction(
+                scope=scope, changes=changes, executor=executor,
+                description=f"Apply {len(changes)} {scope} changes",
+            )
+            gate_result = gate_and_execute(action, deps.config, deps.session_id)
+            results[scope] = gate_result.result or {"applied": {}, "failed": changes, "actions": ["denied"]}
+            if gate_result.decision.approved:
+                if scope == "webserver":
+                    state["service_applied"] = True
+                else:
+                    state["system_applied"] = True
 
         # Log results per category
         for cat, result in results.items():
@@ -2237,30 +2237,56 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
     deps.token_counter.input_tokens += fix_usage["input_tokens"]
     deps.token_counter.output_tokens += fix_usage["output_tokens"]
 
-    # Apply fixes
+    # Apply fixes — gated through tool approval
     fixes_applied = []
     fix_commands = fix_plan.get("fixes", [])
-    if isinstance(fix_commands, list):
-        for cmd in fix_commands:
-            cmd_str = str(cmd).strip()
-            if not cmd_str or cmd_str.startswith("#"):
-                continue
-            tool_call("preflight_fix", cmd_str[:100])
-            # Guard: validate nginx config before restart/reload to avoid downtime
-            if "restart nginx" in cmd_str or "reload nginx" in cmd_str:
-                test_r = ssh.execute("nginx -t 2>&1", timeout=10)
-                if "syntax is ok" not in test_r.stdout and "test is successful" not in test_r.stdout:
-                    tool_result("preflight_fix", f"SKIPPED restart — nginx -t failed: {test_r.stdout[:150]}")
-                    fixes_applied.append({"command": cmd_str, "ok": False, "output": "skipped: config invalid"})
-                    continue
-            cmd_result = ssh.execute(cmd_str, timeout=120)
-            fixes_applied.append(
-                {
-                    "command": cmd_str,
-                    "ok": cmd_result.ok,
-                    "output": cmd_result.stdout.strip()[:200],
-                }
-            )
+    _PREFLIGHT_ALLOWED_CMDS = frozenset({
+        "systemctl", "sysctl", "sed", "nginx", "redis-cli", "psql",
+        "ip", "ss", "sar", "grep", "echo", "cat", "rm", "cp",
+        "chmod", "chown", "mkdir", "touch", "tuned-adm",
+    })
+    valid_commands = []
+    for _raw_cmd in (fix_commands if isinstance(fix_commands, list) else []):
+        _cmd = str(_raw_cmd).strip()
+        if not _cmd or _cmd.startswith("#"):
+            continue
+        if _cmd.split()[0] not in _PREFLIGHT_ALLOWED_CMDS:
+            tool_result("preflight_fix", f"BLOCKED (not allowlisted): {_cmd[:80]}")
+            continue
+        valid_commands.append(_cmd)
+
+    if valid_commands:
+        from agents.tool_gate import ToolAction, gate_and_execute
+
+        preflight_changes = {f"cmd_{i}": cmd for i, cmd in enumerate(valid_commands)}
+
+        def _execute_preflight():
+            results = []
+            for cmd_str in valid_commands:
+                tool_call("preflight_fix", cmd_str[:100])
+                # Guard: validate service config before any restart/reload
+                _svc_proc = deps.adapter.get_service_info().get("process_name", "")
+                if any(kw in cmd_str for kw in (
+                    f"restart {_svc_proc}", f"reload {_svc_proc}",
+                    "systemctl restart", "systemctl reload",
+                )):
+                    if not deps.adapter.validate_config():
+                        tool_result("preflight_fix", "SKIPPED restart — config validation failed")
+                        results.append({"command": cmd_str, "ok": False, "output": "skipped: config invalid"})
+                        continue
+                cmd_result = ssh.execute(cmd_str, timeout=120)
+                results.append({"command": cmd_str, "ok": cmd_result.ok, "output": cmd_result.stdout.strip()[:200]})
+            return {"applied": results, "failed": {}}
+
+        action = ToolAction(
+            scope="preflight",
+            changes=preflight_changes,
+            executor=_execute_preflight,
+            description=f"Execute {len(valid_commands)} preflight fix commands",
+        )
+        gate_result = gate_and_execute(action, deps.config, deps.session_id)
+        if gate_result.result:
+            fixes_applied = gate_result.result.get("applied", [])
 
     # Re-verify after fixes
     recheck: dict[str, str] = {}

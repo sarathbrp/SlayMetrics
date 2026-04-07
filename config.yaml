@@ -239,6 +239,23 @@ slack:
     - run_complete                   # final summary + report
     - error                          # crashes, nginx down, etc.
 
+tools:
+  approval_mode: auto              # auto | interactive | dry_run
+  audit_log: true                  # write audit trail to report/audit_<session>.jsonl
+  scopes:
+    webserver:
+      mode: auto
+    kernel:
+      mode: auto
+    resource_limits:
+      mode: auto
+    network:
+      mode: auto
+    storage:
+      mode: auto
+    preflight:
+      mode: auto                   # set to 'interactive' for LLM-generated command approval
+
 telemetry:
   langfuse:
-    enabled: false 
+    enabled: false

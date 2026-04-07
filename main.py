@@ -171,6 +171,7 @@ async def main(
     max_phase: int | None = None,
     planner_mode: str | None = None,
     baseline_mode: str | None = None,
+    approval_mode: str | None = None,
 ) -> None:
     # Load .env FIRST so ${DUT_HOST} etc. resolve in config.yaml
     load_dotenv()
@@ -186,6 +187,8 @@ async def main(
         cfg["agent"]["planner_mode"] = normalized_planner_mode
     if baseline_mode is not None:
         cfg["agent"]["baseline_mode"] = baseline_mode
+    if approval_mode is not None:
+        cfg.setdefault("tools", {})["approval_mode"] = approval_mode.replace("-", "_")
 
     resolved_max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
     resolved_planner_mode = str((cfg.get("agent") or {}).get("planner_mode", "debate")).strip()
@@ -357,6 +360,12 @@ if __name__ == "__main__":
             "the latest stored one for this host"
         ),
     )
+    parser.add_argument(
+        "--approval-mode",
+        choices=["auto", "interactive", "dry-run"],
+        default=None,
+        help="Tool approval mode: auto (default), interactive (prompt), dry-run (plan only)",
+    )
     args = parser.parse_args()
     try:
         asyncio.run(
@@ -367,6 +376,7 @@ if __name__ == "__main__":
                 args.max_phase,
                 args.planner_mode,
                 args.baseline_mode,
+                args.approval_mode,
             )
         )
     except KeyboardInterrupt:
