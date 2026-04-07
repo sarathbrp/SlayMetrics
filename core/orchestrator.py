@@ -202,6 +202,16 @@ async def run(model, deps: AgentDeps) -> str:
         baseline_rps=baseline_rps,
         best_rps=baseline_rps,
     )
+    # Persist baseline benchmarks to SQLite
+    for workload in ("homepage", "small", "medium", "large", "mixed"):
+        wl_data = baselines.get(workload, {})
+        if wl_data.get("rps"):
+            memory.save_benchmark(
+                session_id=session_id, iteration_num=0, phase="baseline",
+                payload_size=workload, rps=wl_data.get("rps"),
+                latency_p99_ms=wl_data.get("p99"),
+                cpu_pct=wl_data.get("cpu_pct"), mem_pct=wl_data.get("mem_mb"),
+            )
     if slack_notifier:
         try:
             slack_notifier.notify_baseline_complete(session_id=session_id, baselines=baselines)
@@ -378,6 +388,17 @@ async def run(model, deps: AgentDeps) -> str:
         if bench_tool == "hackathon":
             logger.step(f"Step 5.{iteration}: Running post-iteration benchmark (all workloads)...")
             iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
+
+        # Persist iteration benchmarks to SQLite
+        for workload in ("homepage", "small", "medium", "large", "mixed"):
+            wl_data = iteration_finals.get(workload, {})
+            if wl_data.get("rps"):
+                memory.save_benchmark(
+                    session_id=session_id, iteration_num=iteration, phase="iteration",
+                    payload_size=workload, rps=wl_data.get("rps"),
+                    latency_p99_ms=wl_data.get("p99"),
+                    cpu_pct=wl_data.get("cpu_pct"), mem_pct=wl_data.get("mem_mb"),
+                )
 
         # Check exit criteria: all workloads within 1% of baseline
         healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
@@ -586,6 +607,17 @@ async def run(model, deps: AgentDeps) -> str:
         best_rps = final_small_rps
     memory.update_profile(session_id, best_rps=best_rps)
 
+    # Persist final benchmarks to SQLite
+    for workload in ("homepage", "small", "medium", "large", "mixed"):
+        wl_data = finals.get(workload, {})
+        if wl_data.get("rps"):
+            memory.save_benchmark(
+                session_id=session_id, iteration_num=999, phase="final",
+                payload_size=workload, rps=wl_data.get("rps"),
+                latency_p99_ms=wl_data.get("p99"),
+                cpu_pct=wl_data.get("cpu_pct"), mem_pct=wl_data.get("mem_mb"),
+            )
+
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6.5: Capture system throughput limits (direct — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
@@ -665,7 +697,17 @@ async def run(model, deps: AgentDeps) -> str:
 
     _save_token_usage(memory, session_id, deps.token_counter)
 
-    memory.update_profile(session_id, status="completed")
+    # Count fixes applied from knowledge table
+    all_fixes = memory.get_facts(session_id, type="fix")
+    fixes_count = len([f for f in all_fixes if f.get("status") == "active"])
+
+    memory.complete_session(
+        session_id=session_id,
+        total_tokens=deps.token_counter.total,
+        fixes_applied=fixes_count,
+        rps_start=baseline_rps,
+        rps_end=best_rps,
+    )
 
     token_history = memory.get_token_history()
 
