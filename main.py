@@ -305,8 +305,8 @@ async def main(
                 error=str(e),
                 context=f"LLM: {profile_name} | Tokens: {token_counter.total:,}",
             )
-        except Exception:
-            pass
+        except Exception as slack_err:
+            logger.log("slack", f"Error notification failed: {slack_err}", "warn")
         raise
     finally:
         # Silent cleanup

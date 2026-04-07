@@ -18,9 +18,9 @@ DIM='\033[2m'
 NC='\033[0m'
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
-TIDB_VERSION="v8.4.0"
-TIDB_TAG="perfagent"
 VENV_DIR="$INSTALL_DIR/venv"
+SQLITE_DB_PATH="${SQLITE_DB_PATH:-$INSTALL_DIR/data/slaymetrics.db}"
+SQLITE_DB_DIR="$(dirname "$SQLITE_DB_PATH")"
 
 log()  { echo -e "${GREEN}[setup]${NC} $1"; }
 warn() { echo -e "${YELLOW}[warn]${NC}  $1"; }
@@ -115,41 +115,19 @@ else
     MISSING+=("buildtools")
 fi
 
-# ── 6. TiDB ─────────────────────────────────────────────────────────────────
-if command -v tiup &>/dev/null || [ -f "$HOME/.tiup/bin/tiup" ]; then
-    ok "TiDB (tiup)      installed"
-    PRESENT+=("tiup")
-    if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1;" &>/dev/null 2>&1; then
-        ok "  server         running on :4000"
-        PRESENT+=("tidb-running")
-    else
-        miss "  server         not running (will start)"
-        MISSING+=("tidb-start")
-    fi
+# ── 6. SQLite data path ─────────────────────────────────────────────────────
+if [ -f "$SQLITE_DB_PATH" ]; then
+    ok "SQLite DB        $SQLITE_DB_PATH"
+    PRESENT+=("sqlite-db")
+elif mkdir -p "$SQLITE_DB_DIR" 2>/dev/null; then
+    ok "SQLite path      $SQLITE_DB_PATH (will be created on first run)"
+    PRESENT+=("sqlite-path")
 else
-    miss "TiDB (tiup)      not installed"
-    MISSING+=("tiup")
+    miss "SQLite path      cannot create directory: $SQLITE_DB_DIR"
+    MISSING+=("sqlite-dir")
 fi
 
-# ── 7. MySQL client ─────────────────────────────────────────────────────────
-if command -v mysql &>/dev/null; then
-    ok "MySQL client     $(mysql --version 2>&1 | head -1 | awk '{print $3,$4,$5}')"
-    PRESENT+=("mysql")
-else
-    miss "MySQL client     not found (needed for TiDB)"
-    MISSING+=("mysql")
-fi
-
-# ── 8. TiDB schema ─────────────────────────────────────────────────────────
-if mysql -h 127.0.0.1 -P 4000 -u root -e "USE perfagent; SELECT 1;" &>/dev/null 2>&1; then
-    ok "TiDB schema      perfagent database exists"
-    PRESENT+=("schema")
-else
-    miss "TiDB schema      perfagent database not found"
-    MISSING+=("schema")
-fi
-
-# ── 9. SSH key ───────────────────────────────────────────────────────────────
+# ── 7. SSH key ───────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}Agent Connectivity:${NC}"
 if [ -f "$HOME/.ssh/id_rsa" ]; then
@@ -202,7 +180,6 @@ SYS_PKGS=()
 contains "python3"    "${MISSING[@]}" && SYS_PKGS+=(python3)
 contains "pip3"       "${MISSING[@]}" && SYS_PKGS+=(python3-pip)
 contains "buildtools" "${MISSING[@]}" && SYS_PKGS+=(git gcc make openssl-devel zlib-devel)
-contains "mysql"      "${MISSING[@]}" && SYS_PKGS+=(mariadb)
 
 if [ ${#SYS_PKGS[@]} -gt 0 ]; then
     log "Installing system packages: ${SYS_PKGS[*]}"
@@ -239,40 +216,10 @@ if contains "pydeps" "${MISSING[@]}"; then
     log "Venv ready: $VENV_DIR"
 fi
 
-# ── TiDB ─────────────────────────────────────────────────────────────────────
-if contains "tiup" "${MISSING[@]}"; then
-    log "Installing TiDB (tiup)..."
-    curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh 2>&1 | tail -3
-fi
-export PATH="$PATH:$HOME/.tiup/bin"
-grep -q '.tiup/bin' "$HOME/.bashrc" 2>/dev/null || \
-    echo 'export PATH=$PATH:$HOME/.tiup/bin' >> "$HOME/.bashrc"
-
-if contains "tiup" "${MISSING[@]}" || contains "tidb-start" "${MISSING[@]}"; then
-    if ! mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1;" &>/dev/null 2>&1; then
-        log "Starting TiDB ${TIDB_VERSION} (this may take a few minutes on first run)..."
-        nohup tiup playground "$TIDB_VERSION" --tag "$TIDB_TAG" > /tmp/tidb.log 2>&1 &
-
-        log "Waiting for TiDB to start..."
-        for i in $(seq 1 60); do
-            if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1;" &>/dev/null 2>&1; then
-                break
-            fi
-            sleep 5
-        done
-
-        if ! mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1;" &>/dev/null 2>&1; then
-            err "TiDB failed to start. Check /tmp/tidb.log"
-        fi
-        log "TiDB $(mysql -h 127.0.0.1 -P 4000 -u root -e 'SELECT VERSION();' -sN) running"
-    fi
-fi
-
-# ── Schema ───────────────────────────────────────────────────────────────────
-if contains "schema" "${MISSING[@]}"; then
-    log "Bootstrapping TiDB schema..."
-    mysql -h 127.0.0.1 -P 4000 -u root < "$INSTALL_DIR/schema.sql"
-    log "Tables: $(mysql -h 127.0.0.1 -P 4000 -u root -e 'USE perfagent; SHOW TABLES;' -sN | tr '\n' ', ')"
+# ── SQLite path fixup ───────────────────────────────────────────────────────
+if contains "sqlite-dir" "${MISSING[@]}"; then
+    log "Creating SQLite directory: $SQLITE_DB_DIR"
+    mkdir -p "$SQLITE_DB_DIR" || err "Failed to create SQLite directory: $SQLITE_DB_DIR"
 fi
 
 # ── SSH key ──────────────────────────────────────────────────────────────────
@@ -298,7 +245,12 @@ log "  SlayMetricsAgent bench node ready"
 log "============================================"
 echo ""
 echo "  wrk2:     $(which wrk2 2>/dev/null || echo 'not found')"
-echo "  TiDB:     :4000"
+if [ -f "$SQLITE_DB_PATH" ]; then
+    SQLITE_STATE="present"
+else
+    SQLITE_STATE="not created yet (auto-created on first run)"
+fi
+echo "  SQLite:   $SQLITE_DB_PATH ($SQLITE_STATE)"
 echo "  Python:   $($VENV_DIR/bin/python3 --version 2>&1)"
 echo "  Venv:     $VENV_DIR"
 echo "  Agent:    $INSTALL_DIR"

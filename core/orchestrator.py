@@ -30,6 +30,13 @@ async def run(model, deps: AgentDeps) -> str:
     memory = deps.memory
     langfuse = getattr(deps, "langfuse", None)
     max_phase = int((cfg.get("agent") or {}).get("max_phase", 4))
+    slack_notifier = None
+    try:
+        from core.slack_notifier import SlackNotifier
+
+        slack_notifier = SlackNotifier(cfg)
+    except Exception as e:
+        logger.log("slack", f"Notifier unavailable: {e}", "warn")
 
     logger.panel(
         "SlayMetricsAgent",
@@ -91,6 +98,22 @@ async def run(model, deps: AgentDeps) -> str:
         f"{rhel_ver}, Kernel: {kernel_ver}, CPU: {cpu_cores} cores, RAM: {ram_gb} GB"
     )
     logger.status("system", f"RHEL: {deps.system_fingerprint}")
+    if slack_notifier:
+        issue_count: dict[str, int] = {}
+        for chk in checks:
+            status = str(getattr(chk, "status", "unknown") or "unknown").strip().lower()
+            issue_count[status] = issue_count.get(status, 0) + 1
+        try:
+            slack_notifier.notify_run_start(
+                session_id=session_id,
+                dut_host=cfg["target"]["host"],
+                llm_profile=cfg["llm"]["active_profile"],
+                cpu_cores=cpu_cores,
+                ram_gb=ram_gb,
+                issue_count=issue_count,
+            )
+        except Exception as e:
+            logger.log("slack", f"run_start notify failed: {e}", "warn")
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1.7: Pre-flight validation (LLM-assisted)
@@ -179,6 +202,11 @@ async def run(model, deps: AgentDeps) -> str:
         baseline_rps=baseline_rps,
         best_rps=baseline_rps,
     )
+    if slack_notifier:
+        try:
+            slack_notifier.notify_baseline_complete(session_id=session_id, baselines=baselines)
+        except Exception as e:
+            logger.log("slack", f"baseline_complete notify failed: {e}", "warn")
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 2.5: Aggregate benchmark evidence from bench + DUT telemetry
@@ -268,6 +296,22 @@ async def run(model, deps: AgentDeps) -> str:
     best_iteration_finals: dict[str, Any] = {}
     best_iteration_rps: float = 0.0
 
+    def _notify_iteration(decision_text: str, results: dict[str, Any]) -> None:
+        if not slack_notifier:
+            return
+        try:
+            slack_notifier.notify_iteration_complete(
+                session_id=session_id,
+                iteration=iteration,
+                baselines=baselines,
+                results=results or baselines,
+                guardrails_triggered=getattr(diagnosis, "guardrails_triggered", None),
+                tokens_used=deps.token_counter.total,
+                decision=decision_text,
+            )
+        except Exception as e:
+            logger.log("slack", f"iteration_complete notify failed: {e}", "warn")
+
     for iteration in range(1, max_iterations + 1):
         logger.step(
             f"Step 5: Iteration {iteration}/{max_iterations} — RCA and recommendation planning..."
@@ -327,6 +371,7 @@ async def run(model, deps: AgentDeps) -> str:
                 decision=decision,
                 diagnosis=diagnosis,
             )
+            _notify_iteration(decision, iteration_finals or baselines)
             break
 
         # Benchmark ALL workloads to check for regressions
@@ -391,6 +436,7 @@ async def run(model, deps: AgentDeps) -> str:
                 decision=decision,
                 diagnosis=diagnosis,
             )
+            _notify_iteration(decision, iteration_finals)
             # Don't break — always run max_iterations to explore optimization groups
 
         if iteration >= max_iterations:
@@ -405,6 +451,7 @@ async def run(model, deps: AgentDeps) -> str:
                 decision=decision,
                 diagnosis=diagnosis,
             )
+            _notify_iteration(decision, iteration_finals)
             break
 
         # Continuing to next iteration
@@ -420,6 +467,7 @@ async def run(model, deps: AgentDeps) -> str:
                 decision=decision,
                 diagnosis=diagnosis,
             )
+            _notify_iteration(decision, iteration_finals)
 
         iteration_feedback = _build_iteration_feedback(
             iteration=iteration,
@@ -467,6 +515,17 @@ async def run(model, deps: AgentDeps) -> str:
             f"Report: {report_path}\n"
             f"Log: report/log_*_{session_id}.md",
         )
+        if slack_notifier:
+            try:
+                slack_notifier.notify_run_complete(
+                    session_id=session_id,
+                    baselines=baselines,
+                    finals=baselines,
+                    total_tokens=deps.token_counter.total,
+                    report_path=report_path,
+                )
+            except Exception as e:
+                logger.log("slack", f"run_complete notify failed: {e}", "warn")
         return report_path
 
     # Update best RPS from agent's result
@@ -649,6 +708,17 @@ async def run(model, deps: AgentDeps) -> str:
             },
             metadata={"session_id": session_id},
         )
+    if slack_notifier:
+        try:
+            slack_notifier.notify_run_complete(
+                session_id=session_id,
+                baselines=baselines,
+                finals=finals,
+                total_tokens=deps.token_counter.total,
+                report_path=report_path,
+            )
+        except Exception as e:
+            logger.log("slack", f"run_complete notify failed: {e}", "warn")
     return report_path
 
 
