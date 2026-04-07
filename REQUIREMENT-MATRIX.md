@@ -17,7 +17,7 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 | 1.1 | `main.py` entry point — loads config, wires deps, starts orchestrator | `[x]` | session resume support; CLI overrides are optional |
 | 1.2 | `config.yaml` — all config externalized, no hardcoding | `[x]` | all sections, profiles; planner_mode preserved unless CLI overrides |
 | 1.3 | `requirements.txt` with pinned deps | `[x]` | |
-| 1.4 | `schema.sql` — TiDB bootstrap script | `[x]` | 4 tables + indexes |
+| 1.4 | Database schema — embedded in sqlite_store.py | `[x]` | Auto-created on connect |
 | 1.5 | `README.md` — usage instructions for customer | `[x]` | |
 
 ---
@@ -35,11 +35,11 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 
 ---
 
-## 3. Memory Layer (TiDB — Knowledge-Scoped)
+## 3. Memory Layer (SQLite — Knowledge-Scoped)
 
 | # | Requirement | Status | Notes |
 |---|-------------|--------|-------|
-| 3.1 | TiDB v8.4+ self-hosted via `tiup playground` | `[x]` | schema.sql |
+| 3.1 | SQLite database (automatic, no setup) | `[x]` | Schema embedded in sqlite_store.py |
 | 3.2 | `systems` table — persistent host+service identity | `[x]` | Replaces old `profile` |
 | 3.3 | `sessions` table — per-run metadata, tokens, outcome | `[x]` | New; completion now finalized via `complete_session()` |
 | 3.4 | `knowledge` table — scoped facts with confidence scoring | `[x]` | Replaces old `facts`; fix facts are deduped per logical system-level change |
@@ -47,14 +47,14 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 | 3.6 | `benchmarks` table — structured perf data (never expires) | `[x]` | New, replaces TEXT blobs |
 | 3.7 | `context` table — session-scoped working memory with iteration_num | `[x]` | Updated, no embeddings |
 | 3.8 | `hypothesis_queue` table — with source provenance + knowledge_ref | `[x]` | Updated |
-| 3.9 | `TiDBStore` class — read/write for all 7 tables | `[x]` | memory/tidb_store.py |
-| 3.10 | Vector search over knowledge (semantic symptom recall) | `[x]` | `VEC_COSINE_DISTANCE()` |
+| 3.9 | `SQLiteStore` class — read/write for all 7 tables | `[x]` | memory/sqlite_store.py |
+| 3.10 | Vector search over knowledge (semantic symptom recall) | `[x]` | Cosine distance in Python |
 | 3.11 | `embeddings.py` — text → vector (Claude embeddings or local) | `[x]` | Claude + LocalEmbeddings fallback |
-| 3.12 | Agent survives restart — resumes from TiDB state | `[x]` | `populate_queue` skips if exists |
+| 3.12 | Agent survives restart — resumes from SQLite state | `[x]` | `populate_queue` skips if exists |
 | 3.13 | Cross-system learning — knowledge for service type | `[x]` | `get_knowledge_for_service()` |
 | 3.14 | Confidence scoring — grows with validations | `[x]` | Auto-updates on save_validation |
 | 3.15 | Knowledge promotion pipeline — system → service_type | `[x]` | `run_knowledge_promotion()` |
-| 3.16 | Backward-compatible API — old callers work unchanged | `[x]` | Facade methods in TiDBStore |
+| 3.16 | Backward-compatible API — old callers work unchanged | `[x]` | Facade methods in SQLiteStore |
 
 ---
 
@@ -79,7 +79,7 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 | 5.4 | Analyzer sub-agent — interprets context, `AnalysisResult` output | `[x]` | agents/analyzer.py |
 | 5.5 | Remediation sub-agent — applies fix, `RemediationResult` output | `[x]` | agents/remediation.py |
 | 5.6 | Benchmark sub-agent — wrk2/pgbench, `BenchmarkResult` output | `[x]` | agents/benchmark.py |
-| 5.7 | Each sub-agent born fresh, writes to TiDB, exits — no context accumulation | `[x]` | each agent is a fresh Agent() call |
+| 5.7 | Each sub-agent born fresh, writes to SQLite, exits — no context accumulation | `[x]` | each agent is a fresh Agent() call |
 
 ---
 
@@ -91,7 +91,7 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 | 6.2 | `run_benchmark(duration)` — wrk2/pgbench → `BenchmarkResult` | `[x]` | benchmark, remediation agents |
 | 6.3 | `apply_config_change(param, value, reason)` — write config + log decision | `[x]` | remediation agent |
 | 6.4 | `reload_service(reason)` — systemctl reload | `[x]` | remediation agent |
-| 6.5 | `query_memory(symptom)` — vector search TiDB facts + context | `[x]` | analyzer agent |
+| 6.5 | `query_memory(symptom)` — vector search facts + context | `[x]` | analyzer agent |
 | 6.6 | `save_finding(finding, outcome)` — persist to Facts table | `[x]` | remediation agent |
 | 6.7 | `get_hypothesis_queue()` — return pending hypotheses | `[x]` | decision_engine + orchestrator |
 | 6.8 | `mark_hypothesis_done(name, outcome)` — update queue status | `[x]` | decision_engine |
@@ -153,7 +153,7 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 | # | Requirement | Status | Notes |
 |---|-------------|--------|-------|
 | 10.1 | Hypothesis queue pre-populated from adapter on first run | `[x]` | decision_engine.populate() |
-| 10.2 | Queue ordered by priority (P1 → P2 → P3) | `[x]` | TiDB ORDER BY priority |
+| 10.2 | Queue ordered by priority (P1 → P2 → P3) | `[x]` | SQLite ORDER BY priority |
 | 10.3 | Vector memory checked before testing each hypothesis | `[x]` | analyzer.query_memory() |
 | 10.4 | One change at a time — benchmark between every change | `[x]` | remediation agent + ranked optimization mode enforce one group per iteration |
 | 10.5 | Hypothesis marked done after test (pass or fail) | `[x]` | engine.mark_done/skipped |
@@ -199,7 +199,7 @@ Track implementation status of every requirement from REQUIREMENTS.md.
 |---|-------------|--------|-------|
 | 13.1 | No hardcoded values — all in `config.yaml` | `[x]` | |
 | 13.2 | No black box — every decision logged with supporting data | `[x]` | reason field on all tools; offline debate eval harness (`core/eval_harness.py`) scores saved inspection + expert artifacts with deterministic findings/corrections, debate mode logs/persists observational eval results as `iterN_debate_eval`, synthesizer eval filters non-critical omissions while checking target drift/key normalization/risk calibration, the harness now tolerates legacy/raw Nginx+RHEL expert shapes (`issue/expected`, alias keys, cross-category lookups), and completed runs persist a final effective DUT config snapshot for dashboard truth |
-| 13.3 | Context-stateless — TiDB is source of truth, not message history | `[x]` | fresh agent per iteration |
+| 13.3 | Context-stateless — SQLite is source of truth, not message history | `[x]` | fresh agent per iteration |
 | 13.4 | Idempotent — safe to run multiple times, no double-applied fixes | `[x]` | populate_queue skips if exists |
 | 13.5 | Single command to run: `python main.py` | `[x]` | |
 

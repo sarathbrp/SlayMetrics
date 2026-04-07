@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Load knowledge documents from facts/ into TiDB for agent semantic search.
+"""Load knowledge documents from facts/ into the database for agent semantic search.
 
 Reads .md files from the facts/ directory, chunks them by section headers,
-embeds each chunk, and stores them in the facts table as type='knowledge'.
+embeds each chunk, and stores them in the knowledge table as type='knowledge'.
 
 Usage:
     python tools/load_facts.py
@@ -63,35 +63,38 @@ def chunk_markdown(text: str, source_file: str) -> list[dict]:
     return chunks
 
 
+def _get_store(cfg: dict, embedder):
+    """Create the SQLite memory store from config."""
+    from memory.sqlite_store import from_config
+    store = from_config(cfg, embedder)
+    store.connect()
+    return store
+
+
 def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
     embedder = embedder_from_config(cfg)
-
-    m = cfg["memory"]
-    conn_kwargs = dict(
-        host=m["host"],
-        port=int(m.get("port", 4000)),
-        user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",
-        database=m["database"],
-        charset="utf8mb4",
-        autocommit=True,
-    )
-
-    import pymysql
-    import pymysql.cursors
-
-    conn = pymysql.connect(**conn_kwargs, cursorclass=pymysql.cursors.DictCursor)
+    store = _get_store(cfg, embedder)
 
     if clear:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
-            print("Cleared existing knowledge entries.")
+        # Use raw connection for bulk delete
+        if hasattr(store, '_conn') and store._conn:
+            conn = store._conn
+            if hasattr(conn, 'cursor'):
+                cur = conn.cursor()
+                try:
+                    cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
+                    if hasattr(conn, 'commit'):
+                        conn.commit()
+                except Exception:
+                    pass
+        print("Cleared existing knowledge entries.")
 
     # Find all .md files
     md_files = sorted(f for f in os.listdir(facts_dir) if f.endswith(".md"))
 
     if not md_files:
         print(f"No .md files found in {facts_dir}")
+        store.disconnect()
         return 0
 
     total = 0
@@ -108,31 +111,24 @@ def load_facts(facts_dir: str, cfg: dict, clear: bool = False) -> int:
             embed_text = f"{chunk['title']} {chunk['body'][:2000]}"
             embedding = embedder.embed(embed_text)
 
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO knowledge
-                        (id, discovered_by, scope, type, parameter, reasoning, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                    (
-                        fid,
-                        "__knowledge__",
-                        "universal",
-                        "knowledge",
-                        chunk["title"],
-                        chunk["body"][:10000],
-                        json.dumps(embedding),
-                    ),
-                )
+            conn = store._conn
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO knowledge
+                    (id, discovered_by, scope, type, parameter, reasoning, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (fid, "__knowledge__", "universal", "knowledge",
+                 chunk["title"], chunk["body"][:10000], json.dumps(embedding)),
+            )
+            conn.commit()
             total += 1
 
-    conn.close()
+    store.disconnect()
     return total
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Load knowledge docs from facts/ into TiDB")
+    parser = argparse.ArgumentParser(description="Load knowledge docs from facts/ into database")
     parser.add_argument("--dir", default="facts", help="Directory with .md files (default: facts/)")
     parser.add_argument(
         "--config", default="config.yaml", help="Config file (default: config.yaml)"
@@ -144,9 +140,7 @@ def main():
 
     cfg = load_config(args.config)
     total = load_facts(args.dir, cfg, clear=args.clear)
-    print(
-        f"\nLoaded {total} chunks into TiDB knowledge table (type='knowledge', scope='universal')."
-    )
+    print(f"\nLoaded {total} chunks into SQLite knowledge table (type='knowledge', scope='universal').")
     print("Agent can now query these via semantic search during diagnosis.")
 
 

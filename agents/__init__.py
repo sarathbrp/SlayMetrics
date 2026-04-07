@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from adapters.base import ServiceAdapter
-from memory.tidb_store import TiDBStore
 from services import ServiceProfile
 from tools.ssh import LocalClient, SSHClient
 
@@ -89,7 +88,7 @@ class TokenCounter:
 @dataclass
 class AgentDeps:
     adapter: ServiceAdapter
-    memory: TiDBStore
+    memory: Any  # memory store — duck-typed
     ssh: LocalClient | SSHClient
     session_id: str
     config: dict

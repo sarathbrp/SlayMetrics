@@ -2,7 +2,7 @@
 """Reset target system to clean state before a fresh agent run.
 
 Reverts nginx config to default, clears sysctl/cgroup/iptables/tc changes,
-and optionally clears TiDB session data.
+and optionally clears SQLite session data.
 
 Usage:
     python3 tools/reset.py                      # reset system only
@@ -183,17 +183,14 @@ def reset_system(client, cfg: dict | None = None) -> None:
 
 
 def clear_db(cfg: dict) -> None:
-    import pymysql
+    import sqlite3
 
-    m = cfg["memory"]
-    conn = pymysql.connect(
-        host=m["host"],
-        port=int(m.get("port", 4000)),
-        user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
-        database=m["database"],
-        autocommit=True,
-    )
+    m = cfg.get("memory") or {}
+    db_path = m.get("path", "data/slaymetrics.db")
+    if not os.path.exists(db_path):
+        print(f"  [sqlite] Database not found at {db_path} — nothing to clear")
+        return
+    conn = sqlite3.connect(db_path)
     tables = [
         "validations",
         "benchmarks",
@@ -201,19 +198,20 @@ def clear_db(cfg: dict) -> None:
         "hypothesis_queue",
         "sessions",
     ]
-    with conn.cursor() as cur:
-        for table in tables:
-            try:
-                cur.execute(f"DELETE FROM {table}")
-            except pymysql.err.ProgrammingError:
-                pass  # table doesn't exist yet — skip
+    cur = conn.cursor()
+    for table in tables:
         try:
-            cur.execute("DELETE FROM knowledge WHERE type != 'knowledge'")
-        except pymysql.err.ProgrammingError:
-            pass
-        # Keep systems — they persist across sessions
+            cur.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist yet — skip
+    try:
+        cur.execute("DELETE FROM knowledge WHERE type != 'knowledge'")
+    except sqlite3.OperationalError:
+        pass
+    # Keep systems — they persist across sessions
+    conn.commit()
     conn.close()
-    print("  [tidb] Cleared all sessions (knowledge base and systems preserved)")
+    print("  [sqlite] Cleared all sessions (knowledge base and systems preserved)")
 
 
 def clear_leaderboard(cfg: dict) -> None:
@@ -222,17 +220,14 @@ def clear_leaderboard(cfg: dict) -> None:
     Use this for a fresh start of the lessons-learned system while
     keeping the system identity intact.
     """
-    import pymysql
+    import sqlite3
 
-    m = cfg["memory"]
-    conn = pymysql.connect(
-        host=m["host"],
-        port=int(m.get("port", 4000)),
-        user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
-        database=m["database"],
-        autocommit=True,
-    )
+    m = cfg.get("memory") or {}
+    db_path = m.get("path", "data/slaymetrics.db")
+    if not os.path.exists(db_path):
+        print(f"  [sqlite] Database not found at {db_path} — nothing to clear")
+        return
+    conn = sqlite3.connect(db_path)
     tables_to_clear = [
         "apply_failures",
         "validations",
@@ -242,28 +237,26 @@ def clear_leaderboard(cfg: dict) -> None:
         "knowledge",
         "sessions",
     ]
-    with conn.cursor() as cur:
-        for table in tables_to_clear:
-            try:
-                cur.execute(f"DELETE FROM {table}")
-            except pymysql.err.ProgrammingError:
-                pass
+    cur = conn.cursor()
+    for table in tables_to_clear:
+        try:
+            cur.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
     conn.close()
-    print("  [tidb] Cleared leaderboard, knowledge, and all session data (systems preserved)")
+    print("  [sqlite] Cleared leaderboard, knowledge, and all session data (systems preserved)")
 
 
 def reset_all_db(cfg: dict) -> None:
-    import pymysql
+    import sqlite3
 
-    m = cfg["memory"]
-    conn = pymysql.connect(
-        host=m["host"],
-        port=int(m.get("port", 4000)),
-        user=m["user"],
-        password=os.environ.get(m.get("password_env", ""), "") or "",  # pragma: allowlist secret
-        database=m["database"],
-        autocommit=True,
-    )
+    m = cfg.get("memory") or {}
+    db_path = m.get("path", "data/slaymetrics.db")
+    if not os.path.exists(db_path):
+        print(f"  [sqlite] Database not found at {db_path} — nothing to clear")
+        return
+    conn = sqlite3.connect(db_path)
     tables = [
         "apply_failures",
         "validations",
@@ -274,12 +267,13 @@ def reset_all_db(cfg: dict) -> None:
         "sessions",
         "systems",
     ]
-    with conn.cursor() as cur:
-        for table in tables:
-            try:
-                cur.execute(f"DELETE FROM {table}")
-            except pymysql.err.ProgrammingError:
-                pass  # table doesn't exist yet — skip
+    cur = conn.cursor()
+    for table in tables:
+        try:
+            cur.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass  # table doesn't exist yet — skip
+    conn.commit()
     conn.close()
 
     # Remove knowledge hash so facts/ get reloaded on next run
@@ -289,17 +283,17 @@ def reset_all_db(cfg: dict) -> None:
     if os.path.exists(hash_file):
         os.remove(hash_file)
 
-    print("  [tidb] Cleared EVERYTHING — sessions, fixes, AND knowledge base")
+    print("  [sqlite] Cleared EVERYTHING — sessions, fixes, AND knowledge base")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Reset system to clean state")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument(
-        "--clear-db", action="store_true", help="Clear TiDB session data (preserves knowledge base)"
+        "--clear-db", action="store_true", help="Clear session data (preserves knowledge base)"
     )
     parser.add_argument(
-        "--reset-all", action="store_true", help="Clear EVERYTHING in TiDB including knowledge base"
+        "--reset-all", action="store_true", help="Clear EVERYTHING including knowledge base"
     )
     parser.add_argument(
         "--clear-leaderboard",

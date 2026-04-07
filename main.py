@@ -15,7 +15,6 @@ from agents import AgentDeps, TokenCounter
 from services import load_profile
 from core import log as logger
 from memory.embeddings import from_config as embedder_from_config
-from memory.tidb_store import from_config as tidb_from_config
 from models import create_model
 from telemetry import LangfuseClient
 from tools.ssh import from_config as ssh_from_config
@@ -60,7 +59,7 @@ def get_model(cfg: dict):
 
 
 def load_knowledge(cfg: dict, embedder, memory) -> None:
-    """Load facts/ knowledge docs into TiDB if they've changed since last load."""
+    """Load facts/ knowledge docs into SQLite if they've changed since last load."""
     facts_dir = Path(__file__).parent / "facts"
     if not facts_dir.exists():
         return
@@ -81,25 +80,19 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
         logger.status("knowledge", f"{len(md_files)} docs (unchanged, skipping load)")
         return
 
-    # Load knowledge into TiDB
-    logger.status("knowledge", f"Loading {len(md_files)} docs into TiDB...")
-    import pymysql
+    # Load knowledge into SQLite
+    logger.status("knowledge", f"Loading {len(md_files)} docs into database...")
+    import sqlite3
 
-    conn_kwargs = dict(
-        host=cfg["memory"]["host"],
-        port=int(cfg["memory"].get("port", 4000)),
-        user=cfg["memory"]["user"],
-        password=os.environ.get(cfg["memory"].get("password_env", ""), "") or "",
-        database=cfg["memory"]["database"],
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-    )
-    conn = pymysql.connect(**conn_kwargs)
+    conn = memory._conn
+    if conn is None:
+        logger.status("knowledge", "No database connection — skipping knowledge load")
+        return
 
     # Clear old knowledge
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM knowledge WHERE type = 'knowledge'")
+    conn.commit()
 
     total = 0
     for filepath in md_files:
@@ -109,27 +102,26 @@ def load_knowledge(cfg: dict, embedder, memory) -> None:
             fid = str(uuid.uuid4())
             embed_text = f"{chunk['title']} {chunk['body'][:2000]}"
             embedding = embedder.embed(embed_text)
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO knowledge
-                        (id, discovered_by, scope, type, parameter, reasoning, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+            cur.execute(
+                """
+                INSERT INTO knowledge
+                    (id, discovered_by, scope, type, parameter, reasoning, embedding)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                    (
-                        fid,
-                        "__knowledge__",
-                        "universal",
-                        "knowledge",
-                        chunk["title"],
-                        chunk["body"][:10000],
-                        json.dumps(embedding),
-                    ),
-                )
+                (
+                    fid,
+                    "__knowledge__",
+                    "universal",
+                    "knowledge",
+                    chunk["title"],
+                    chunk["body"][:10000],
+                    json.dumps(embedding),
+                ),
+            )
             total += 1
         logger.status("knowledge", f"  {filepath.name}: {len(chunks)} chunks")
 
-    conn.close()
+    conn.commit()
     hash_file.write_text(current_hash)
     logger.status("knowledge", f"{total} chunks loaded")
 
@@ -202,11 +194,12 @@ async def main(
     logger.init(session_id, verbose=verbose)
     logger.status("main", f"Session: {session_id}")
 
-    # Wire up dependencies
+    # Wire up dependencies — SQLite memory backend
     embedder = embedder_from_config(cfg)
-    memory = tidb_from_config(cfg, embedder)
+    from memory.sqlite_store import from_config as store_from_config
+    memory = store_from_config(cfg, embedder)
     memory.connect()
-    logger.status("main", "TiDB connected")
+    logger.status("main", "SQLite connected")
 
     # Load knowledge base (facts/ folder) — skips if unchanged
     load_knowledge(cfg, embedder, memory)

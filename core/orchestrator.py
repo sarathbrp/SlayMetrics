@@ -215,7 +215,7 @@ async def run(model, deps: AgentDeps) -> str:
     )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4a: Check context — previously applied fixes (TiDB — no LLM)
+    # STEP 4a: Check context — previously applied fixes (database — no LLM)
     # ══════════════════════════════════════════════════════════════════════════
     logger.step("Step 4a: Checking for previously applied fixes...")
     # Only use current session's fixes — cross-session fixes may be stale
@@ -821,7 +821,7 @@ def _mark_facts_reverted(
     iteration: int,
     memory: Any,
 ) -> None:
-    """Mark this iteration's applied facts as reverted in TiDB knowledge store."""
+    """Mark this iteration's applied facts as reverted in the knowledge store."""
     for fact in iteration_facts:
         param = fact.get("parameter", "")
         if not any(param.startswith(p) for p in _SYSCTL_PREFIXES):

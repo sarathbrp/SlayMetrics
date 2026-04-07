@@ -11,11 +11,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    import pymysql
-    import pymysql.cursors
-except ImportError:  # pragma: no cover - optional in some dev environments
-    pymysql = None
 
 PRECISE_BUNDLE_MAP: dict[str, str] = {
     "worker_processes": "nginx core concurrency",
@@ -102,274 +97,6 @@ IGNORED_SESSION_IDS = {"fc1e49d9"}
 LEADERBOARD_LIMIT = 30
 
 
-def _tidb_settings(data_dir: str) -> dict[str, object] | None:
-    env_host = os.environ.get("TIDB_HOST", "").strip()
-    if env_host:
-        return {
-            "host": env_host,
-            "port": int(os.environ.get("TIDB_PORT", "4000")),
-            "user": os.environ.get("TIDB_USER", "root"),
-            "password": os.environ.get("TIDB_PASSWORD", ""),
-            "database": os.environ.get("TIDB_DATABASE", "perfagent"),
-        }
-
-    config_path = Path(data_dir) / "config.yaml"
-    if not config_path.exists():
-        return None
-
-    memory_values: dict[str, str] = {}
-    in_memory = False
-    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\S", line):
-            in_memory = line.startswith("memory:")
-            continue
-        if not in_memory:
-            continue
-        match = re.match(r"^\s+([A-Za-z0-9_]+):\s*(.+?)\s*$", line)
-        if not match:
-            continue
-        key = match.group(1)
-        value = match.group(2).split("#", 1)[0].strip().strip("'\"")
-        memory_values[key] = value
-
-    if not memory_values.get("host"):
-        return None
-
-    password = ""
-    password_env = memory_values.get("password_env")
-    if password_env:
-        password = os.environ.get(password_env, "")
-
-    return {
-        "host": memory_values.get("host", "127.0.0.1"),
-        "port": int(memory_values.get("port", "4000")),
-        "user": memory_values.get("user", "root"),
-        "password": password,
-        "database": memory_values.get("database", "perfagent"),
-    }
-
-
-def _load_parameter_summary_from_tidb(data_dir: str) -> dict | None:
-    if pymysql is None:
-        return None
-
-    settings = _tidb_settings(data_dir)
-    if not settings:
-        return None
-
-    try:
-        conn = pymysql.connect(
-            host=str(settings["host"]),
-            port=int(settings["port"]),
-            user=str(settings["user"]),
-            password=str(settings["password"]),
-            database=str(settings["database"]),
-            charset="utf8mb4",
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=True,
-        )
-    except Exception:
-        return None
-
-    try:
-        return _build_tidb_summary(conn, data_dir)
-    except Exception:
-        return None
-    finally:
-        conn.close()
-
-
-def _build_tidb_summary(conn, data_dir: str) -> dict:
-    hypo_root = Path(data_dir) / "hypothesis"
-    session_rows: list[dict] = []
-    session_states: dict[str, dict[str, dict]] = {}
-    session_precise_applied: dict[str, dict[str, str]] = {}
-    session_param_sources: dict[str, dict[str, set[str]]] = {}
-    parameter_sessions: dict[str, dict[str, dict]] = defaultdict(dict)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                s.id AS session_id,
-                s.status,
-                s.rps_delta_pct,
-                s.started_at,
-                s.completed_at,
-                COALESCE(
-                    MAX(CASE WHEN b.payload_size = 'small' THEN b.rps END),
-                    0
-                ) AS best_small_rps,
-                COALESCE(
-                    MAX(CASE WHEN b.payload_size = 'homepage' THEN b.rps END),
-                    0
-                ) AS best_homepage_rps
-            FROM sessions s
-            LEFT JOIN benchmarks b ON b.session_id = s.id
-            GROUP BY s.id, s.status, s.rps_delta_pct, s.started_at, s.completed_at
-            ORDER BY s.started_at DESC
-            """
-        )
-        session_meta_rows = cur.fetchall()
-
-        cur.execute(
-            """
-            SELECT
-                v.session_id,
-                v.outcome,
-                v.created_at,
-                k.parameter,
-                k.before_value,
-                k.after_value
-            FROM validations v
-            JOIN knowledge k ON k.id = v.knowledge_id
-            ORDER BY v.session_id ASC, v.created_at ASC, k.created_at ASC
-            """
-        )
-        validation_rows = cur.fetchall()
-
-        cur.execute(
-            """
-            SELECT session_id, content
-            FROM context
-            WHERE source = 'final_effective_config_snapshot'
-            ORDER BY created_at DESC
-            """
-        )
-        snapshot_rows = cur.fetchall()
-
-    validation_rows_by_session: dict[str, list[dict]] = defaultdict(list)
-    for row in validation_rows:
-        validation_rows_by_session[str(row.get("session_id"))].append(row)
-    snapshot_by_session: dict[str, dict[str, str]] = {}
-    for row in snapshot_rows:
-        session_id = str(row.get("session_id") or "")
-        if session_id in snapshot_by_session:
-            continue
-        snapshot_by_session[session_id] = _parse_effective_snapshot(row.get("content"))
-
-    for meta in session_meta_rows:
-        session_id = str(meta["session_id"])
-        validation_rows = validation_rows_by_session.get(session_id, [])
-        if not validation_rows and float(meta.get("best_small_rps") or 0.0) <= 0:
-            continue
-
-        session_state: dict[str, dict] = {}
-        effective_applied: dict[str, str] = {}
-        session_param_sources[session_id] = _collect_sources_for_session(hypo_root, session_id)
-
-        for row in validation_rows:
-            raw_parameter = str(row.get("parameter") or "").strip()
-            parameter = _normalize_tidb_parameter(raw_parameter)
-            if not parameter:
-                continue
-            after_value = str(row.get("after_value") or "").strip()
-            before_value = str(row.get("before_value") or "").strip()
-            outcome = str(row.get("outcome") or "").strip()
-
-            state = session_state.setdefault(
-                parameter,
-                {
-                    "parameter": parameter,
-                    "scope": _scope_for_parameter(raw_parameter),
-                    "recommended": True,
-                    "applied": False,
-                    "rejected": False,
-                    "values": set(),
-                    "titles": set(),
-                },
-            )
-            state["recommended"] = True
-            if after_value:
-                state["values"].add(after_value)
-
-            if outcome == "confirmed":
-                if after_value:
-                    effective_applied[parameter] = after_value
-            elif outcome == "contradicted":
-                state["rejected"] = True
-                if (
-                    parameter in effective_applied
-                    and str(effective_applied[parameter]) == after_value
-                ):
-                    effective_applied.pop(parameter, None)
-                elif not after_value and before_value and parameter in effective_applied:
-                    effective_applied.pop(parameter, None)
-
-        for parameter in effective_applied:
-            session_state.setdefault(
-                parameter,
-                {
-                    "parameter": parameter,
-                    "scope": _scope_for_parameter(parameter),
-                    "recommended": True,
-                    "applied": False,
-                    "rejected": False,
-                    "values": set(),
-                    "titles": set(),
-                },
-            )["applied"] = True
-
-        snapshot_effective = snapshot_by_session.get(session_id) or {}
-        if snapshot_effective:
-            effective_applied = dict(snapshot_effective)
-            for parameter, value in snapshot_effective.items():
-                state = session_state.setdefault(
-                    parameter,
-                    {
-                        "parameter": parameter,
-                        "scope": _scope_for_parameter(parameter),
-                        "recommended": True,
-                        "applied": False,
-                        "rejected": False,
-                        "values": set(),
-                        "titles": set(),
-                    },
-                )
-                state["applied"] = True
-                state["recommended"] = True
-                state["values"].add(str(value))
-
-        timestamp = _format_tidb_timestamp(meta.get("completed_at") or meta.get("started_at"))
-        best_small_rps = float(meta.get("best_small_rps") or 0.0)
-        best_homepage_rps = float(meta.get("best_homepage_rps") or 0.0)
-        improvement = float(meta.get("rps_delta_pct") or 0.0)
-
-        session_rows.append(
-            {
-                "session_id": session_id,
-                "timestamp": timestamp,
-                "improvement_pct": round(improvement, 2),
-                "iterations": 0,
-                "parameter_count": len(session_state),
-                "applied_count": len(effective_applied),
-                "rejected_count": sum(1 for item in session_state.values() if item["rejected"]),
-                "best_small_rps": best_small_rps,
-                "best_homepage_rps": best_homepage_rps,
-            }
-        )
-        session_states[session_id] = session_state
-        session_precise_applied[session_id] = effective_applied
-
-        for parameter, state in session_state.items():
-            parameter_sessions[parameter][session_id] = {
-                "state": _resolve_parameter_state(state),
-                "scope": state.get("scope", "unknown"),
-                "improvement_pct": improvement,
-                "values": sorted(state["values"]),
-                "titles": sorted(state["titles"]),
-            }
-
-    return _assemble_parameter_summary(
-        session_rows=session_rows,
-        parameter_sessions=parameter_sessions,
-        session_states=session_states,
-        session_precise_applied=session_precise_applied,
-        session_param_sources=session_param_sources,
-    )
 
 
 def discover_sessions(data_dir: str) -> list[dict]:
@@ -505,9 +232,6 @@ def load_comparison(data_dir: str, session_ids: list[str]) -> list[dict]:
 
 
 def load_parameter_summary(data_dir: str) -> dict:
-    tidb_summary = _load_parameter_summary_from_tidb(data_dir)
-    if tidb_summary:
-        return tidb_summary
     return _load_parameter_summary_from_artifacts(data_dir)
 
 
@@ -1371,7 +1095,7 @@ def _parse_effective_snapshot(content: object) -> dict[str, str]:
         if not isinstance(values, dict):
             continue
         for parameter, value in values.items():
-            normalized = _normalize_tidb_parameter(f"{category}.{parameter}")
+            normalized = _normalize_parameter(f"{category}.{parameter}")
             if normalized:
                 flattened[normalized] = str(value)
     return flattened
@@ -1388,7 +1112,7 @@ def _normalize_precise_param(parameter: str) -> str:
     return aliases.get(parameter, parameter)
 
 
-def _normalize_tidb_parameter(parameter: str) -> str:
+def _normalize_parameter(parameter: str) -> str:
     parameter = parameter.strip()
     if not parameter:
         return ""
@@ -1424,7 +1148,7 @@ def _collect_sources_for_session(hypo_root: Path, session_id: str) -> dict[str, 
     return _collect_param_sources(session.get("iterations", []))
 
 
-def _format_tidb_timestamp(value: object) -> str:
+def _format_timestamp(value: object) -> str:
     if isinstance(value, datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)

@@ -237,9 +237,19 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr("pymysql.connect", lambda **kwargs: Conn())
+    # Create a fake memory object with _conn for load_knowledge
+    class FakeMemoryConn:
+        def __init__(self):
+            self._conn = FakeSqliteConn()
+
+    class FakeSqliteConn:
+        def cursor(self):
+            return Cur()
+        def commit(self):
+            pass
+
     main.load_knowledge(
-        {"memory": {"host": "h", "port": 1, "user": "u", "database": "d"}}, Embedder(), object()
+        {"memory": {"path": ":memory:"}}, Embedder(), FakeMemoryConn()
     )
     assert (facts_dir / ".loaded_hash").exists()
 
@@ -339,7 +349,8 @@ def test_main_helpers_and_main_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "load_dotenv", lambda: None)
     monkeypatch.setattr(main, "embedder_from_config", lambda cfg: "embed")
     fake_memory = FakeMemory()
-    monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: fake_memory)
+    import memory.sqlite_store as _sqlite_mod
+    monkeypatch.setattr(_sqlite_mod, "from_config", lambda cfg, embed: fake_memory)
     monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
     fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
     monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)
@@ -412,7 +423,8 @@ def test_main_preserves_config_planner_mode_when_cli_omitted(monkeypatch):
     monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
     monkeypatch.setattr(main, "load_dotenv", lambda: None)
     monkeypatch.setattr(main, "embedder_from_config", lambda cfg: "embed")
-    monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: FakeMemory())
+    import memory.sqlite_store as _sqlite_mod
+    monkeypatch.setattr(_sqlite_mod, "from_config", lambda cfg, embed: FakeMemory())
     monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
     fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
     monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)
@@ -454,7 +466,8 @@ def test_main_normalizes_single_planner_mode_alias(monkeypatch):
     monkeypatch.setattr(main.logger, "init", lambda *a, **k: "log")
     monkeypatch.setattr(main, "load_dotenv", lambda: None)
     monkeypatch.setattr(main, "embedder_from_config", lambda cfg: "embed")
-    monkeypatch.setattr(main, "tidb_from_config", lambda cfg, embed: FakeMemory())
+    import memory.sqlite_store as _sqlite_mod
+    monkeypatch.setattr(_sqlite_mod, "from_config", lambda cfg, embed: FakeMemory())
     monkeypatch.setattr(main, "load_knowledge", lambda *a, **k: None)
     fake_ssh = SimpleNamespace(connect=lambda: None, disconnect=lambda: None)
     monkeypatch.setattr(main, "ssh_from_config", lambda cfg, section="target": fake_ssh)

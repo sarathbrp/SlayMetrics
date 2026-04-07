@@ -21,12 +21,7 @@ llm:
       api_key_env: ANTHROPIC_API_KEY      # pragma: allowlist secret
 
 memory:
-  backend: tidb
-  host: localhost
-  port: 4000
-  database: perfagent
-  user: root
-  password_env: TIDB_PASSWORD          # pragma: allowlist secret
+  path: data/slaymetrics.db
 
 target:
   host_env: DUT_HOST                # reads IP from .env DUT_HOST variable

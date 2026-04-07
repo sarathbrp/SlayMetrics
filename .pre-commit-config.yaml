@@ -34,7 +34,6 @@ repos:
           - pydantic>=2.7.0
           - PyYAML>=6.0.1
           - rich>=13.7.0
-          - pymysql>=1.1.0
           - paramiko>=3.4.0
         files: ^(adapters|agents|core|memory|rhel|tools)/|^main\.py$
 

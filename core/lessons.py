@@ -1,4 +1,4 @@
-"""Lessons learned — query best runs from TiDB and merge proven params.
+"""Lessons learned — query best runs from database and merge proven params.
 
 No new tables needed. Uses existing benchmarks + sessions tables:
   - benchmarks: per-workload RPS per session (phase='final')
@@ -148,10 +148,10 @@ def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
             WHERE s.status = 'completed'
             GROUP BY s.id, s.total_tokens, s.fixes_applied
             HAVING MAX(CASE WHEN b.payload_size='small' THEN b.rps END) IS NOT NULL
-               AND MAX(CASE WHEN b.payload_size='medium' THEN b.rps END) >= %s
-               AND MAX(CASE WHEN b.payload_size='large'  THEN b.rps END) >= %s
+               AND MAX(CASE WHEN b.payload_size='medium' THEN b.rps END) >= ?
+               AND MAX(CASE WHEN b.payload_size='large'  THEN b.rps END) >= ?
             ORDER BY small_rps DESC
-            LIMIT %s
+            LIMIT ?
             """,
             (QUALIFY_MEDIUM_RPS, QUALIFY_LARGE_RPS, LEADERBOARD_SIZE),
         )
@@ -170,7 +170,7 @@ def get_top_runs(memory, system_id: str | None = None) -> list[dict[str, Any]]:
     ]
     for i, r in enumerate(results):
         log.info(
-            "leaderboard #%d: %s small=%.0f med=%.0f large=%.0f tokens=%d",
+            "leaderboard #%d: ? small=%.0f med=%.0f large=%.0f tokens=%d",
             i + 1,
             r["session_id"],
             r["small_rps"],
@@ -201,7 +201,7 @@ def get_best_run_params(memory, system_id: str | None = None) -> dict[str, str]:
             SELECT k.parameter, k.after_value
             FROM validations v
             JOIN knowledge k ON k.id = v.knowledge_id
-            WHERE v.session_id = %s
+            WHERE v.session_id = ?
               AND v.outcome IN ('confirmed', 'partial')
               AND k.type = 'fix'
               AND k.status = 'active'
@@ -235,13 +235,13 @@ def get_prior_knowledge_text(memory, system_id: str | None = None, limit: int = 
             """
             SELECT parameter, before_value, after_value, reasoning, impact_pct
             FROM knowledge
-            WHERE discovered_by = %s
+            WHERE discovered_by = ?
               AND type = 'fix'
               AND status = 'active'
               AND parameter IS NOT NULL
               AND after_value IS NOT NULL
             ORDER BY ABS(COALESCE(impact_pct, 0)) DESC
-            LIMIT %s
+            LIMIT ?
             """,
             (best_session, limit),
         )
@@ -486,7 +486,7 @@ def get_ranked_optimization_groups(
 def _get_fix_evidence_for_sessions(memory, session_ids: list[str]) -> list[dict[str, Any]]:
     if not session_ids:
         return []
-    placeholders = ",".join(["%s"] * len(session_ids))
+    placeholders = ",".join(["?"] * len(session_ids))
     with memory._cursor() as cur:
         cur.execute(
             f"""
@@ -607,11 +607,11 @@ def compute_delta(
     best_session = top[0]["session_id"]
     proven = get_best_run_params(memory, system_id)
     if not proven:
-        log.info("compute_delta: no proven params for #1 (%s)", best_session)
+        log.info("compute_delta: no proven params for #1 (?)", best_session)
         return {}
 
     log.info(
-        "compute_delta: #1=%s has %d proven params, comparing to session %s",
+        "compute_delta: #1=? has %d proven params, comparing to session ?",
         best_session,
         len(proven),
         current_session_id,
@@ -623,7 +623,7 @@ def compute_delta(
             """
             SELECT parameter, after_value
             FROM knowledge
-            WHERE discovered_by = %s
+            WHERE discovered_by = ?
               AND type = 'fix'
               AND status = 'active'
               AND parameter IS NOT NULL
@@ -635,7 +635,7 @@ def compute_delta(
 
     current = {r["parameter"]: r["after_value"] for r in rows}
     log.info(
-        "compute_delta: current session %s has %d applied params",
+        "compute_delta: current session ? has %d applied params",
         current_session_id,
         len(current),
     )
@@ -648,20 +648,20 @@ def compute_delta(
             parts = full_key.split(".", 1)
             cat, param = parts if len(parts) == 2 else ("kernel", full_key)
             delta.setdefault(cat, {})[param] = proven_value
-            log.info("  delta MISSING: %s (proven=%s)", full_key, proven_value)
+            log.info("  delta MISSING: ? (proven=?)", full_key, proven_value)
         elif current_value != proven_value:
             parts = full_key.split(".", 1)
             cat, param = parts if len(parts) == 2 else ("kernel", full_key)
             delta.setdefault(cat, {})[param] = proven_value
             log.info(
-                "  delta DIFFERS: %s current=%s proven=%s",
+                "  delta DIFFERS: ? current=? proven=?",
                 full_key,
                 current_value,
                 proven_value,
             )
 
     log.info(
-        "compute_delta: %d params differ (%s)",
+        "compute_delta: %d params differ (?)",
         sum(len(v) for v in delta.values()),
         ", ".join(f"{c}={len(v)}" for c, v in delta.items()),
     )

@@ -3654,7 +3654,7 @@ def save_iteration_summary(
     target = path / f"iter{iteration}_00_summary.md"
     target.write_text("\n".join(lines), encoding="utf-8")
 
-    # Also save to TiDB
+    # Also save to database
     deps.memory.save_context(
         deps.session_id,
         "command_output",

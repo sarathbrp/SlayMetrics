@@ -5,12 +5,11 @@ import os
 from datetime import datetime, timezone
 
 from agents import TokenCounter
-from memory.tidb_store import TiDBStore
 
 
 def generate(
     session_id: str,
-    memory: TiDBStore,
+    memory,
     token_counter: TokenCounter,
     output_dir: str = "report",
     baselines: dict | None = None,

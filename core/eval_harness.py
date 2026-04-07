@@ -559,7 +559,7 @@ def llm_synth_judge(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline debate-path eval harness")
     parser.add_argument("--bundle", help="Path to a case bundle JSON")
-    parser.add_argument("--session", help="Session id to load from TiDB")
+    parser.add_argument("--session", help="Session id to load from database")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
     parser.add_argument("--iteration", type=int, default=None)
     parser.add_argument("--output", help="Write eval report JSON to this path")
@@ -576,7 +576,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         from main import load_config, load_dotenv
         from memory.embeddings import from_config as embedder_from_config
-        from memory.tidb_store import from_config as tidb_from_config
+        from memory.sqlite_store import from_config as store_from_config
         from models import create_model
 
         load_dotenv()
@@ -585,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
 
         logger.status("eval", f"Loading session {args.session} for offline eval")
         embedder = embedder_from_config(cfg)
-        memory = tidb_from_config(cfg, embedder)
+        memory = store_from_config(cfg, embedder)
         memory.connect()
         bundle = build_case_bundle_from_session(memory, args.session, iteration=args.iteration)
         try:

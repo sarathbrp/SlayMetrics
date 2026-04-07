@@ -39,7 +39,7 @@ Pre-flight → Baseline benchmarks → Iteration loop:
 ```
 
 - **Config-driven allowlist** — agent can only touch parameters listed in `config.yaml`
-- **TiDB** knowledge-scoped memory with vector search
+- **SQLite** knowledge-scoped memory with vector search
 - **Cross-session learning** — knowledge persists, session state is fresh
 - **Auto-fix** — resource limits, network, and storage issues fixed automatically when detected
 
@@ -49,8 +49,8 @@ Pre-flight → Baseline benchmarks → Iteration loop:
 
 - RHEL 9.x system with Nginx
 - Root SSH access to the target (DUT)
-- TiDB v8.4+ (for memory/knowledge)
 - An LLM backend (GPT-OSS, Granite, or Claude)
+- SQLite is used for memory/knowledge (automatic, no setup needed)
 
 ### Setup
 
@@ -93,7 +93,7 @@ python3 main.py --session <id>  # resume previous session
 
 ```bash
 python3 tools/reset.py              # reset DUT (nginx, sysctl, THP, SELinux)
-python3 tools/reset.py --clear-db   # + clear sessions (keeps knowledge base)
+python3 tools/reset.py --clear-db   # + clear SQLite sessions (keeps knowledge base)
 python3 tools/reset.py --reset-all  # + clear everything including knowledge
 ```
 
@@ -190,16 +190,14 @@ curl "http://localhost:8080/api/leaderboard/224815cd/export?pretty=1"
   reference/current session metadata, applied parameters, and per-parameter compare rows.
 
 Data source behavior:
-- The dashboard now prefers live TiDB data for sessions, benchmarks, confirmed fixes, and contradicted/reverted validations.
-- New runs also persist a canonical `final_effective_config_snapshot` in TiDB context and `report.json`; the dashboard prefers that snapshot over inferred validation history when it exists.
-- Historical `hypothesis/` artifacts are still used as a fallback when TiDB is unavailable, and as a provenance source for agent attribution where available.
-- In containerized deployment on system 2, the dashboard runs in host-network mode so it can reach TiDB on `127.0.0.1:4000`.
+- The dashboard reads from hypothesis artifacts and report JSON files.
+- New runs persist a canonical `final_effective_config_snapshot` in the SQLite context and `report.json`.
 - `pretty=1`
   Supported on JSON endpoints for human-readable curl output.
 
 ## Knowledge Base
 
-Drop `.md` files into `facts/` with performance tuning documentation. Automatically chunked, embedded, and loaded into TiDB on startup.
+Drop `.md` files into `facts/` with performance tuning documentation. Automatically chunked, embedded, and loaded into SQLite on startup.
 
 ## Tests
 
