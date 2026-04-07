@@ -2654,11 +2654,11 @@ async def _run_debate_planner(
     if _planner_debug_enabled(deps):
         tool_result(
             "debug",
-            f"nginx_expert raw: {json.dumps(nginx_analysis, ensure_ascii=False)}",
+            f"nginx_expert raw:\n{json.dumps(nginx_analysis, indent=2, ensure_ascii=False)}",
         )
         tool_result(
             "debug",
-            f"rhel_expert raw: {json.dumps(rhel_analysis, ensure_ascii=False)}",
+            f"rhel_expert raw:\n{json.dumps(rhel_analysis, indent=2, ensure_ascii=False)}",
         )
 
     from core.prompts import synthesizer as synthesizer_prompt
@@ -2670,7 +2670,7 @@ async def _run_debate_planner(
     )
     synthesis, synth_usage = _invoke_json_planner(model, "planner.synthesizer", synth_prompt, deps)
     if _planner_debug_enabled(deps):
-        tool_result("debug", f"synthesizer raw: {json.dumps(synthesis, ensure_ascii=False)}")
+        tool_result("debug", f"synthesizer raw:\n{json.dumps(synthesis, indent=2, ensure_ascii=False)}")
 
     _iter = getattr(deps, "iteration", 0)
     _save_planner_artifact(deps, "nginx_expert", nginx_analysis, iteration=_iter)
@@ -2729,7 +2729,7 @@ async def _run_debate_planner(
     if _planner_debug_enabled(deps):
         tool_result(
             "debug",
-            f"apply_planner raw: {json.dumps(apply_plan, ensure_ascii=False)}",
+            f"apply_planner raw:\n{json.dumps(apply_plan, indent=2, ensure_ascii=False)}",
         )
     _save_planner_artifact(deps, "apply_planner", apply_plan, iteration=_iter)
 
