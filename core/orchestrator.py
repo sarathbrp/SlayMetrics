@@ -380,7 +380,7 @@ async def run(model, deps: AgentDeps) -> str:
             best_iteration_rps = current_small_rps
 
         if should_stop:
-            decision = f"All workloads OK — stopping after iteration {iteration}"
+            decision = f"All workloads OK after iteration {iteration} — continuing to find further gains"
             logger.status("iteration", f"Iteration {iteration}: {decision}")
             diagnosis_agent.save_iteration_summary(
                 deps,
@@ -391,7 +391,7 @@ async def run(model, deps: AgentDeps) -> str:
                 decision=decision,
                 diagnosis=diagnosis,
             )
-            break
+            # Don't break — always run max_iterations to explore optimization groups
 
         if iteration >= max_iterations:
             decision = f"Max iterations ({max_iterations}) reached — stopping"
@@ -408,17 +408,18 @@ async def run(model, deps: AgentDeps) -> str:
             break
 
         # Continuing to next iteration
-        decision = f"{len(regressions)} regressions — continuing to iteration {iteration + 1}"
-        logger.status("iteration", f"Iteration {iteration}: {decision}")
-        diagnosis_agent.save_iteration_summary(
-            deps,
-            iteration=iteration,
-            baselines=baselines,
-            results=iteration_finals,
-            regressions=regressions,
-            decision=decision,
-            diagnosis=diagnosis,
-        )
+        if not should_stop:
+            decision = f"{len(regressions)} regressions — continuing to iteration {iteration + 1}"
+            logger.status("iteration", f"Iteration {iteration}: {decision}")
+            diagnosis_agent.save_iteration_summary(
+                deps,
+                iteration=iteration,
+                baselines=baselines,
+                results=iteration_finals,
+                regressions=regressions,
+                decision=decision,
+                diagnosis=diagnosis,
+            )
 
         iteration_feedback = _build_iteration_feedback(
             iteration=iteration,
