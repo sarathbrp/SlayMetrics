@@ -12,6 +12,12 @@ import core.reporter as reporter
 import rhel.system_checks as system_checks
 from agents import AgentDeps
 from core import log as logger
+from core.lessons import (
+    get_best_run_params,
+    get_prior_knowledge_text,
+    get_ranked_optimization_groups,
+    get_top_runs,
+)
 from telemetry import (
     collect_snapshot,
     persist_sampler_result,
@@ -359,8 +365,8 @@ async def run(model, deps: AgentDeps) -> str:
 
     # Save expert state for iter2
     expert_state = {
-        "rca_records": diagnosis_iter1.rca_records,
-        "recommendations": diagnosis_iter1.recommendations,
+        "rca_records": getattr(diagnosis_iter1, "rca_records", []) or [],
+        "recommendations": getattr(diagnosis_iter1, "recommendations", []) or [],
         "service_analysis": getattr(diagnosis_iter1, "_service_analysis", None) or {},
         "rhel_analysis": getattr(diagnosis_iter1, "_rhel_analysis", None) or {},
         "inspection": getattr(diagnosis_iter1, "_inspection", None) or {},
@@ -374,6 +380,13 @@ async def run(model, deps: AgentDeps) -> str:
         diagnosis=diagnosis_iter1,
     )
     _notify_iteration(1, decision, baselines, diag=diagnosis_iter1)
+
+    # Phase controller (debate mode): block iter2 apply when eval quality is unsafe.
+    phase2_allowed = True
+    phase2_reason = ""
+    if planner_mode == "debate":
+        phase2_allowed, phase2_reason = _should_run_plan_apply(cfg, diagnosis_iter1)
+        logger.status("phase", f"Iter1 gate: {phase2_reason}")
 
     # For deterministic/hybrid mode, iter1 already applied — skip iter2
     if planner_mode != "debate":
@@ -400,7 +413,7 @@ async def run(model, deps: AgentDeps) -> str:
                     or iteration_finals.get("homepage", {}).get("rps", 0)
                     or 0
                 )
-    else:
+    elif phase2_allowed:
         # ── ITERATION 2: PLAN + APPLY + BENCHMARK ────────────────────────────
         logger.step("Step 5: Iteration 2/3 — Synthesize, plan, and apply...")
         deps.iteration = 2  # type: ignore[attr-defined]
@@ -568,6 +581,20 @@ async def run(model, deps: AgentDeps) -> str:
                 decision=decision, diagnosis=diagnosis_iter3,
             )
             _notify_iteration(3, decision, iteration_finals)
+    else:
+        diagnosis = diagnosis_iter1
+        decision = f"Iteration 2 skipped — {phase2_reason}"
+        logger.status("iteration", decision)
+        diagnosis_agent.save_iteration_summary(
+            deps,
+            iteration=2,
+            baselines=baselines,
+            results=baselines,
+            regressions=[],
+            decision=decision,
+            diagnosis=diagnosis_iter1,
+        )
+        _notify_iteration(2, decision, baselines, diag=diagnosis_iter1)
 
     notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
     logger.log("agent", f"Summary: {notes}", "result")
@@ -588,6 +615,15 @@ async def run(model, deps: AgentDeps) -> str:
         logger.status("main", "Stopping after Phase 3 planning (RCA + recommendations)")
         memory.update_profile(session_id, status="completed")
         _save_token_usage(memory, session_id, deps.token_counter)
+        all_fixes = memory.get_facts(session_id, type="fix")
+        fixes_count = len([f for f in all_fixes if f.get("status") == "active"])
+        memory.complete_session(
+            session_id=session_id,
+            total_tokens=deps.token_counter.total,
+            fixes_applied=fixes_count,
+            rps_start=baseline_rps,
+            rps_end=baseline_rps,
+        )
         token_history = memory.get_token_history()
         report_path = reporter.generate(
             session_id,
@@ -1021,6 +1057,63 @@ def _mark_facts_reverted(
             after_value=fact.get("before_value", ""),
             status="reverted",
         )
+
+
+def _should_run_plan_apply(cfg: dict[str, Any], diagnosis_iter1: Any) -> tuple[bool, str]:
+    """Decide whether debate iter2 (plan+apply) is safe to run."""
+    agent_cfg = cfg.get("agent") or {}
+    phase_cfg = agent_cfg.get("phase_controller") or {}
+    if not bool(phase_cfg.get("enabled", True)):
+        return True, "phase controller disabled"
+
+    # _inspection is a dataclass field on DiagnosisResult (agents/agent.py)
+    inspection = getattr(diagnosis_iter1, "_inspection", {}) or {}
+    summary = inspection.get("summary", {}) if isinstance(inspection, dict) else {}
+    total_issues = int(summary.get("total_issues", 0) or 0)
+
+    eval_results = getattr(diagnosis_iter1, "eval_results", {}) or {}
+    if not eval_results:
+        if bool(phase_cfg.get("require_eval_for_plan_apply", False)):
+            return False, f"blocked: eval missing (inspect_issues={total_issues})"
+        return True, f"passed: eval missing, inspect_issues={total_issues}"
+
+    action = str(eval_results.get("action", "")).strip().lower() or "unknown"
+    raw_findings = eval_results.get("findings") or []
+    findings = [item for item in raw_findings if isinstance(item, dict)]
+    fail_findings = [
+        item
+        for item in findings
+        if str(item.get("severity", "")).strip().lower() == "fail"
+        or str(item.get("verdict", "")).strip().lower() == "fail"
+    ]
+
+    raw_block_actions = phase_cfg.get("block_eval_actions")
+    if isinstance(raw_block_actions, list):
+        block_actions = {
+            str(item).strip().lower() for item in raw_block_actions if str(item).strip()
+        }
+    else:
+        block_actions = {"self_correct"}
+
+    if action in block_actions:
+        return (
+            False,
+            f"blocked: eval_action={action} in blocklist, "
+            f"fail_findings={len(fail_findings)}, inspect_issues={total_issues}",
+        )
+
+    if bool(phase_cfg.get("block_on_fail_findings", True)) and fail_findings:
+        return (
+            False,
+            f"blocked: eval has {len(fail_findings)} fail findings "
+            f"(action={action}, inspect_issues={total_issues})",
+        )
+
+    return (
+        True,
+        f"passed: action={action}, fail_findings={len(fail_findings)}, "
+        f"inspect_issues={total_issues}",
+    )
 
 
 def _check_iteration_exit(

@@ -1,7 +1,7 @@
 """Tool approval gate — user control over apply operations.
 
 Single chokepoint for all apply operations. Supports three modes:
-- auto: execute immediately (default, zero breakage)
+- auto: execute immediately (explicit opt-in)
 - interactive: prompt user per category before executing
 - dry_run: log plan, skip execution
 """
@@ -90,16 +90,20 @@ def gate_and_execute(
 
 
 def _resolve_mode(scope: str, config: dict[str, Any]) -> str:
-    """Resolve approval mode: explicit scope override → global → 'auto'.
+    """Resolve approval mode: explicit scope override → global → safe fallback.
 
     Scope override only wins if it's explicitly non-auto (e.g. 'interactive').
     This lets CLI --approval-mode override config.yaml scope defaults.
     """
+    # Backward compatibility for callers/tests that do not provide tools config.
+    if "tools" not in config:
+        return "interactive"
+
     tools_cfg = config.get("tools") or {}
     scopes = tools_cfg.get("scopes") or {}
     scope_cfg = scopes.get(scope) or {}
 
-    global_mode = tools_cfg.get("approval_mode", "auto")
+    global_mode = tools_cfg.get("approval_mode", "interactive")
     scope_mode = scope_cfg.get("mode")
 
     # Scope override only applies if explicitly set to something other than auto
@@ -110,9 +114,13 @@ def _resolve_mode(scope: str, config: dict[str, Any]) -> str:
 
     mode = mode.strip().lower()
 
-    # Fall back to auto if stdin is not a TTY (CI/headless)
+    # Auto apply must be explicitly allowed.
+    if mode == "auto" and not bool(tools_cfg.get("allow_auto_apply", False)):
+        mode = "interactive"
+
+    # In headless mode, never auto-approve. Downgrade to dry-run.
     if mode == "interactive" and not sys.stdin.isatty():
-        mode = "auto"
+        mode = "dry_run"
 
     if mode == "interactive":
         logger.status("gate", f"[INTERACTIVE] {scope}: awaiting approval")

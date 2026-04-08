@@ -350,6 +350,35 @@ def build(model, config=None) -> DiagnosisWorkflow:
             return "tc_rules"
         return _param_aliases.get(key_s, _param_aliases.get(key_s.lower(), key_s))
 
+    _SHELL_UNSAFE = re.compile(r"[;&|`$(){}!\\\n\r]")
+
+    def _sanitize_shell_value(raw: str) -> str:
+        """Reject values containing shell metacharacters."""
+        if _SHELL_UNSAFE.search(raw):
+            raise ValueError(f"unsafe shell characters in value: {raw!r}")
+        return raw.strip()
+
+    def _emit_apply_param(
+        scope: str,
+        param: str,
+        value: Any,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        value_s = str(value).strip()
+        msg = f"{scope}.{param}={value_s} status={status}"
+        if detail:
+            msg += f" detail={detail[:180]}"
+        tool_result("apply_param", msg)
+
+    def _extract_result_params(result_bucket: Any) -> set[str]:
+        """Coerce keys to str — result payloads may contain int keys from JSON."""
+        if isinstance(result_bucket, dict):
+            return {str(k) for k in result_bucket.keys()}
+        if isinstance(result_bucket, list):
+            return {str(item) for item in result_bucket}
+        return set()
+
     def inspect_irq_impl(deps: AgentDeps) -> dict:
         tool_call("inspect", "irq distribution — checking for IRQ lock and CPU spread")
         ssh = deps.ssh
@@ -553,6 +582,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
             unsupported = [key for key in changes_dict if key not in allowed]
             changes_dict = {key: value for key, value in changes_dict.items() if key in allowed}
             if unsupported and not changes_dict:
+                for param in unsupported:
+                    _emit_apply_param("webserver", param, "<unsupported>", "failed", "unsupported")
                 error = f"unsupported nginx directives: {', '.join(unsupported)}"
                 tool_call("apply_service", "unsupported directives")
                 tool_result("apply_service", f"FAILED: {error}")
@@ -578,8 +609,10 @@ def build(model, config=None) -> DiagnosisWorkflow:
             success = deps.adapter.apply_config(param, value)
             if success:
                 applied.append(param)
+                _emit_apply_param("webserver", param, value, "applied")
             else:
                 failed.append(param)
+                _emit_apply_param("webserver", param, value, "failed", "adapter.apply_config returned false")
                 deps.ssh.execute(f"cp {batch_backup} {config_path}")
                 result = {
                     "applied": applied,
@@ -635,6 +668,11 @@ def build(model, config=None) -> DiagnosisWorkflow:
 
         reload_ok = deps.adapter.reload()
         result = {"applied": applied, "failed": failed, "reload": "OK" if reload_ok else "FAILED"}
+        if not reload_ok:
+            for param in applied:
+                _emit_apply_param(
+                    "webserver", param, changes_dict.get(param, ""), "failed", "reload failed"
+                )
         if unsupported:
             result["warning"] = f"ignored unsupported nginx directives: {', '.join(unsupported)}"
 
@@ -681,68 +719,114 @@ def build(model, config=None) -> DiagnosisWorkflow:
         applied = {}
         failed = {}
         for param, value in changes_dict.items():
+            try:
+                value = _sanitize_shell_value(str(value))
+            except ValueError as exc:
+                failed[param] = str(exc)
+                _emit_apply_param("system", param, value, "failed", failed[param])
+                continue
             if param == "transparent_hugepage":
                 result = ssh.execute(
                     f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
                 )
                 if result.ok:
                     applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
                 else:
                     failed[param] = result.stderr.strip()
+                    _emit_apply_param("system", param, value, "failed", failed[param])
             elif param == "selinux":
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
                 result = ssh.execute(f"setenforce {mode} 2>&1")
                 # Persist across reboots
                 if value.lower() in ("permissive", "0"):
-                    ssh.execute(
+                    persist = ssh.execute(
                         "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
-                        " /etc/selinux/config 2>/dev/null || true"
+                        " /etc/selinux/config 2>/dev/null"
                     )
+                    if not persist.ok:
+                        # Rollback the runtime change since we cannot persist
+                        rollback_mode = "1" if mode == "0" else "0"
+                        ssh.execute(f"setenforce {rollback_mode} 2>&1")
+                        failed[param] = persist.stderr.strip() or "failed to persist SELinux mode"
+                        _emit_apply_param("system", param, value, "failed", failed[param])
+                        continue
                 # Verify it actually changed
                 verify = ssh.execute("getenforce 2>/dev/null")
                 actual = verify.stdout.strip().lower()
                 expected = "permissive" if mode == "0" else "enforcing"
                 if actual == expected:
                     applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
                 else:
                     failed[param] = f"setenforce ran but getenforce={actual}"
+                    _emit_apply_param("system", param, value, "failed", failed[param])
             elif param == "cpu_governor":
                 result = ssh.execute(
                     f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>&1"
                 )
                 if result.ok:
                     applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
                 else:
                     failed[param] = result.stderr.strip()
+                    _emit_apply_param("system", param, value, "failed", failed[param])
             elif param == "net.ipv4.ip_local_port_range":
                 result = ssh.execute(f'sysctl -w net.ipv4.ip_local_port_range="{value}" 2>&1')
                 if result.ok:
                     applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
                 else:
                     failed[param] = result.stderr.strip()
+                    _emit_apply_param("system", param, value, "failed", failed[param])
             elif param == "nofile":
                 cmds = [
-                    "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
+                    "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null",
                     f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
                     f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
-                    f"systemctl set-property nginx.service LimitNOFILE={value} 2>/dev/null || true",
-                    "systemctl daemon-reload && systemctl restart nginx 2>&1 || true",
+                    f"systemctl set-property nginx.service LimitNOFILE={value} 2>/dev/null",
+                    "systemctl daemon-reload 2>&1",
+                    "systemctl restart nginx 2>&1",
                 ]
+                cmd_errors = []
                 for cmd in cmds:
-                    ssh.execute(cmd)
-                applied[param] = value
+                    cmd_result = ssh.execute(cmd)
+                    if not cmd_result.ok:
+                        err = cmd_result.stderr.strip() or cmd_result.stdout.strip() or "command failed"
+                        cmd_errors.append(f"{cmd}: {err}")
+                        break
+                if cmd_errors:
+                    failed[param] = "; ".join(cmd_errors)[:500]
+                    _emit_apply_param("system", param, value, "failed", failed[param])
+                    continue
+                limits = ssh.execute(
+                    "cat /proc/$(pgrep -o nginx)/limits 2>/dev/null | grep 'Max open files'"
+                )
+                if re.search(rf"Max open files\s+{re.escape(str(value))}\s", limits.stdout):
+                    applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
+                else:
+                    failed[param] = (
+                        "nginx limit verification failed: "
+                        + (limits.stdout.strip() or limits.stderr.strip() or "no limits output")
+                    )[:500]
+                    _emit_apply_param("system", param, value, "failed", failed[param])
             elif param == "irqbalance":
                 result = ssh.execute("systemctl enable --now irqbalance 2>&1")
                 if result.ok:
                     applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
                 else:
                     failed[param] = result.stderr.strip() or "irqbalance enable failed"
+                    _emit_apply_param("system", param, value, "failed", failed[param])
             else:
                 result = ssh.execute(f"sysctl -w {param}={value} 2>&1")
                 if result.ok:
                     applied[param] = value
+                    _emit_apply_param("system", param, value, "applied")
                 else:
                     failed[param] = result.stderr.strip()
+                    _emit_apply_param("system", param, value, "failed", failed[param])
 
         deps.token_counter.tool_calls += 1
         state["system_applied"] = state["system_applied"] or bool(applied)
@@ -1207,7 +1291,6 @@ def build(model, config=None) -> DiagnosisWorkflow:
         """Re-read DUT state and verify changes actually took effect."""
         ssh = deps.ssh
         mismatches: list[dict[str, str]] = []
-        fixed: list[str] = []
 
         # ── Verify service directives ────────────────────────────────────
         if service_applied:
@@ -1245,21 +1328,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                             "actual": actual,
                         }
                     )
-                    # Try to fix: remove from conf.d and retry
-                    ssh.execute(
-                        f"sed -i '/^[[:space:]]*{param}[[:space:]]/d'"
-                        " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
-                    )
-                    fixed.append(param)
-
-            if fixed:
-                # Restart nginx after conf.d cleanup (restart, not reload,
-                # to kill any lingering workers with old debug logging)
-                ssh.execute("nginx -t 2>&1 && systemctl restart nginx 2>&1")
-                tool_result(
-                    "verify",
-                    f"fixed {len(fixed)} conf.d overrides: {', '.join(fixed)}",
-                )
+                    # Verify phase is read-only: report mismatch but do not mutate config.
 
         # ── Verify system parameters ────────────────────────────────────
         sysctl_params = [p for p in system_applied if p.startswith("net.") or p.startswith("fs.")]
@@ -1276,8 +1345,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                         "actual": actual,
                     }
                 )
-                # Retry the sysctl
-                ssh.execute(f"sysctl -w {param}={expected} 2>&1")
+                # Verify phase is read-only: report mismatch but do not mutate config.
 
         if "transparent_hugepage" in system_applied:
             result = ssh.execute("cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null")
@@ -1322,8 +1390,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                         "actual": actual_soft,
                     }
                 )
-                # Force restart nginx to pick up new limits
-                ssh.execute("systemctl restart nginx 2>&1 || true")
+                # Verify phase is read-only: record mismatch and let apply phase decide remediation.
 
         # Log results
         if mismatches:
@@ -1335,8 +1402,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 deps.session_id,
                 "command_output",
                 "post_apply_verification",
-                json.dumps({"mismatches": mismatches, "fixed": fixed}),
-                f"verification: {len(mismatches)} mismatches, {len(fixed)} conf.d fixes",
+                json.dumps({"mismatches": mismatches}),
+                f"verification: {len(mismatches)} mismatches",
             )
             # Record verify failures for lessons-learned tracking
             from core.apply_failures import record_verify_mismatches
@@ -1353,7 +1420,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 "verification: all changes confirmed on DUT",
             )
 
-        return {"mismatches": mismatches, "fixed": fixed}
+        return {"mismatches": mismatches}
 
     def _translate_recommendations(
         raw_recommendations: list[dict[str, Any]],
@@ -1503,19 +1570,27 @@ def build(model, config=None) -> DiagnosisWorkflow:
             value = changes[param]
             if deps.adapter.apply_config(param, value):
                 applied.append(param)
+                _emit_apply_param("webserver", param, value, "applied")
             else:
                 failed.append(param)
+                _emit_apply_param("webserver", param, value, "failed", "adapter.apply_config returned false")
 
         # Reload/restart once after all changes.
         # Use hard restart (not graceful reload) when error_log_level changed —
         # graceful reload keeps old debug-logging workers alive, causing OOM.
         if applied:
-            if deps.adapter.validate_config():
+            is_valid = deps.adapter.validate_config()
+            if is_valid:
                 if "error_log_level" in applied or "access_log" in applied:
-                    deps.adapter.restart()
+                    restart_ok = deps.adapter.restart()
                 else:
-                    deps.adapter.reload()
-                reload_status = "OK"
+                    restart_ok = deps.adapter.reload()
+                reload_status = "OK" if restart_ok else "FAILED"
+                if not restart_ok:
+                    failed = list(changes.keys())
+                    applied = []
+                    for param, value in changes.items():
+                        _emit_apply_param("webserver", param, value, "failed", "reload/restart failed")
             else:
                 # Rollback everything
                 ssh.execute(f"cp {config_path}.pre_batch {config_path}")
@@ -1523,6 +1598,8 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 reload_status = "FAILED"
                 failed = list(changes.keys())
                 applied = []
+                for param, value in changes.items():
+                    _emit_apply_param("webserver", param, value, "failed", "post-apply validate failed")
         else:
             reload_status = "SKIPPED"
 
@@ -1554,25 +1631,49 @@ def build(model, config=None) -> DiagnosisWorkflow:
         )
 
         ssh = deps.ssh
+        # Sanitize all values before building the script
+        sanitized: dict[str, str] = {}
+        pre_failed: dict[str, str] = {}
+        for param, value in changes.items():
+            try:
+                sanitized[param] = _sanitize_shell_value(str(value))
+            except ValueError as exc:
+                pre_failed[param] = str(exc)
+                _emit_apply_param("system", param, value, "failed", pre_failed[param])
+        if not sanitized:
+            return {"applied": {}, "failed": pre_failed}
+
         # Build a single script
         script_lines = ["#!/bin/bash", "set +e", "RESULT=''"]
 
-        for param, value in changes.items():
+        for param, value in sanitized.items():
             if param == "transparent_hugepage":
                 script_lines.append(
-                    f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled 2>&1"
+                    f"echo {value} > /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1"
                     f' && RESULT="$RESULT {param}=OK"'
                     f' || RESULT="$RESULT {param}=FAIL"'
                 )
             elif param == "selinux":
                 mode = "0" if value.lower() in ("permissive", "0") else "1"
-                script_lines.append(f"setenforce {mode} 2>&1")
+                expected = "permissive" if mode == "0" else "enforcing"
                 if value.lower() in ("permissive", "0"):
                     script_lines.append(
-                        "sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
-                        " /etc/selinux/config 2>/dev/null || true"
+                        f"setenforce {mode} >/dev/null 2>&1"
+                        " && getenforce 2>/dev/null | tr '[:upper:]' '[:lower:]'"
+                        f" | grep -qx '{expected}'"
+                        " && sed -i 's/^SELINUX=enforcing/SELINUX=permissive/'"
+                        " /etc/selinux/config >/dev/null 2>&1"
+                        f' && RESULT="$RESULT {param}=OK"'
+                        f' || RESULT="$RESULT {param}=FAIL"'
                     )
-                script_lines.append(f'RESULT="$RESULT {param}=OK"')
+                else:
+                    script_lines.append(
+                        f"setenforce {mode} >/dev/null 2>&1"
+                        " && getenforce 2>/dev/null | tr '[:upper:]' '[:lower:]'"
+                        f" | grep -qx '{expected}'"
+                        f' && RESULT="$RESULT {param}=OK"'
+                        f' || RESULT="$RESULT {param}=FAIL"'
+                    )
             elif param == "cpu_governor":
                 script_lines.append(
                     f"echo {value} | tee /sys/devices/system/cpu/cpu*/cpufreq/"
@@ -1581,51 +1682,56 @@ def build(model, config=None) -> DiagnosisWorkflow:
                     f' || RESULT="$RESULT {param}=FAIL"'
                 )
             elif param == "nofile":
-                script_lines.extend(
-                    [
-                        "sed -i '/nofile/d' /etc/security/limits.conf 2>/dev/null || true",
-                        f"echo '* soft nofile {value}' >> /etc/security/limits.conf",
-                        f"echo '* hard nofile {value}' >> /etc/security/limits.conf",
-                        f"systemctl set-property nginx.service LimitNOFILE={value}"
-                        " 2>/dev/null || true",
-                        f'RESULT="$RESULT {param}=OK"',
-                    ]
+                script_lines.append(
+                    "{ "
+                    "sed -i '/nofile/d' /etc/security/limits.conf >/dev/null 2>&1"
+                    f" && echo '* soft nofile {value}' >> /etc/security/limits.conf"
+                    f" && echo '* hard nofile {value}' >> /etc/security/limits.conf"
+                    f" && systemctl set-property nginx.service LimitNOFILE={value} >/dev/null 2>&1"
+                    " && systemctl daemon-reload >/dev/null 2>&1"
+                    " && systemctl restart nginx >/dev/null 2>&1"
+                    " && cat /proc/$(pgrep -o nginx)/limits 2>/dev/null"
+                    f" | grep -Eq 'Max open files[[:space:]]+{value}[[:space:]]+'"
+                    "; }"
+                    f' && RESULT="$RESULT {param}=OK"'
+                    f' || RESULT="$RESULT {param}=FAIL"'
                 )
             elif param == "irqbalance":
                 script_lines.append(
-                    "systemctl enable --now irqbalance 2>&1"
+                    "systemctl enable --now irqbalance >/dev/null 2>&1"
                     f' && RESULT="$RESULT {param}=OK"'
                     f' || RESULT="$RESULT {param}=FAIL"'
                 )
             elif param == "net.ipv4.ip_local_port_range":
                 script_lines.append(
-                    f"sysctl -w 'net.ipv4.ip_local_port_range={value}' 2>&1"
+                    f"sysctl -w 'net.ipv4.ip_local_port_range={value}' >/dev/null 2>&1"
                     f' && RESULT="$RESULT {param}=OK"'
                     f' || RESULT="$RESULT {param}=FAIL"'
                 )
             elif param.startswith("net.") or param.startswith("fs."):
                 script_lines.append(
-                    f"sysctl -w {param}={value} 2>&1"
+                    f"sysctl -w {param}={value} >/dev/null 2>&1"
                     f' && RESULT="$RESULT {param}=OK"'
                     f' || RESULT="$RESULT {param}=FAIL"'
                 )
             else:
                 script_lines.append(f'RESULT="$RESULT {param}=SKIP"')
 
-        # Restart nginx to pick up nofile changes (if any)
-        if "nofile" in changes:
-            script_lines.append("systemctl daemon-reload && systemctl restart nginx 2>&1 || true")
-
-        script_lines.append("echo $RESULT")
+        script_lines.append('echo "__RESULT__ $RESULT"')
         script = "\n".join(script_lines)
 
         result = ssh.execute(f"bash -c '{script}'", timeout=30)
         output = result.stdout.strip()
+        result_line = ""
+        for line in reversed(output.splitlines()):
+            if line.startswith("__RESULT__ "):
+                result_line = line[len("__RESULT__ ") :]
+                break
 
         # Parse results
         applied = {}
         failed = {}
-        for token in output.split():
+        for token in result_line.split():
             if "=" not in token:
                 continue
             key, status = token.rsplit("=", 1)
@@ -1633,11 +1739,22 @@ def build(model, config=None) -> DiagnosisWorkflow:
                 applied[key] = changes.get(key, "")
             elif status == "FAIL":
                 failed[key] = "command failed"
+            elif status == "SKIP":
+                failed[key] = "unsupported parameter"
 
-        # Any param not in output is assumed applied (some don't echo)
-        for param, value in changes.items():
+        # Any param missing from script output is treated as failure.
+        for param, value in sanitized.items():
             if param not in applied and param not in failed:
-                applied[param] = value
+                failed[param] = "missing result token"
+
+        # Merge pre-sanitization failures
+        failed.update(pre_failed)
+
+        for param, value in changes.items():
+            if param in applied:
+                _emit_apply_param("system", param, value, "applied")
+            else:
+                _emit_apply_param("system", param, value, "failed", str(failed.get(param, "unknown")))
 
         result_dict: dict[str, Any] = {"applied": applied, "failed": failed}
         tool_result(
@@ -1815,6 +1932,29 @@ def build(model, config=None) -> DiagnosisWorkflow:
             )
             gate_result = gate_and_execute(action, deps.config, deps.session_id)
             results[scope] = gate_result.result or {"applied": {}, "failed": changes, "actions": ["denied"]}
+            if not gate_result.decision.approved:
+                for param, value in changes.items():
+                    _emit_apply_param(scope, str(param), value, "denied", gate_result.decision.reason)
+            else:
+                result_payload = results[scope]
+                applied_params = _extract_result_params(result_payload.get("applied", {}))
+                failed_payload = result_payload.get("failed", {})
+                failed_params = _extract_result_params(failed_payload)
+                failed_details = failed_payload if isinstance(failed_payload, dict) else {}
+                for param, value in changes.items():
+                    param_s = str(param)
+                    if param_s in applied_params:
+                        _emit_apply_param(scope, param_s, value, "applied")
+                    elif param_s in failed_params:
+                        _emit_apply_param(
+                            scope,
+                            param_s,
+                            value,
+                            "failed",
+                            str(failed_details.get(param_s, "failed")),
+                        )
+                    else:
+                        _emit_apply_param(scope, param_s, value, "unknown", "not present in apply result")
             if gate_result.decision.approved:
                 if scope == "webserver":
                     state["service_applied"] = True

@@ -84,6 +84,10 @@ class NginxAdapter(ServiceAdapter):
     }
     ALLOWED_BATCH_DIRECTIVES = set(DIRECTIVE_SPECS)
 
+    def _allow_confd_mutation(self) -> bool:
+        """Allow broad conf.d rewrites only when explicitly enabled."""
+        return bool(self._cfg.get("allow_confd_mutation", False))
+
     def apply_config(self, parameter: str, value: str) -> bool:
         # Handle listen_backlog specially — modifies existing listen directives
         if parameter == "listen_backlog":
@@ -127,8 +131,9 @@ class NginxAdapter(ServiceAdapter):
         )
         self._ssh.execute(f"cp /tmp/nginx_new.conf {config_path}")
 
-        # Remove same directive from included conf.d files to prevent overrides
-        if block == "http":
+        # Optional legacy behavior: strip matching directives from conf.d.
+        # Disabled by default because broad sed-based cleanup can remove user-owned config.
+        if block == "http" and self._allow_confd_mutation():
             self._remove_from_confd(parameter)
 
         # Validate — rollback if broken
@@ -160,11 +165,12 @@ class NginxAdapter(ServiceAdapter):
         self._ssh.execute(
             f"sed -i -E 's|^(error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|' {config_path}"
         )
-        # Also fix in conf.d
-        self._ssh.execute(
-            f"sed -i -E 's|^(\\s*error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|'"
-            " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
-        )
+        # Also fix in conf.d when explicitly allowed.
+        if self._allow_confd_mutation():
+            self._ssh.execute(
+                f"sed -i -E 's|^(\\s*error_log\\s+\\S+)\\s+\\S+;|\\1 {level};|'"
+                " /etc/nginx/conf.d/*.conf 2>/dev/null || true"
+            )
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
             self._ssh.execute(f"cp {config_path}.bak {config_path}")
@@ -181,12 +187,15 @@ class NginxAdapter(ServiceAdapter):
             f"{directive} ",
         ):
             self._ssh.execute(f"sed -i '/{pattern}/d' {config_path} 2>/dev/null || true")
-        # Also remove from conf.d files
-        for pattern in (
-            f"{directive}_zone",
-            f"{directive} ",
-        ):
-            self._ssh.execute(f"sed -i '/{pattern}/d' /etc/nginx/conf.d/*.conf 2>/dev/null || true")
+        # Also remove from conf.d files only when explicitly allowed.
+        if self._allow_confd_mutation():
+            for pattern in (
+                f"{directive}_zone",
+                f"{directive} ",
+            ):
+                self._ssh.execute(
+                    f"sed -i '/{pattern}/d' /etc/nginx/conf.d/*.conf 2>/dev/null || true"
+                )
         test = self._ssh.execute("nginx -t 2>&1")
         if "syntax is ok" not in test.stdout and "test is successful" not in test.stdout:
             self._ssh.execute(f"cp {config_path}.bak {config_path}")

@@ -97,6 +97,11 @@ agent:
     enabled: true
     observational: true
     synth_timeout_sec: 300
+  phase_controller:
+    enabled: true
+    block_on_fail_findings: true
+    block_eval_actions:
+      - self_correct
   stability:
     enabled: false
     duration_sec: 1800
@@ -235,17 +240,18 @@ slack:
     - error                          # crashes, nginx down, etc.
 
 tools:
-  approval_mode: auto              # auto | interactive | dry_run
+  approval_mode: interactive       # auto | interactive | dry_run
+  allow_auto_apply: false          # explicit opt-in required for auto mode
   audit_log: true                  # write audit trail to report/audit_<session>.jsonl
   scopes:
     webserver:
-      mode: auto
+      mode: interactive
     kernel:
-      mode: auto
+      mode: interactive
     resource_limits:
-      mode: auto
+      mode: interactive
     network:
-      mode: auto
+      mode: interactive
     storage:
       mode: auto
     preflight:
