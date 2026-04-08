@@ -236,27 +236,47 @@ async def main(
         )
 
     token_counter = TokenCounter()
-    tracing_cfg = cfg.get("telemetry", {}).get("langfuse", {}) or {}
-    langfuse_enabled = bool(tracing_cfg.get("enabled", False))
-    langfuse = LangfuseClient.from_env(
-        {
-            "session_id": session_id,
-            "service": cfg["service"]["name"],
-            "planner_mode": resolved_planner_mode,
-            "max_phase": resolved_max_phase,
-            "baseline_mode": resolved_baseline_mode,
-            "llm_profile": profile_name,
-            "dut_host": host,
-            "bench_host": bench_host,
-        },
-        enabled=langfuse_enabled,
-    )
-    if langfuse.enabled:
-        if langfuse.auth_check():
-            logger.status("langfuse", "Tracing enabled (auth OK)")
+    # Observability provider selection: otel | langfuse | none
+    obs_cfg = cfg.get("observability") or {}
+    # Check new observability config, fall back to legacy telemetry.langfuse.enabled
+    legacy_langfuse = bool((cfg.get("telemetry", {}).get("langfuse", {}) or {}).get("enabled", False))
+    if obs_cfg.get("enabled", False):
+        obs_provider = obs_cfg.get("provider", "otel")
+    elif legacy_langfuse:
+        obs_provider = "langfuse"
+    else:
+        obs_provider = "none"
+    tracing_metadata = {
+        "session_id": session_id,
+        "service": cfg["service"]["name"],
+        "planner_mode": resolved_planner_mode,
+        "max_phase": resolved_max_phase,
+        "baseline_mode": resolved_baseline_mode,
+        "llm_profile": profile_name,
+        "dut_host": host,
+        "bench_host": bench_host,
+    }
+
+    if obs_provider == "otel":
+        from telemetry.otel_provider import OTelProvider
+        langfuse = OTelProvider(obs_cfg)
+        if langfuse.enabled:
+            logger.status("observability", f"OpenTelemetry → {obs_cfg.get('endpoint', 'localhost:4318')}")
         else:
-            logger.log("langfuse", "Tracing disabled: auth check failed", "warn")
-            langfuse = LangfuseClient.from_env(enabled=False)
+            logger.log("observability", "OTel init failed — tracing disabled", "warn")
+    elif obs_provider == "langfuse":
+        tracing_cfg = cfg.get("telemetry", {}).get("langfuse", {}) or {}
+        langfuse = LangfuseClient.from_env(tracing_metadata, enabled=True)
+        if langfuse.enabled:
+            if langfuse.auth_check():
+                logger.status("langfuse", "Tracing enabled (auth OK)")
+            else:
+                logger.log("langfuse", "Tracing disabled: auth check failed", "warn")
+                langfuse = LangfuseClient.from_env(enabled=False)
+        else:
+            logger.log("langfuse", "Langfuse not configured", "warn")
+    else:
+        langfuse = LangfuseClient.from_env(tracing_metadata, enabled=False)
     deps = AgentDeps(
         adapter=adapter,
         memory=memory,

@@ -251,6 +251,14 @@ tools:
     preflight:
       mode: auto                   # set to 'interactive' for LLM-generated command approval
 
+observability:
+  enabled: false                     # set to true to enable tracing
+  provider: otel                     # otel | langfuse | none
+  endpoint: http://localhost:4318    # OTLP HTTP endpoint (Grafana Alloy / OTel Collector)
+  service_name: slaymetrics
+  trace_content: true                # include prompts/completions in spans
+  auto_instrument_langchain: true    # auto-instrument LangChain/LangGraph calls
+
 telemetry:
   langfuse:
     enabled: false
