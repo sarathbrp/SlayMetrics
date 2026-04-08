@@ -244,6 +244,7 @@ class OTelProvider:
         self,
         name: str,
         *,
+        input: Any = None,
         output: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -255,6 +256,8 @@ class OTelProvider:
         if not span or not span.is_recording():
             return
         attrs: dict[str, str] = {}
+        if input:
+            attrs["input"] = _safe_str(input)
         if output:
             attrs["output"] = _safe_str(output)
         if metadata:
