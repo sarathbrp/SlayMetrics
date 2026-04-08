@@ -297,16 +297,20 @@ async def run(model, deps: AgentDeps) -> str:
     logger.status("evidence", "Benchmark and telemetry evidence assembled for RCA")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5: RCA + recommendations (ITERATION LOOP)
+    # STEP 5: 3-Phase Iteration Pipeline
+    #   Iter 1: DIAGNOSE — experts analyze (no apply)
+    #   Iter 2: PLAN + APPLY — synthesize + apply + benchmark
+    #   Iter 3: REVIEW — targeted fix if needed (conditional)
     # ══════════════════════════════════════════════════════════════════════════
-    max_iterations = int((cfg.get("agent") or {}).get("max_iterations", 3))
-    iteration_feedback = ""
     diagnosis = None
     iteration_finals: dict[str, Any] = {}
     best_iteration_finals: dict[str, Any] = {}
     best_iteration_rps: float = 0.0
+    planner_mode = str((cfg.get("agent") or {}).get("planner_mode", "debate")).strip().lower()
 
-    def _notify_iteration(decision_text: str, results: dict[str, Any]) -> None:
+    def _notify_iteration(
+        iteration: int, decision_text: str, results: dict[str, Any], diag: Any = None
+    ) -> None:
         if not slack_notifier:
             return
         try:
@@ -315,187 +319,255 @@ async def run(model, deps: AgentDeps) -> str:
                 iteration=iteration,
                 baselines=baselines,
                 results=results or baselines,
-                guardrails_triggered=getattr(diagnosis, "guardrails_triggered", None),
+                guardrails_triggered=getattr(diag, "guardrails_triggered", None),
                 tokens_used=deps.token_counter.total,
                 decision=decision_text,
             )
         except Exception as e:
             logger.log("slack", f"iteration_complete notify failed: {e}", "warn")
 
-    for iteration in range(1, max_iterations + 1):
-        logger.step(
-            f"Step 5: Iteration {iteration}/{max_iterations} — RCA and recommendation planning..."
-        )
-        # Pass iteration number to agent for per-iteration hypothesis files
-        deps.iteration = iteration  # type: ignore[attr-defined]
+    context_prompt = _build_context_prompt(
+        rhel_ver=rhel_ver,
+        kernel_ver=kernel_ver,
+        cpu_cores=cpu_cores,
+        ram_gb=ram_gb,
+        checks_summary=checks_summary,
+        benchmark_evidence_text=benchmark_evidence_text,
+        prior_fixes=prior_fixes,
+    )
 
-        context_prompt = _build_context_prompt(
-            rhel_ver=rhel_ver,
-            kernel_ver=kernel_ver,
-            cpu_cores=cpu_cores,
-            ram_gb=ram_gb,
-            checks_summary=checks_summary,
-            benchmark_evidence_text=benchmark_evidence_text,
-            prior_fixes=prior_fixes,
-        )
-        if iteration_feedback:
-            context_prompt += f"\n{iteration_feedback}\n"
+    # ── ITERATION 1: DIAGNOSE (experts only, no apply) ────────────────────
+    logger.step("Step 5: Iteration 1/3 — Expert diagnosis...")
+    deps.iteration = 1  # type: ignore[attr-defined]
 
-        logger.log(
-            "orchestrator",
-            f"Context prompt: {len(context_prompt)} chars (iteration {iteration})",
-            "info",
+    with (
+        langfuse.span(
+            "diagnosis_iter1",
+            input={"phase": "diagnose", "planner_mode": planner_mode},
+            metadata={"session_id": session_id},
         )
+        if langfuse
+        else nullcontext()
+    ):
+        if planner_mode == "debate":
+            diagnosis_iter1 = await diagnosis_agent.run(
+                model, deps, context_prompt, iteration_phase="diagnose"
+            )
+        else:
+            # deterministic/hybrid: run full pipeline in one shot (legacy)
+            diagnosis_iter1 = await diagnosis_agent.run(model, deps, context_prompt)
 
-        # Snapshot fact count to isolate this iteration's applied facts
-        pre_iteration_facts = memory.get_facts(session_id, type="fix")
-        pre_iteration_fact_count = len(pre_iteration_facts)
+    # Save expert state for iter2
+    expert_state = {
+        "rca_records": diagnosis_iter1.rca_records,
+        "recommendations": diagnosis_iter1.recommendations,
+        "service_analysis": getattr(diagnosis_iter1, "_service_analysis", None) or {},
+        "rhel_analysis": getattr(diagnosis_iter1, "_rhel_analysis", None) or {},
+        "inspection": getattr(diagnosis_iter1, "_inspection", None) or {},
+    }
+
+    decision = "Diagnosis complete — experts analyzed all 5 categories"
+    logger.status("iteration", f"Iteration 1: {decision}")
+    diagnosis_agent.save_iteration_summary(
+        deps, iteration=1, baselines=baselines,
+        results=baselines, regressions=[], decision=decision,
+        diagnosis=diagnosis_iter1,
+    )
+    _notify_iteration(1, decision, baselines, diag=diagnosis_iter1)
+
+    # For deterministic/hybrid mode, iter1 already applied — skip iter2
+    if planner_mode != "debate":
+        diagnosis = diagnosis_iter1
+        service_applied = getattr(diagnosis, "service_applied", False)
+        system_applied = getattr(diagnosis, "system_applied", False)
+        if service_applied or system_applied:
+            # Benchmark
+            if bench_tool == "hackathon":
+                logger.step("Step 5.1: Running post-apply benchmark (all workloads)...")
+                iteration_finals = _run_hackathon_benchmark(deps, cfg, "iter1", session_id)
+                for workload in ("homepage", "small", "medium", "large", "mixed"):
+                    wl_data = iteration_finals.get(workload, {})
+                    if wl_data.get("rps"):
+                        memory.save_benchmark(
+                            session_id=session_id, iteration_num=1, phase="iteration",
+                            payload_size=workload, rps=wl_data.get("rps"),
+                            latency_p99_ms=wl_data.get("p99"),
+                            cpu_pct=wl_data.get("cpu_pct"), mem_pct=wl_data.get("mem_mb"),
+                        )
+                best_iteration_finals = dict(iteration_finals)
+                best_iteration_rps = float(
+                    iteration_finals.get("small", {}).get("rps", 0)
+                    or iteration_finals.get("homepage", {}).get("rps", 0)
+                    or 0
+                )
+    else:
+        # ── ITERATION 2: PLAN + APPLY + BENCHMARK ────────────────────────────
+        logger.step("Step 5: Iteration 2/3 — Synthesize, plan, and apply...")
+        deps.iteration = 2  # type: ignore[attr-defined]
+        deps.expert_state = expert_state  # type: ignore[attr-defined]
+
+        # Snapshot fact count for rollback
+        pre_iter2_facts = memory.get_facts(session_id, type="fix")
+        pre_iter2_fact_count = len(pre_iter2_facts)
 
         with (
             langfuse.span(
-                "diagnosis_planning",
-                input={
-                    "context_prompt_length": len(context_prompt),
-                    "planner_mode": (cfg.get("agent") or {}).get("planner_mode", "debate"),
-                    "iteration": iteration,
-                },
+                "diagnosis_iter2",
+                input={"phase": "plan_apply", "planner_mode": planner_mode},
                 metadata={"session_id": session_id},
             )
             if langfuse
             else nullcontext()
         ):
-            diagnosis = await diagnosis_agent.run(model, deps, context_prompt)
-
-        # Check if any changes were applied
-        service_applied = getattr(diagnosis, "service_applied", False)
-        system_applied = getattr(diagnosis, "system_applied", False)
-        if not service_applied and not system_applied:
-            decision = "No changes applied — stopping"
-            logger.status("iteration", f"Iteration {iteration}: {decision}")
-            diagnosis_agent.save_iteration_summary(
-                deps,
-                iteration=iteration,
-                baselines=baselines,
-                results=iteration_finals or baselines,
-                regressions=[],
-                decision=decision,
-                diagnosis=diagnosis,
+            diagnosis_iter2 = await diagnosis_agent.run(
+                model, deps, context_prompt, iteration_phase="plan_apply"
             )
-            _notify_iteration(decision, iteration_finals or baselines)
-            break
 
-        # Benchmark ALL workloads to check for regressions
+        diagnosis = diagnosis_iter2
+
+        # Benchmark
         if bench_tool == "hackathon":
-            logger.step(f"Step 5.{iteration}: Running post-iteration benchmark (all workloads)...")
-            iteration_finals = _run_hackathon_benchmark(deps, cfg, f"iter{iteration}", session_id)
+            logger.step("Step 5.2: Running post-iteration benchmark (all workloads)...")
+            iteration_finals = _run_hackathon_benchmark(deps, cfg, "iter2", session_id)
 
-        # Persist iteration benchmarks to SQLite
+        # Persist benchmarks
         for workload in ("homepage", "small", "medium", "large", "mixed"):
             wl_data = iteration_finals.get(workload, {})
             if wl_data.get("rps"):
                 memory.save_benchmark(
-                    session_id=session_id, iteration_num=iteration, phase="iteration",
+                    session_id=session_id, iteration_num=2, phase="iteration",
                     payload_size=workload, rps=wl_data.get("rps"),
                     latency_p99_ms=wl_data.get("p99"),
                     cpu_pct=wl_data.get("cpu_pct"), mem_pct=wl_data.get("mem_mb"),
                 )
 
-        # Check exit criteria: all workloads within 1% of baseline
-        healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
-        should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
-
-        # Check if this iteration degraded vs best so far — rollback if so
         current_small_rps = float(
             iteration_finals.get("small", {}).get("rps", 0)
             or iteration_finals.get("homepage", {}).get("rps", 0)
             or 0
         )
-        iteration_degraded = False
-        if best_iteration_rps and current_small_rps < best_iteration_rps * 0.99:
-            iteration_degraded = True
-        elif not best_iteration_rps:
-            # First iteration — compare against baseline
-            if current_small_rps < baseline_rps * 0.99:
-                iteration_degraded = True
-
-        if iteration_degraded and getattr(diagnosis, "system_applied", False):
-            # Revert this iteration's sysctl params
-            # get_facts returns ORDER BY created_at — safe to slice by count
+        _baseline_rps = float(
+            baselines.get("small", {}).get("rps", 0)
+            or baselines.get("homepage", {}).get("rps", 0)
+            or 0
+        )
+        iter2_degraded = bool(_baseline_rps) and current_small_rps < _baseline_rps * 0.99
+        if iter2_degraded and getattr(diagnosis_iter2, "system_applied", False):
             all_facts = memory.get_facts(session_id, type="fix")
-            iteration_facts = all_facts[pre_iteration_fact_count:]
-            reverted = _revert_iteration_params(deps, iteration_facts)
+            iter2_facts = all_facts[pre_iter2_fact_count:]
+            reverted = _revert_iteration_params(deps, iter2_facts)
             if reverted:
                 logger.status(
                     "rollback",
-                    f"Iteration {iteration}: Reverted {len(reverted)} sysctl params "
-                    f"(small {current_small_rps:.0f} < best {best_iteration_rps:.0f})",
+                    f"Iteration 2: Reverted {len(reverted)} sysctl params "
+                    f"(small {current_small_rps:.0f} < baseline {_baseline_rps:.0f})",
                 )
-                _mark_facts_reverted(
-                    deps, session_id, iteration_facts, iteration, memory
-                )
-        elif iteration_degraded:
-            # Degraded but no system params applied — nothing to revert
-            logger.status(
-                "iteration",
-                f"Iteration {iteration}: Degraded (small {current_small_rps:.0f} "
-                f"< best {best_iteration_rps or baseline_rps:.0f}) but no sysctl "
-                f"params to revert",
-            )
+                _mark_facts_reverted(deps, session_id, iter2_facts, 2, memory)
         else:
             best_iteration_finals = dict(iteration_finals)
             best_iteration_rps = current_small_rps
 
-        if should_stop:
-            decision = f"All workloads OK after iteration {iteration} — continuing to find further gains"
-            logger.status("iteration", f"Iteration {iteration}: {decision}")
-            diagnosis_agent.save_iteration_summary(
-                deps,
-                iteration=iteration,
-                baselines=baselines,
-                results=iteration_finals,
-                regressions=regressions,
-                decision=decision,
-                diagnosis=diagnosis,
-            )
-            _notify_iteration(decision, iteration_finals)
-            # Don't break — always run max_iterations to explore optimization groups
-
-        if iteration >= max_iterations:
-            decision = f"Max iterations ({max_iterations}) reached — stopping"
-            logger.status("iteration", f"Iteration {iteration}: {decision}")
-            diagnosis_agent.save_iteration_summary(
-                deps,
-                iteration=iteration,
-                baselines=baselines,
-                results=iteration_finals,
-                regressions=regressions,
-                decision=decision,
-                diagnosis=diagnosis,
-            )
-            _notify_iteration(decision, iteration_finals)
-            break
-
-        # Continuing to next iteration
-        if not should_stop:
-            decision = f"{len(regressions)} regressions — continuing to iteration {iteration + 1}"
-            logger.status("iteration", f"Iteration {iteration}: {decision}")
-            diagnosis_agent.save_iteration_summary(
-                deps,
-                iteration=iteration,
-                baselines=baselines,
-                results=iteration_finals,
-                regressions=regressions,
-                decision=decision,
-                diagnosis=diagnosis,
-            )
-            _notify_iteration(decision, iteration_finals)
-
-        iteration_feedback = _build_iteration_feedback(
-            iteration=iteration,
-            baselines=baselines,
-            current_results=iteration_finals,
-            regressions=regressions,
+        decision = f"Applied all categories — small={current_small_rps:.0f} RPS"
+        logger.status("iteration", f"Iteration 2: {decision}")
+        diagnosis_agent.save_iteration_summary(
+            deps, iteration=2, baselines=baselines,
+            results=iteration_finals, regressions=[],
+            decision=decision, diagnosis=diagnosis_iter2,
         )
+        _notify_iteration(2, decision, iteration_finals, diag=diagnosis_iter2)
+
+        # ── DECISION GATE: should we run iter3? ──────────────────────────────
+        healthy_floor = cfg.get("service", {}).get("benchmark", {}).get("healthy_floor_rps")
+        should_stop, regressions = _check_iteration_exit(baselines, iteration_finals, healthy_floor)
+        target_rps = float((cfg.get("agent") or {}).get("skip_if_above_rps", 1300000))
+
+        if should_stop and current_small_rps >= target_rps:
+            decision = (
+                f"Target met ({current_small_rps:.0f} >= {target_rps:.0f} RPS) — skipping iter 3"
+            )
+            logger.status("iteration", f"Decision gate: {decision}")
+        else:
+            # ── ITERATION 3: REVIEW + TARGETED FIX ───────────────────────────
+            reason = (
+                f"{len(regressions)} regressions" if regressions
+                else f"RPS {current_small_rps:.0f} below target {target_rps:.0f}"
+            )
+            logger.step(f"Step 5: Iteration 3/3 — Review and targeted fix ({reason})...")
+            deps.iteration = 3  # type: ignore[attr-defined]
+
+            feedback = _build_iteration_feedback(
+                iteration=2, baselines=baselines,
+                current_results=iteration_finals, regressions=regressions,
+            )
+            deps.iteration_feedback = feedback  # type: ignore[attr-defined]
+
+            pre_iter3_facts = memory.get_facts(session_id, type="fix")
+            pre_iter3_fact_count = len(pre_iter3_facts)
+
+            with (
+                langfuse.span(
+                    "diagnosis_iter3",
+                    input={"phase": "review", "planner_mode": planner_mode},
+                    metadata={"session_id": session_id},
+                )
+                if langfuse
+                else nullcontext()
+            ):
+                diagnosis_iter3 = await diagnosis_agent.run(
+                    model, deps, context_prompt + "\n" + feedback,
+                    iteration_phase="review",
+                )
+
+            diagnosis = diagnosis_iter3
+
+            # Benchmark
+            if bench_tool == "hackathon":
+                logger.step("Step 5.3: Running post-review benchmark (all workloads)...")
+                iteration_finals = _run_hackathon_benchmark(deps, cfg, "iter3", session_id)
+
+            # Persist benchmarks
+            for workload in ("homepage", "small", "medium", "large", "mixed"):
+                wl_data = iteration_finals.get(workload, {})
+                if wl_data.get("rps"):
+                    memory.save_benchmark(
+                        session_id=session_id, iteration_num=3, phase="iteration",
+                        payload_size=workload, rps=wl_data.get("rps"),
+                        latency_p99_ms=wl_data.get("p99"),
+                        cpu_pct=wl_data.get("cpu_pct"), mem_pct=wl_data.get("mem_mb"),
+                    )
+
+            iter3_rps = float(
+                iteration_finals.get("small", {}).get("rps", 0)
+                or iteration_finals.get("homepage", {}).get("rps", 0)
+                or 0
+            )
+
+            # Rollback if iter3 degraded vs iter2
+            if iter3_rps < best_iteration_rps * 0.99:
+                all_facts = memory.get_facts(session_id, type="fix")
+                iter3_facts = all_facts[pre_iter3_fact_count:]
+                reverted = _revert_iteration_params(deps, iter3_facts)
+                if reverted:
+                    logger.status(
+                        "rollback",
+                        f"Iteration 3: Reverted {len(reverted)} params "
+                        f"(small {iter3_rps:.0f} < iter2 {best_iteration_rps:.0f})",
+                    )
+                    _mark_facts_reverted(deps, session_id, iter3_facts, 3, memory)
+                # Keep iter2 as best
+                iteration_finals = best_iteration_finals
+            else:
+                best_iteration_finals = dict(iteration_finals)
+                best_iteration_rps = iter3_rps
+
+            decision = f"Review complete — small={iter3_rps:.0f} RPS"
+            logger.status("iteration", f"Iteration 3: {decision}")
+            diagnosis_agent.save_iteration_summary(
+                deps, iteration=3, baselines=baselines,
+                results=iteration_finals, regressions=regressions,
+                decision=decision, diagnosis=diagnosis_iter3,
+            )
+            _notify_iteration(3, decision, iteration_finals)
 
     notes = getattr(diagnosis, "notes", getattr(diagnosis, "summary", ""))
     logger.log("agent", f"Summary: {notes}", "result")

@@ -196,7 +196,7 @@ def test_orchestrator_reuses_stored_baseline(monkeypatch):
     monkeypatch.setattr(
         orchestrator.diagnosis_agent,
         "run",
-        lambda model, deps, context_prompt: asyncio.sleep(
+        lambda model, deps, context_prompt, iteration_phase="full": asyncio.sleep(
             0,
             result=SimpleNamespace(
                 notes="planned",
@@ -205,6 +205,9 @@ def test_orchestrator_reuses_stored_baseline(monkeypatch):
                 service_applied=False,
                 system_applied=False,
                 after_rps=0.0,
+                _service_analysis={},
+                _rhel_analysis={},
+                _inspection={},
             ),
         ),
     )
@@ -327,11 +330,16 @@ def test_orchestrator_run_and_context_prompt(monkeypatch, tmp_path):
         "run_all",
         lambda ssh, checks: [CheckResult("cpu_governor", "ok", "ok", "")],
     )
-    diagnosis = SimpleNamespace(summary="done", fixes_applied=[{"after_rps": 150}])
+    diagnosis = SimpleNamespace(
+        summary="done", fixes_applied=[{"after_rps": 150}],
+        notes="done", recommendations=[], rca_records=[],
+        service_applied=False, system_applied=False, after_rps=0.0,
+        _service_analysis={}, _rhel_analysis={}, _inspection={},
+    )
     monkeypatch.setattr(
         orchestrator.diagnosis_agent,
         "run",
-        lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
+        lambda model, deps, context_prompt, iteration_phase="full": asyncio.sleep(0, result=diagnosis),
     )
     monkeypatch.setattr(
         orchestrator.diagnosis_agent,
@@ -427,7 +435,7 @@ def test_orchestrator_stops_after_phase_3(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator.diagnosis_agent,
         "run",
-        lambda model, deps, context_prompt: asyncio.sleep(0, result=diagnosis),
+        lambda model, deps, context_prompt, iteration_phase="full": asyncio.sleep(0, result=diagnosis),
     )
     monkeypatch.setattr(
         orchestrator.diagnosis_agent,
@@ -501,7 +509,7 @@ def test_orchestrator_optimization_mode_reverts_failed_group(monkeypatch, tmp_pa
     monkeypatch.setattr(
         orchestrator.diagnosis_agent,
         "run",
-        lambda model, deps, context_prompt: asyncio.sleep(
+        lambda model, deps, context_prompt, iteration_phase="full": asyncio.sleep(
             0,
             result=SimpleNamespace(
                 notes="planned",
@@ -509,6 +517,10 @@ def test_orchestrator_optimization_mode_reverts_failed_group(monkeypatch, tmp_pa
                 rca_records=[],
                 service_applied=True,
                 system_applied=False,
+                after_rps=0.0,
+                _service_analysis={},
+                _rhel_analysis={},
+                _inspection={},
             ),
         ),
     )

@@ -42,6 +42,10 @@ class DiagnosisOutput:
     apply_results: dict[str, Any] | None = None
     guardrails_triggered: list[str] | None = None
     eval_results: dict[str, Any] | None = None
+    # Expert state — passed between iterations
+    _service_analysis: dict[str, Any] | None = None
+    _rhel_analysis: dict[str, Any] | None = None
+    _inspection: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.after_rps = _coerce_float(self.after_rps)
@@ -298,16 +302,31 @@ def build(model, config=None) -> DiagnosisWorkflow:
             _tuning_cfg.get("webserver_targets") or _tuning_cfg.get("service_targets") or {}
         ).items()
     }
+    # Kernel-only targets used by inspect_system_tuning (backward-compatible behavior).
     system_targets: dict[str, str] = {
         str(k): str(v)
         for k, v in (
             _tuning_cfg.get("kernel_targets") or _tuning_cfg.get("system_targets") or {}
         ).items()
     }
+    resource_targets: dict[str, str] = {
+        str(k): str(v) for k, v in (_tuning_cfg.get("resource_limits_targets") or {}).items()
+    }
+    network_targets: dict[str, str] = {
+        str(k): str(v) for k, v in (_tuning_cfg.get("network_targets") or {}).items()
+    }
+    storage_targets: dict[str, str] = {
+        str(k): str(v) for k, v in (_tuning_cfg.get("storage_targets") or {}).items()
+    }
+    # Recommendation filtering should accept all non-webserver categories.
+    system_allowed_params: set[str] = (
+        set(system_targets) | set(resource_targets) | set(network_targets) | set(storage_targets)
+    )
 
     # Alias map: LLMs use variant key names → normalize to config allowlist keys
     _param_aliases: dict[str, str] = {
         "selinux_mode": "selinux",
+        "selinux": "selinux",
         "cgroup_IOWeight": "cgroup_io_weight",
         "cgroup_CPUWeight": "cgroup_cpu_weight",
         "cgroup_ioweight": "cgroup_io_weight",
@@ -315,12 +334,21 @@ def build(model, config=None) -> DiagnosisWorkflow:
         "IOWeight": "cgroup_io_weight",
         "CPUWeight": "cgroup_cpu_weight",
         "tc_qdisc": "tc_rules",
+        "defaultlimitnofile": "systemd_nofile",
+        "DefaultLimitNOFILE": "systemd_nofile",
+        "fs.file-max": "fs.file_max",
+        "transparent_hugepage/enabled": "transparent_hugepage",
+        "transparent_hugepage/defrag": "transparent_hugepage",
+        "SELINUX": "selinux",
         "keepalive_timeout": "keepalive_timeout",
     }
 
     def _resolve_param_alias(key: str) -> str:
         """Normalize a parameter key using the alias map."""
-        return _param_aliases.get(key, key)
+        key_s = str(key).strip()
+        if key_s.startswith("tc_qdisc_"):
+            return "tc_rules"
+        return _param_aliases.get(key_s, _param_aliases.get(key_s.lower(), key_s))
 
     def inspect_irq_impl(deps: AgentDeps) -> dict:
         tool_call("inspect", "irq distribution — checking for IRQ lock and CPU spread")
@@ -938,7 +966,17 @@ def build(model, config=None) -> DiagnosisWorkflow:
         )
         normalized_items: list[dict[str, Any]] = []
         for idx, item in enumerate(recommendations, start=1):
-            scope = str(item.get("scope", "nginx")).strip().lower() or "nginx"
+            raw_scope = str(item.get("scope", "nginx")).strip().lower() or "nginx"
+            scope = {
+                "service": "nginx",
+                "webserver": "nginx",
+                "nginx": "nginx",
+                "system": "system",
+                "kernel": "system",
+                "resource_limits": "system",
+                "network": "system",
+                "storage": "system",
+            }.get(raw_scope, raw_scope)
             if scope not in {"nginx", "system"}:
                 if _debug_enabled(deps):
                     tool_result(
@@ -986,7 +1024,7 @@ def build(model, config=None) -> DiagnosisWorkflow:
             changes, parse_error = _normalize_changes(item.get("changes"), "recommendation")
             if parse_error:
                 changes = {}
-            allowed_params = set(service_targets) if scope == "nginx" else set(system_targets)
+            allowed_params = set(service_targets) if scope == "nginx" else set(system_allowed_params)
             filtered_changes = {
                 _resolve_param_alias(key): value
                 for key, value in (changes or {}).items()
@@ -2336,9 +2374,18 @@ async def run_preflight(model, deps: AgentDeps) -> dict[str, Any]:
     }
 
 
-async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
-    """Run the diagnosis workflow and derive the final structured result in Python."""
-    llm_call("agent", "Starting diagnosis — sending context to LLM...")
+async def run(
+    model, deps: AgentDeps, context_prompt: str, iteration_phase: str = "full",
+) -> DiagnosisOutput:
+    """Run the diagnosis workflow with phase-based execution.
+
+    iteration_phase:
+      "diagnose"   — iter1: inspect + experts only, no apply
+      "plan_apply" — iter2: synthesizer + apply_planner + apply
+      "review"     — iter3: experts with feedback + targeted apply
+      "full"       — legacy: all in one (backward compat)
+    """
+    llm_call("agent", f"Starting diagnosis — phase={iteration_phase!r}")
     agent = build(model, config=getattr(deps, "config", None))
     state = getattr(agent, "_slaymetrics_state", {})
     config = getattr(deps, "config", {}) or {}
@@ -2346,23 +2393,33 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
     if planner_mode == "single":
         planner_mode = "deterministic"
     llm_call("agent", f"Planner mode: {planner_mode!r}")
-    if planner_mode in ("deterministic", "hybrid"):
+
+    if iteration_phase == "diagnose":
+        # Iter1: inspect + experts only — no apply
+        result = await _run_debate_experts_only(agent, model, deps, context_prompt, state)
+    elif iteration_phase == "plan_apply":
+        # Iter2: synthesize + plan + apply using iter1 expert outputs
+        result = await _run_synthesis_and_apply(agent, model, deps, context_prompt, state)
+    elif iteration_phase == "review":
+        # Iter3: re-run experts with feedback + targeted apply
+        result = await _run_review_iteration(agent, model, deps, context_prompt, state)
+    elif planner_mode in ("deterministic", "hybrid"):
         result = await _run_rules_engine(
-            agent,
-            model,
-            deps,
-            context_prompt,
-            state,
+            agent, model, deps, context_prompt, state,
             hybrid=(planner_mode == "hybrid"),
         )
     elif planner_mode == "debate":
         result = await _run_debate_planner(agent, model, deps, context_prompt, state)
     else:
         result = await agent.run(context_prompt, deps=deps)
-    apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
-    max_phase = int((config.get("agent") or {}).get("max_phase", 4))
-    if callable(apply_from_recommendations) and max_phase >= 4:
-        apply_from_recommendations(deps)
+
+    # Apply phase — only for "full", "plan_apply", "review" modes
+    if iteration_phase in ("full", "plan_apply", "review"):
+        apply_from_recommendations = getattr(agent, "_apply_from_recommendations", None)
+        max_phase = int((config.get("agent") or {}).get("max_phase", 4))
+        if callable(apply_from_recommendations) and max_phase >= 4:
+            apply_from_recommendations(deps)
+
     inp, out = result.usage().input_tokens or 0, result.usage().output_tokens or 0
     deps.token_counter.input_tokens += int(inp)
     deps.token_counter.output_tokens += int(out)
@@ -2409,6 +2466,9 @@ async def run(model, deps: AgentDeps, context_prompt: str) -> DiagnosisOutput:
         apply_results=state.get("apply_results"),
         guardrails_triggered=state.get("guardrails_triggered"),
         eval_results=state.get("eval_results"),
+        _service_analysis=state.get("service_analysis"),
+        _rhel_analysis=state.get("rhel_analysis"),
+        _inspection=state.get("inspection"),
     )
 
 
@@ -2815,6 +2875,327 @@ async def _run_debate_planner(
     )
 
 
+async def _run_debate_experts_only(
+    agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None,
+):
+    """Iteration 1: Inspect + run service_expert + rhel_expert in parallel. No synthesis or apply."""
+    ctx = SimpleNamespace(deps=deps)
+    save_rca = agent._function_toolset.tools["save_rca"].function
+    save_recommendations = agent._function_toolset.tools["save_recommendations"].function
+
+    from agents.tools_inspect import inspect_all
+
+    tool_call("inspect", "compound inspect — all 5 categories")
+    all_inspection = inspect_all(deps.ssh, deps.config, adapter=deps.adapter)
+    tool_result(
+        "inspect",
+        f"issues: {all_inspection.get('summary', {}).get('total_issues', 0)} "
+        f"({json.dumps(all_inspection.get('summary', {}).get('by_category', {}))}) ",
+    )
+    deps.token_counter.tool_calls += 1
+    deps.memory.save_context(
+        deps.session_id, "command_output", "compound_inspection",
+        json.dumps(all_inspection, ensure_ascii=True)[:8000],
+        f"compound inspect: {all_inspection.get('summary', {}).get('total_issues', 0)} issues",
+    )
+    if agent_state is not None:
+        agent_state["inspection"] = all_inspection
+
+    # Split inspection data for experts
+    webserver_data = all_inspection.get("webserver", {})
+    kernel_data = all_inspection.get("kernel", {})
+    resource_data = all_inspection.get("resource_limits", {})
+    network_data = all_inspection.get("network", {})
+    storage_data = all_inspection.get("storage", {})
+
+    _web_llm = _filter_inspection_for_llm(webserver_data)
+    _kern_llm = _filter_inspection_for_llm(kernel_data)
+    _sys_line = getattr(deps, "system_fingerprint", "") or ""
+
+    from core.prompts import service_expert as service_expert_prompt
+    from core.prompts import rhel_expert as rhel_expert_prompt
+
+    _profile = getattr(deps, "service_profile", None)
+    service_prompt = service_expert_prompt.build(
+        system_line=_sys_line, service_inspection=_web_llm, profile=_profile,
+    )
+    rhel_prompt = rhel_expert_prompt.build(
+        system_line=_sys_line, kernel_inspection=_kern_llm,
+        resource_data=resource_data, network_data=network_data, storage_data=storage_data,
+    )
+
+    _svc_name = _profile.name if _profile else "service"
+    (service_analysis, svc_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
+        asyncio.to_thread(_invoke_json_planner, model, f"planner.{_svc_name}_expert", service_prompt, deps),
+        asyncio.to_thread(_invoke_json_planner, model, "planner.rhel_expert", rhel_prompt, deps),
+    )
+    if _planner_debug_enabled(deps):
+        tool_result("debug", f"{_svc_name}_expert raw:\n{json.dumps(service_analysis, indent=2, ensure_ascii=False)}")
+        tool_result("debug", f"rhel_expert raw:\n{json.dumps(rhel_analysis, indent=2, ensure_ascii=False)}")
+
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, f"{_svc_name}_expert", service_analysis, iteration=_iter)
+    _save_planner_artifact(deps, "rhel_expert", rhel_analysis, iteration=_iter)
+
+    # Save expert outputs to state for iter2
+    if agent_state is not None:
+        agent_state["service_analysis"] = service_analysis
+        agent_state["rhel_analysis"] = rhel_analysis
+
+    # Save RCA + recommendations from expert outputs (without synthesis)
+    rca_records = _coerce_records(service_analysis.get("rca_records"), deps=deps)
+    rca_records += _coerce_records(rhel_analysis.get("rca_records"), deps=deps)
+    recommendations = _coerce_recommendations(service_analysis.get("recommendations"), deps=deps)
+    recommendations += _coerce_recommendations(rhel_analysis.get("recommendations"), deps=deps)
+    if rca_records:
+        await save_rca(ctx, rca_records)
+    if recommendations:
+        await save_recommendations(ctx, recommendations)
+
+    total_in = svc_usage["input_tokens"] + rhel_usage["input_tokens"]
+    total_out = svc_usage["output_tokens"] + rhel_usage["output_tokens"]
+
+    summary = service_analysis.get("summary", "") or rhel_analysis.get("summary", "")
+    return SimpleNamespace(
+        output=f"Diagnosis complete: {summary}".strip(),
+        usage=lambda: SimpleNamespace(input_tokens=total_in, output_tokens=total_out),
+        all_messages=lambda: [],
+    )
+
+
+async def _run_synthesis_and_apply(
+    agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None,
+):
+    """Iteration 2: Synthesize iter1 expert outputs + apply_planner + apply."""
+    ctx = SimpleNamespace(deps=deps)
+    save_rca = agent._function_toolset.tools["save_rca"].function
+    save_recommendations = agent._function_toolset.tools["save_recommendations"].function
+
+    # Get expert outputs from iter1 (stored on deps by orchestrator)
+    expert_state = getattr(deps, "expert_state", {}) or {}
+    service_analysis = expert_state.get("service_analysis", {})
+    rhel_analysis = expert_state.get("rhel_analysis", {})
+    all_inspection = expert_state.get("inspection", {})
+
+    if agent_state is not None:
+        agent_state["inspection"] = all_inspection
+
+    resource_data = all_inspection.get("resource_limits", {})
+    network_data = all_inspection.get("network", {})
+    storage_data = all_inspection.get("storage", {})
+
+    _profile = getattr(deps, "service_profile", None)
+    _svc_name = _profile.name if _profile else "service"
+
+    # Run synthesizer
+    from core.prompts import synthesizer as synthesizer_prompt
+
+    synth_prompt = synthesizer_prompt.build(
+        system_fingerprint=getattr(deps, "system_fingerprint", "") or "unknown",
+        service_analysis=service_analysis, rhel_analysis=rhel_analysis,
+        service_name=_svc_name.upper(),
+    )
+    synthesis, synth_usage = _invoke_json_planner(model, "planner.synthesizer", synth_prompt, deps)
+    if _planner_debug_enabled(deps):
+        tool_result("debug", f"synthesizer raw:\n{json.dumps(synthesis, indent=2, ensure_ascii=False)}")
+
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, "synthesizer", synthesis, iteration=_iter)
+
+    rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
+    recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)
+    if rca_records:
+        await save_rca(ctx, rca_records)
+    if recommendations:
+        await save_recommendations(ctx, recommendations)
+
+    # Run apply_planner
+    _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
+    _web_tgt = _tuning.get("service_targets") or _tuning.get("webserver_targets") or {}
+    _kern_tgt = _tuning.get("kernel_targets") or {}
+    _res_tgt = _tuning.get("resource_limits_targets") or {}
+    _net_tgt = _tuning.get("network_targets") or {}
+    _stor_tgt = _tuning.get("storage_targets") or {}
+
+    from core.prompts import apply_planner as apply_planner_prompt
+
+    apply_prompt = apply_planner_prompt.build(
+        service_targets=_web_tgt, kernel_targets=_kern_tgt,
+        resource_limits_targets=_res_tgt, network_targets=_net_tgt,
+        storage_targets=_stor_tgt,
+        recommendations=_clean_recs_for_planner(synthesis.get("recommendations", []), deps.config),
+        resource_problems=resource_data.get("problems", []),
+        network_problems=network_data.get("problems", []),
+        storage_problems=storage_data.get("problems", []),
+    )
+    apply_plan, apply_usage = _invoke_json_planner(model, "planner.apply_planner", apply_prompt, deps)
+
+    categories = ["webserver", "kernel", "resource_limits", "network", "storage"]
+    plan_summary = {cat: list((apply_plan.get(cat) or {}).keys()) for cat in categories}
+    tool_call("apply_planner", " | ".join(f"{c}={len(v)}" for c, v in plan_summary.items() if v))
+    if _planner_debug_enabled(deps):
+        tool_result("debug", f"apply_planner raw:\n{json.dumps(apply_plan, indent=2, ensure_ascii=False)}")
+    _save_planner_artifact(deps, "apply_planner", apply_plan, iteration=_iter)
+
+    # Safety net: inject config defaults
+    _defaults_by_cat = {
+        "webserver": _web_tgt, "kernel": _kern_tgt, "resource_limits": _res_tgt,
+        "network": _net_tgt, "storage": _stor_tgt,
+    }
+    for _cat, _defaults in _defaults_by_cat.items():
+        plan_cat = apply_plan.get(_cat)
+        if not isinstance(plan_cat, dict):
+            plan_cat = {}
+            apply_plan[_cat] = plan_cat
+        _cfg = getattr(deps, "config", None) or {}
+        for _param, _default_val in _defaults.items():
+            if _param not in plan_cat and not _is_blocked(_param, _default_val, _cfg):
+                plan_cat[_param] = _default_val
+
+    _enforce_nginx_fd_consistency(apply_plan, getattr(deps, "config", None) or {})
+
+    if agent_state is not None:
+        agent_state["apply_plan"] = apply_plan
+
+    total_in = synth_usage["input_tokens"] + apply_usage["input_tokens"]
+    total_out = synth_usage["output_tokens"] + apply_usage["output_tokens"]
+    return SimpleNamespace(
+        output=str(synthesis.get("summary") or "Plan and apply completed.").strip(),
+        usage=lambda: SimpleNamespace(input_tokens=total_in, output_tokens=total_out),
+        all_messages=lambda: [],
+    )
+
+
+async def _run_review_iteration(
+    agent, model, deps: AgentDeps, context_prompt: str, agent_state: dict | None = None,
+):
+    """Iteration 3: Re-run experts with benchmark feedback, synthesize delta, apply."""
+    ctx = SimpleNamespace(deps=deps)
+    save_rca = agent._function_toolset.tools["save_rca"].function
+    save_recommendations = agent._function_toolset.tools["save_recommendations"].function
+
+    # Re-inspect to see current state after iter2 apply
+    from agents.tools_inspect import inspect_all
+
+    tool_call("inspect", "re-inspect — all 5 categories (post-apply)")
+    all_inspection = inspect_all(deps.ssh, deps.config, adapter=deps.adapter)
+    tool_result(
+        "inspect",
+        f"remaining issues: {all_inspection.get('summary', {}).get('total_issues', 0)} "
+        f"({json.dumps(all_inspection.get('summary', {}).get('by_category', {}))}) ",
+    )
+    if agent_state is not None:
+        agent_state["inspection"] = all_inspection
+
+    # Build review context with feedback from iter2
+    feedback = getattr(deps, "iteration_feedback", "") or ""
+
+    webserver_data = all_inspection.get("webserver", {})
+    kernel_data = all_inspection.get("kernel", {})
+    resource_data = all_inspection.get("resource_limits", {})
+    network_data = all_inspection.get("network", {})
+    storage_data = all_inspection.get("storage", {})
+
+    _web_llm = _filter_inspection_for_llm(webserver_data)
+    _kern_llm = _filter_inspection_for_llm(kernel_data)
+    _sys_line = getattr(deps, "system_fingerprint", "") or ""
+
+    from core.prompts import service_expert as service_expert_prompt
+    from core.prompts import rhel_expert as rhel_expert_prompt
+
+    _profile = getattr(deps, "service_profile", None)
+    _svc_name = _profile.name if _profile else "service"
+
+    # Augment expert prompts with benchmark feedback
+    review_context = (
+        f"\n\nPREVIOUS ITERATION RESULTS:\n{feedback}\n\n"
+        "Focus on parameters that may have been missed or need adjustment "
+        "based on the benchmark results above. Only recommend CHANGES from "
+        "the current applied state — do not repeat already-applied params."
+    )
+
+    service_prompt = service_expert_prompt.build(
+        system_line=_sys_line + review_context,
+        service_inspection=_web_llm, profile=_profile,
+    )
+    rhel_prompt = rhel_expert_prompt.build(
+        system_line=_sys_line + review_context,
+        kernel_inspection=_kern_llm, resource_data=resource_data,
+        network_data=network_data, storage_data=storage_data,
+    )
+
+    (service_analysis, svc_usage), (rhel_analysis, rhel_usage) = await asyncio.gather(
+        asyncio.to_thread(_invoke_json_planner, model, f"planner.{_svc_name}_expert_review", service_prompt, deps),
+        asyncio.to_thread(_invoke_json_planner, model, "planner.rhel_expert_review", rhel_prompt, deps),
+    )
+    if _planner_debug_enabled(deps):
+        tool_result("debug", f"{_svc_name}_expert_review raw:\n{json.dumps(service_analysis, indent=2, ensure_ascii=False)}")
+        tool_result("debug", f"rhel_expert_review raw:\n{json.dumps(rhel_analysis, indent=2, ensure_ascii=False)}")
+
+    _iter = getattr(deps, "iteration", 0)
+    _save_planner_artifact(deps, f"{_svc_name}_expert_review", service_analysis, iteration=_iter)
+    _save_planner_artifact(deps, "rhel_expert_review", rhel_analysis, iteration=_iter)
+
+    if agent_state is not None:
+        agent_state["service_analysis"] = service_analysis
+        agent_state["rhel_analysis"] = rhel_analysis
+
+    # Synthesize + plan (same as iter2)
+    from core.prompts import synthesizer as synthesizer_prompt
+
+    synth_prompt = synthesizer_prompt.build(
+        system_fingerprint=_sys_line, service_analysis=service_analysis,
+        rhel_analysis=rhel_analysis, service_name=_svc_name.upper(),
+    )
+    synthesis, synth_usage = _invoke_json_planner(model, "planner.synthesizer_review", synth_prompt, deps)
+
+    rca_records = _coerce_records(synthesis.get("rca_records"), deps=deps)
+    recommendations = _coerce_recommendations(synthesis.get("recommendations"), deps=deps)
+    if rca_records:
+        await save_rca(ctx, rca_records)
+    if recommendations:
+        await save_recommendations(ctx, recommendations)
+
+    # Apply planner for delta
+    _tuning = (getattr(deps, "config", None) or {}).get("tuning") or {}
+    _web_tgt = _tuning.get("service_targets") or _tuning.get("webserver_targets") or {}
+    _kern_tgt = _tuning.get("kernel_targets") or {}
+    _res_tgt = _tuning.get("resource_limits_targets") or {}
+    _net_tgt = _tuning.get("network_targets") or {}
+    _stor_tgt = _tuning.get("storage_targets") or {}
+
+    from core.prompts import apply_planner as apply_planner_prompt
+
+    apply_prompt = apply_planner_prompt.build(
+        service_targets=_web_tgt, kernel_targets=_kern_tgt,
+        resource_limits_targets=_res_tgt, network_targets=_net_tgt,
+        storage_targets=_stor_tgt,
+        recommendations=_clean_recs_for_planner(synthesis.get("recommendations", []), deps.config),
+        resource_problems=resource_data.get("problems", []),
+        network_problems=network_data.get("problems", []),
+        storage_problems=storage_data.get("problems", []),
+    )
+    apply_plan, apply_usage = _invoke_json_planner(model, "planner.apply_planner_review", apply_prompt, deps)
+
+    categories = ["webserver", "kernel", "resource_limits", "network", "storage"]
+    plan_summary = {cat: list((apply_plan.get(cat) or {}).keys()) for cat in categories}
+    tool_call("apply_planner", " | ".join(f"{c}={len(v)}" for c, v in plan_summary.items() if v))
+    _save_planner_artifact(deps, "apply_planner_review", apply_plan, iteration=_iter)
+
+    _enforce_nginx_fd_consistency(apply_plan, getattr(deps, "config", None) or {})
+
+    if agent_state is not None:
+        agent_state["apply_plan"] = apply_plan
+
+    total_in = svc_usage["input_tokens"] + rhel_usage["input_tokens"] + synth_usage["input_tokens"] + apply_usage["input_tokens"]
+    total_out = svc_usage["output_tokens"] + rhel_usage["output_tokens"] + synth_usage["output_tokens"] + apply_usage["output_tokens"]
+    return SimpleNamespace(
+        output=str(synthesis.get("summary") or "Review and targeted fix completed.").strip(),
+        usage=lambda: SimpleNamespace(input_tokens=total_in, output_tokens=total_out),
+        all_messages=lambda: [],
+    )
+
+
 @contextmanager
 def _null_generation():
     yield None
@@ -3008,7 +3389,19 @@ def _coerce_recommendations(value: Any, deps: AgentDeps | None = None) -> list[d
                 or "medium",
                 "validation": str(normalized_item.get("validation", "")).strip()
                 or "manual verification required",
-                "scope": str(normalized_item.get("scope", "nginx")).strip().lower() or "nginx",
+                "scope": {
+                    "service": "nginx",
+                    "webserver": "nginx",
+                    "nginx": "nginx",
+                    "system": "system",
+                    "kernel": "system",
+                    "resource_limits": "system",
+                    "network": "system",
+                    "storage": "system",
+                }.get(
+                    str(normalized_item.get("scope", "nginx")).strip().lower() or "nginx",
+                    str(normalized_item.get("scope", "nginx")).strip().lower() or "nginx",
+                ),
                 "changes": changes,
             }
         )
@@ -3101,6 +3494,12 @@ def _clean_recs_for_planner(
 
 def _normalize_synthesized_recommendation(item: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(item)
+    raw_scope = str(item.get("scope", "")).strip().lower()
+    if raw_scope in {"service", "webserver", "nginx"}:
+        normalized["scope"] = "nginx"
+    elif raw_scope in {"system", "kernel", "resource_limits", "network", "storage"}:
+        normalized["scope"] = "system"
+
     changes = item.get("changes")
     if isinstance(changes, dict) and changes:
         return normalized
