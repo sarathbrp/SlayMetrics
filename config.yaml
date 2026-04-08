@@ -252,7 +252,7 @@ tools:
       mode: auto                   # set to 'interactive' for LLM-generated command approval
 
 observability:
-  enabled: false                     # set to true to enable tracing
+  enabled: true                      # OTel tracing enabled by default
   provider: otel                     # otel | langfuse | none
   endpoint: http://10.1.89.124:4318  # OTLP HTTP endpoint (system2 LGTM container)
   service_name: slaymetrics
