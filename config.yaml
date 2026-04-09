@@ -1,7 +1,7 @@
 log_level: INFO   # INFO, DEBUG, WARNING — controls all hosttune log output
 
 mlflow:
-  enabled: true
+  enabled: false 
   tracking_uri: http://d21-h24-000-r650.rdu2.scalelab.redhat.com:5000/  # override: SLAY_MLFLOW_URI
   experiment: SlayMetrics  # override: SLAY_MLFLOW_EXPERIMENT
 
@@ -25,7 +25,7 @@ remediation:
     tc_shaping: write
     iptables_connlimit: write
     nftables_ratelimit: write
-  max_fixes: 15                     # safety cap on fixes per run
+  max_fixes: 10                     # safety cap on fixes per run
 
 target:
   mode: ssh
@@ -39,7 +39,7 @@ benchmark:
   runner:
     mode: local
   contestant_name: slaymetrics 
-  script_path: /root/hackathon-tools/benchmark-fast.sh
+  script_path: /root/hackathon-tools/benchmark.sh
   compare_script_path: /root/hackathon-tools/compare-results.sh
   results_directory: /root/hackathon-results
   cooling_period_seconds: 30
