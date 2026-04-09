@@ -20,8 +20,8 @@ These are hard ceilings that make all other tuning irrelevant.
 |---------|---------|------|--------|
 | `systemd_CPUQuota` | < 100% (CPUQuotaPerSecUSec != infinity) | `systemd_property` (CPUQuota=) | CRITICAL — caps CPU; fix before anything else |
 | `systemd_LimitNOFILE` | < 65536 | `systemd_property` | CRITICAL — fd exhaustion prevents nginx from accepting connections |
-| `systemd_LimitNPROC` | < 1024 | `systemd_property` | HIGH — blocks nginx worker spawn |
-| `systemd_MemoryMax` | set (not infinity) | `systemd_property` | HIGH — OOM kills nginx under load |
+| `systemd_LimitNPROC` | < 1024 (e.g. 64, 128, 256) | `systemd_property` (LimitNPROC=infinity) | **CRITICAL** — blocks nginx worker spawn. Any value < 1024 is a hard cap. Flag even if memory says it was fixed before — always verify the current audit value. |
+| `systemd_MemoryMax` | any value that is NOT infinity (e.g. 256M, 512M, 2G, 2147483648) | `systemd_property` (MemoryMax=infinity) | **CRITICAL** — OOM kills nginx under load. ANY numeric value means a cap is active. Flag it. |
 | `systemd_CPUWeight` | < 100 | `systemd_property` (CPUWeight=100) | Medium — below-default CPU scheduling weight starves nginx relative to other processes |
 | `systemd_IOWeight` | < 100 | `systemd_property` (IOWeight=100) | Medium — below-default I/O weight reduces nginx disk throughput priority |
 
