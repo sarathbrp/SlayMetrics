@@ -105,6 +105,14 @@ class SysctlTool(RemediationTool):
 # Group 3 — Systemd service properties
 # ---------------------------------------------------------------------------
 
+# Properties that need drop-in files + daemon-reload + restart
+_DROPIN_PROPS = {"LimitNOFILE", "LimitNPROC"}
+_DROPIN_DIR = "/etc/systemd/system/nginx.service.d"
+
+# Properties that use systemctl set-property (runtime)
+_SETPROP_PROPS = {"CPUQuota", "CPUWeight", "MemoryMax", "IOWeight"}
+
+
 class SystemdPropertyTool(RemediationTool):
     name = "systemd_property"
     params_schema = '{"property": "<LimitNOFILE|CPUQuota|...>", "value": "<new_value>"}'
@@ -115,6 +123,20 @@ class SystemdPropertyTool(RemediationTool):
         if prop not in ALLOWED_SYSTEMD:
             return f"unknown property: {prop}"
         q_prop = shlex.quote(prop)
+        # CPUQuota: read CPUQuotaPerSecUSec for accurate detection
+        if prop == "CPUQuota":
+            out, _ = executor.run(
+                "systemctl show nginx.service -p CPUQuotaPerSecUSec | awk -F= '{print $2}'"
+            )
+            raw = out.strip()
+            if raw == "infinity":
+                return "infinity"
+            # Convert µs to percentage: e.g. 500000 → 50%
+            try:
+                usec = int(raw.replace("us", ""))
+                return f"{usec / 10000:.0f}%"
+            except (ValueError, AttributeError):
+                return raw
         out, _ = executor.run(
             f"systemctl show nginx.service -p {q_prop} | awk -F= '{{print $2}}'"
         )
@@ -122,34 +144,73 @@ class SystemdPropertyTool(RemediationTool):
 
     @classmethod
     def is_no_op(cls, current_value: str, params: dict) -> bool:
-        return current_value.strip() == str(params.get("value", "")).strip()
+        prop = params.get("property", "")
+        value = str(params.get("value", "")).strip()
+        current = current_value.strip()
+        # CPUQuota: "infinity" means already removed
+        if prop == "CPUQuota" and current == "infinity":
+            return True
+        return current == value
 
     def apply(self, params: dict) -> None:
         prop  = params["property"]
-        value = _validate_value(str(params["value"]), "systemd value")
+        value = str(params["value"])
         if prop not in ALLOWED_SYSTEMD:
             raise ValueError(f"systemd property '{prop}' not in allowlist")
+        # CPUQuota allows empty value; others must validate
+        if prop != "CPUQuota":
+            value = _validate_value(value, "systemd value")
         self._prop = prop
-        q_prop = shlex.quote(prop)
-        q_value = shlex.quote(value)
-        self._original = self._run(
-            f"systemctl show nginx.service -p {q_prop} | awk -F= '{{print $2}}'"
-        )
+        self._original = self.read_current(self.executor, params)
         self._no_op_check(self._original, value, f"systemd {prop}")
         logger.info("systemd nginx.service %s: %s → %s", prop, self._original, value)
-        self._run(f"systemctl set-property nginx.service {q_prop}={q_value}")
+
+        if prop == "CPUQuota":
+            # CPUQuota removal: empty value removes the limit entirely
+            self._run("systemctl set-property nginx.service CPUQuota=")
+            self._run("systemctl daemon-reload")
+        elif prop in _DROPIN_PROPS:
+            # LimitNOFILE/LimitNPROC need drop-in files
+            q_value = shlex.quote(value)
+            dropin_name = f"zz_hosttune_{prop.lower()}.conf"
+            dropin_path = f"{_DROPIN_DIR}/{dropin_name}"
+            self._dropin_path = dropin_path
+            self._run(f"mkdir -p {_DROPIN_DIR}")
+            self._run(
+                f"printf '[Service]\\n{prop}={q_value}\\n' > {shlex.quote(dropin_path)}"
+            )
+            self._run("systemctl daemon-reload && systemctl restart nginx")
+        else:
+            # CPUWeight, MemoryMax, IOWeight — use set-property
+            q_prop = shlex.quote(prop)
+            q_value = shlex.quote(value)
+            self._run(f"systemctl set-property nginx.service {q_prop}={q_value}")
+            self._run("systemctl daemon-reload")
+
         self._log_verified(
-            f"systemctl show nginx.service -p {q_prop} | awk -F= '{{print $2}}'",
+            f"systemctl show nginx.service -p {shlex.quote(prop)} | awk -F= '{{print $2}}'",
             f"systemd {prop}",
         )
 
     def rollback(self) -> None:
-        if self._original:
-            logger.info("Rollback systemd %s → %s", self._prop, self._original)
-            self._run(
-                f"systemctl set-property nginx.service "
-                f"{shlex.quote(self._prop)}={shlex.quote(self._original)}"
-            )
+        if not self._original:
+            return
+        logger.info("Rollback systemd %s → %s", self._prop, self._original)
+        if self._prop == "CPUQuota":
+            # Restore original quota
+            q_orig = shlex.quote(self._original)
+            self._run(f"systemctl set-property nginx.service CPUQuota={q_orig}")
+            self._run("systemctl daemon-reload")
+        elif self._prop in _DROPIN_PROPS:
+            # Remove drop-in file and restart
+            if hasattr(self, "_dropin_path"):
+                self._run(f"rm -f {shlex.quote(self._dropin_path)}")
+            self._run("systemctl daemon-reload && systemctl restart nginx")
+        else:
+            q_prop = shlex.quote(self._prop)
+            q_orig = shlex.quote(self._original)
+            self._run(f"systemctl set-property nginx.service {q_prop}={q_orig}")
+            self._run("systemctl daemon-reload")
 
 
 # ---------------------------------------------------------------------------

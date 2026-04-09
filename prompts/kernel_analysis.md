@@ -75,6 +75,7 @@ Output ONLY valid JSON — no markdown, no explanation.
   net.ipv4.ip_local_port_range, vm.swappiness, vm.dirty_ratio, vm.vfs_cache_pressure,
   net.ipv4.tcp_syncookies
 - `"systemd_property"`: params={"property": "<LimitNOFILE|LimitNPROC|CPUQuota|CPUWeight|MemoryMax|IOWeight>", "value": "<value>"}
+  **CPUQuota special rule:** To remove the CPUQuota limit, use value="infinity". The tool will translate this to an empty value internally. Never use "100%" — it sets a 100% cap, not removal.
 - `"cpu_governor"`: params={"governor": "<performance|powersave|ondemand|conservative>"}
 
 ## Using Similar Past Cases
