@@ -1,18 +1,28 @@
-langchain>=0.3.0
-langchain-community>=0.3.0
-langchain-anthropic>=0.3.0
-langchain-openai>=0.3.0
-langchain-ollama>=0.2.0
+# LangGraph agent
 langgraph>=0.2.0
-langfuse>=3.0.0
-ollama>=0.5.0
-anthropic>=0.30.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+
+# DSPy — self-improving prompting
+dspy>=2.6.0
+
+# SSH + SFTP to DUT
 paramiko>=3.4.0
-requests>=2.32.0
-PyYAML>=6.0.1
-rich>=13.7.0
-tiktoken>=0.7.0
-# OpenTelemetry (observability — optional, enable in config.yaml)
-opentelemetry-api>=1.27.0
-opentelemetry-sdk>=1.27.0
-opentelemetry-exporter-otlp-proto-http>=1.27.0
+
+# Config + env
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+
+# Output formatting
+prettytable>=3.10.0
+
+# Semantic memory (vector store)
+chromadb>=0.5.0
+pysqlite3-binary>=0.5.0
+
+# Live sampler analysis
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Observability
+mlflow>=2.10.0
