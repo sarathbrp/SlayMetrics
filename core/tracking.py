@@ -33,7 +33,7 @@ class RunTracker:
                     mlflow.dspy.autolog()
                     logger.info("MLflow DSPy autolog enabled (Traces will appear in UI)")
                 except Exception as ae:
-                    logger.debug("MLflow DSPy autolog not available: %s", ae)
+                    logger.warning("MLflow DSPy autolog not available: %s", ae)
                 logger.info("MLflow tracking enabled → %s / %s",
                             config.mlflow_tracking_uri, config.mlflow_experiment)
             except Exception as e:

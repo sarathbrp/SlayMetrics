@@ -42,7 +42,7 @@ Do NOT repeat fixes already addressed in network_summary or kernel_summary.
 | `nginx_sendfile` | off | on | HIGH — bypass userspace copy |
 | `nginx_tcp_nopush` | off | on | Medium — requires sendfile on |
 | `nginx_tcp_nodelay` | off | on | Medium |
-| `nginx_worker_processes` | not auto and ≠ nproc | auto | Medium |
+| `nginx_worker_processes` | not auto and ≠ nproc | auto | **CRITICAL Tier 1** — single worker severely limits throughput on multi-core systems; ALWAYS flag if not auto |
 | `nginx_limit_rate` | set (non-default) | unset | CRITICAL — throttles per-connection bandwidth. **Always check nginx_limit_rate_after together.** |
 | `nginx_limit_rate_after` | set (non-default) | unset | CRITICAL trap — rate limit only kicks in after this many bytes transferred. e.g. limit_rate_after=1m + limit_rate=5m means small files (< 1MB) are UNAFFECTED but large files get throttled. Low RPS on large/mixed workloads with good small/homepage RPS is the signature — agent may miss this if only checking priority workloads. Always flag both fields together. |
 | `nginx_limit_req` | active | unset | CRITICAL — rate-limits requests |

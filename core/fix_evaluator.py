@@ -111,8 +111,12 @@ class FixEvaluatorLLM:
         elapsed = (datetime.now() - t0).total_seconds()
         in_tok, out_tok = _extract_tokens()
 
-        # Parse verdict
+        # Parse verdict — cap size to prevent unbounded memory usage
+        _MAX_RESPONSE_LEN = 10_000
         raw = pred.verdict_json.strip()
+        if len(raw) > _MAX_RESPONSE_LEN:
+            logger.warning("LLM verdict response too large (%d chars), truncating", len(raw))
+            raw = raw[:_MAX_RESPONSE_LEN]
         if raw.startswith("```"):
             lines = raw.splitlines()
             raw = "\n".join(lines[1:-1]) if len(lines) > 2 else ""

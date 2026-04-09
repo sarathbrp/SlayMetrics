@@ -2,8 +2,8 @@ log_level: INFO   # INFO, DEBUG, WARNING — controls all hosttune log output
 
 mlflow:
   enabled: true
-  tracking_uri: http://d21-h24-000-r650.rdu2.scalelab.redhat.com:5000/
-  experiment: SlayMetrics
+  tracking_uri: http://d21-h24-000-r650.rdu2.scalelab.redhat.com:5000/  # override: SLAY_MLFLOW_URI
+  experiment: SlayMetrics  # override: SLAY_MLFLOW_EXPERIMENT
 
 memory:
   inject_into_rca_analysis: true      # pass similar_cases to Call 1 (RCA report)
@@ -29,11 +29,11 @@ remediation:
 
 target:
   mode: ssh
-  host: 172.21.90.178
-  user: root
-  private_key_path: /root/.ssh/id_ed25519
-  port: 22
-  connect_timeout_seconds: 30
+  host: 172.21.90.178                    # override: SLAY_DUT_HOST
+  user: root                             # override: SLAY_DUT_USER
+  private_key_path: /root/.ssh/id_ed25519  # override: SLAY_DUT_KEY
+  port: 22                               # override: SLAY_DUT_PORT
+  connect_timeout_seconds: 30            # override: SLAY_DUT_TIMEOUT
 
 benchmark:
   runner:

@@ -5,32 +5,40 @@ import yaml
 from dotenv import load_dotenv
 
 
+_REQUIRED_SECTIONS = ("target", "benchmark")
+
+
 class Config:
     def __init__(self, config_path: Path, env_path: Path | None = None):
         load_dotenv(env_path)
         with open(config_path) as f:
             self._cfg = yaml.safe_load(f)
+        if not isinstance(self._cfg, dict):
+            raise ValueError(f"Config file {config_path} must be a YAML mapping, got {type(self._cfg).__name__}")
+        missing = [s for s in _REQUIRED_SECTIONS if s not in self._cfg]
+        if missing:
+            raise ValueError(f"Config file {config_path} missing required sections: {missing}")
 
-    # --- target (DUT) ---
+    # --- target (DUT) — env vars override config.yaml ---
     @property
     def dut_host(self) -> str:
-        return self._cfg["target"]["host"]
+        return os.environ.get("SLAY_DUT_HOST", self._cfg["target"]["host"])
 
     @property
     def dut_user(self) -> str:
-        return self._cfg["target"]["user"]
+        return os.environ.get("SLAY_DUT_USER", self._cfg["target"]["user"])
 
     @property
     def dut_key(self) -> str:
-        return self._cfg["target"]["private_key_path"]
+        return os.environ.get("SLAY_DUT_KEY", self._cfg["target"]["private_key_path"])
 
     @property
     def dut_port(self) -> int:
-        return self._cfg["target"].get("port", 22)
+        return int(os.environ.get("SLAY_DUT_PORT", self._cfg["target"].get("port", 22)))
 
     @property
     def dut_timeout(self) -> int:
-        return self._cfg["target"].get("connect_timeout_seconds", 10)
+        return int(os.environ.get("SLAY_DUT_TIMEOUT", self._cfg["target"].get("connect_timeout_seconds", 10)))
 
     # --- LLM ---
     @property
@@ -112,18 +120,21 @@ class Config:
     def remediation_llm_review_rejected(self) -> bool:
         return self._cfg.get("remediation", {}).get("llm_review_rejected", False)
 
-    # --- MLflow ---
+    # --- MLflow — env vars override config.yaml ---
     @property
     def mlflow_enabled(self) -> bool:
+        env = os.environ.get("SLAY_MLFLOW_ENABLED")
+        if env is not None:
+            return env.lower() in ("true", "1", "yes")
         return self._cfg.get("mlflow", {}).get("enabled", False)
 
     @property
     def mlflow_tracking_uri(self) -> str:
-        return self._cfg.get("mlflow", {}).get("tracking_uri", "http://localhost:5000")
+        return os.environ.get("SLAY_MLFLOW_URI", self._cfg.get("mlflow", {}).get("tracking_uri", "http://localhost:5000"))
 
     @property
     def mlflow_experiment(self) -> str:
-        return self._cfg.get("mlflow", {}).get("experiment", "SlayMetrics")
+        return os.environ.get("SLAY_MLFLOW_EXPERIMENT", self._cfg.get("mlflow", {}).get("experiment", "SlayMetrics"))
 
     @property
     def memory_inject_into_rca(self) -> bool:

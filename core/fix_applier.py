@@ -21,13 +21,22 @@ class FixApplier:
         logger.info("Applying fix [Tier %s] via tool '%s': %s",
                     fix.get("tier", "?"), tool_name, desc)
 
-        self._applied_tool = dispatch(tool_name, params, self.executor)
+        try:
+            self._applied_tool = dispatch(tool_name, params, self.executor)
+        except Exception:
+            self._applied_tool = None
+            raise
 
     def rollback(self) -> bool:
         if not self._applied_tool:
             logger.warning("No applied tool to rollback")
             return False
         logger.info("Rolling back tool '%s'", self._applied_tool.name)
-        self._applied_tool.rollback()
-        self._applied_tool = None
+        try:
+            self._applied_tool.rollback()
+        except Exception as e:
+            logger.error("Rollback of '%s' failed: %s", self._applied_tool.name, e)
+            return False
+        finally:
+            self._applied_tool = None
         return True

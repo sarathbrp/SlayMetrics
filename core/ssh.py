@@ -9,7 +9,7 @@ import paramiko
 logger = logging.getLogger("slayMetrics.ssh")
 
 _CONNECT_RETRIES = 3
-_CONNECT_RETRY_WAIT = 5  # seconds between retries
+_CONNECT_RETRY_BASE_WAIT = 5  # base seconds; doubles each retry (5, 10, 20)
 
 
 class RemoteExecutor:
@@ -41,9 +41,10 @@ class RemoteExecutor:
             except Exception as e:
                 last_err = e
                 if attempt < _CONNECT_RETRIES:
+                    wait = _CONNECT_RETRY_BASE_WAIT * (2 ** (attempt - 1))
                     logger.warning("SSH connect attempt %d/%d failed (%s) — retrying in %ds",
-                                   attempt, _CONNECT_RETRIES, e, _CONNECT_RETRY_WAIT)
-                    time.sleep(_CONNECT_RETRY_WAIT)
+                                   attempt, _CONNECT_RETRIES, e, wait)
+                    time.sleep(wait)
         raise last_err
 
     def disconnect(self) -> None:

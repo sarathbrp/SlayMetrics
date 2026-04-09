@@ -6,6 +6,7 @@ Set remediation.network_tools.enabled: true to allow them.
 """
 
 import logging
+import shlex
 
 from .base_tool import RemediationTool
 from .ssh import RemoteExecutor
@@ -46,11 +47,12 @@ class TcShapingTool(RemediationTool):
 
     def apply(self, params: dict) -> None:
         self._nic = self._run(_NIC_CMD)
-        htb = self._run(f"tc qdisc show dev {self._nic} | grep htb || true")
+        q_nic = shlex.quote(self._nic)
+        htb = self._run(f"tc qdisc show dev {q_nic} | grep htb || true")
         if not htb.strip():
             raise ValueError(f"No HTB qdisc on {self._nic} — nothing to remove")
         # Parse rate and ceil for rollback
-        class_out = self._run(f"tc class show dev {self._nic}")
+        class_out = self._run(f"tc class show dev {q_nic}")
         self._rate = "1gbit"
         self._ceil = "1gbit"
         parts = class_out.split()
@@ -60,17 +62,20 @@ class TcShapingTool(RemediationTool):
             if p == "ceil" and i + 1 < len(parts):
                 self._ceil = parts[i + 1]
         logger.info("TC: removing HTB on %s (rate=%s ceil=%s)", self._nic, self._rate, self._ceil)
-        self._run(f"tc qdisc del dev {self._nic} root 2>/dev/null || true")
-        self._log_verified(f"tc qdisc show dev {self._nic} | head -1", f"TC qdisc {self._nic}")
+        self._run(f"tc qdisc del dev {q_nic} root 2>/dev/null || true")
+        self._log_verified(f"tc qdisc show dev {q_nic} | head -1", f"TC qdisc {self._nic}")
 
     def rollback(self) -> None:
         if not hasattr(self, "_nic"):
             return
+        q_nic = shlex.quote(self._nic)
+        q_rate = shlex.quote(self._rate)
+        q_ceil = shlex.quote(self._ceil)
         logger.info("Rollback TC: re-adding HTB on %s (rate=%s)", self._nic, self._rate)
-        self._run(f"tc qdisc add dev {self._nic} root handle 1: htb default 10")
+        self._run(f"tc qdisc add dev {q_nic} root handle 1: htb default 10")
         self._run(
-            f"tc class add dev {self._nic} parent 1: classid 1:10 htb "
-            f"rate {self._rate} ceil {self._ceil}"
+            f"tc class add dev {q_nic} parent 1: classid 1:10 htb "
+            f"rate {q_rate} ceil {q_ceil}"
         )
 
 
@@ -161,8 +166,11 @@ class NftablesRateLimitTool(RemediationTool):
         if not hasattr(self, "_saved_ruleset") or not self._saved_ruleset.strip():
             return
         logger.info("Rollback nftables: restoring saved ruleset")
-        escaped = self._saved_ruleset.replace("'", "'\\''")
-        self._run(f"echo '{escaped}' > /tmp/nft_rollback.txt && nft -f /tmp/nft_rollback.txt 2>/dev/null || true")
+        # Use printf with %s to safely pass ruleset content without shell interpretation
+        self._run(
+            f"printf %s {shlex.quote(self._saved_ruleset)} > /tmp/nft_rollback.txt "
+            f"&& nft -f /tmp/nft_rollback.txt 2>/dev/null || true"
+        )
 
 
 # All network tools — added to TOOL_REGISTRY conditionally based on config
