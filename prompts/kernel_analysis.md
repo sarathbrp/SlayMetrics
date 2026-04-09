@@ -22,6 +22,8 @@ These are hard ceilings that make all other tuning irrelevant.
 | `systemd_LimitNOFILE` | < 65536 | `systemd_property` | CRITICAL — fd exhaustion prevents nginx from accepting connections |
 | `systemd_LimitNPROC` | < 1024 | `systemd_property` | HIGH — blocks nginx worker spawn |
 | `systemd_MemoryMax` | set (not infinity) | `systemd_property` | HIGH — OOM kills nginx under load |
+| `systemd_CPUWeight` | < 100 | `systemd_property` (CPUWeight=100) | Medium — below-default CPU scheduling weight starves nginx relative to other processes |
+| `systemd_IOWeight` | < 100 | `systemd_property` (IOWeight=100) | Medium — below-default I/O weight reduces nginx disk throughput priority |
 
 **CPUQuota detection:** Read CPUQuotaPerSecUSec. Convert: quota_pct = µs_value / 10000. If < 100%, flag CRITICAL.
 
@@ -84,3 +86,4 @@ Output ONLY valid JSON — no markdown, no explanation.
 5. Never check vm.swappiness without also checking vm.dirty_ratio
 6. Never recommend tcp_tw_reuse=1 — always use 2 on RHEL
 7. If CPUQuota is not throttling, skip systemd_property for CPUQuota entirely
+8. Always check CPUWeight and IOWeight — flag both if < 100 (default is 100; lower values intentionally deprioritise nginx)
