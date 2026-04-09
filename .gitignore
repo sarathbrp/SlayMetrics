@@ -4,9 +4,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.venv/
-.venv312/
-venv/
+.venv*/
+venv*/
 env/
 .coverage
 coverage.xml
@@ -19,23 +18,9 @@ coverage.xml
 *~
 .DS_Store
 
-# Agent output
-report/
-context-window-sequence.html
-tokens-save-plan.md
-
-# Internal planning docs (not for sharing)
-idea.txt
-problem-statement.txt
-perfConfHackathon2026
-REQUIREMENT-MATRIX.md
-REQUIREMENTS.md
 
 # Claude Code
 .claude/
-
-# TiDB data
-/data/
 
 # SSH keys
 *.pem
@@ -48,13 +33,6 @@ id_ed25519
 !.env.example
 source_env
 facts/default_nginx.conf
-scripts/
 trace-*.json
-hackathon-judge/
-architecture.html
 CLAUDE.md
-AGENTS.md
-gaps_found.md
-TOKEN-OPTIMIZATION-PLAN.md
-docs/design_nginx.md
-hypothesis/
+
