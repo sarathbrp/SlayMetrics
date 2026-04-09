@@ -35,7 +35,7 @@ These are hard ceilings that make all other tuning irrelevant.
 | `IRQ_Balance_Active` | inactive | `irqbalance` | HIGH — NIC IRQs pinned to single CPU, causes softirq bottleneck |
 | `NIC_IRQ_Affinity` | single value (no range like "0-111") | `irqbalance` | HIGH — same fix as above, irqbalance re-balances all IRQ affinities |
 | `Readahead_sectors` | < 128 | `readahead` (value=256) | HIGH — degraded block device readahead starves I/O |
-| `IO_Scheduler` | contains [mq-deadline] or [kyber] or [bfq] | `io_scheduler` (value=none) | Medium — passthrough is optimal for NVMe |
+| `IO_Scheduler` | contains [mq-deadline] or [kyber] or [bfq] **AND** Block_Device contains "nvme" | `io_scheduler` (value=none) | Medium — passthrough is optimal for NVMe. **Never change scheduler on HDD (sda/sdb) — mq-deadline is correct for rotational disks.** |
 | `Softnet_Time_Squeeze` | > 10000 (cumulative) | note only | IRQ spreading issue — flag if irqbalance inactive |
 
 ## Layer 2 — Kernel Network Stack

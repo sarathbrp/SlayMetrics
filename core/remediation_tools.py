@@ -489,6 +489,12 @@ class IoSchedulerTool(RemediationTool):
         if value not in ALLOWED_IO_SCHEDULERS:
             raise ValueError(f"I/O scheduler '{value}' not in allowlist")
         self._dev = self._get_device(self.executor)
+        # Guard: only set 'none' on NVMe — mq-deadline is correct for HDD
+        if value == "none" and "nvme" not in self._dev:
+            raise ValueError(
+                f"Refusing to set scheduler=none on non-NVMe device '{self._dev}'. "
+                "mq-deadline is correct for rotational disks."
+            )
         q_dev = shlex.quote(self._dev)
         sched_path = f"/sys/block/{q_dev}/queue/scheduler"
         self._original_raw = self._run(f"cat {sched_path}")
