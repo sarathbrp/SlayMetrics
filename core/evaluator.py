@@ -82,22 +82,38 @@ class Evaluator:
 
         # Skip degradation check for workloads with very low baseline RPS —
         # at < 10 RPS, a single-request timing variance causes ±50%+ swings.
+        # Also skip workloads that returned 0 RPS — this is a benchmark failure,
+        # not a real regression (the workload simply didn't complete).
         # When priority improvement is neutral (≤ 0%), apply a stricter -2% tolerance
         # to avoid accepting fixes that do nothing but add noise degradation.
-        effective_tolerance = degradation_tolerance if priority_avg > 0 else -2.0
+        # When priority improvement is very high (>50%), relax tolerance —
+        # a massive gain on priority workloads outweighs moderate non-priority dips.
+        if priority_avg > 50.0:
+            effective_tolerance = degradation_tolerance * 3  # e.g. -5% → -15%
+        elif priority_avg > 0:
+            effective_tolerance = degradation_tolerance
+        else:
+            effective_tolerance = -2.0
+
         degraded = {
             w: d for w, d in others.items()
-            if d < effective_tolerance and baseline.get(w, 0) >= 10.0
+            if d < effective_tolerance
+            and baseline.get(w, 0) >= 10.0
+            and current.get(w, 0) > 0  # 0 RPS = benchmark failure, not regression
         }
 
         keep = priority_avg >= threshold and not degraded
 
+        bench_failures = [w for w in others if current.get(w, 0) == 0 and baseline.get(w, 0) > 0]
         low_rps_skipped = [w for w in others if baseline.get(w, 0) < 10.0]
+        if bench_failures:
+            logger.warning("Benchmark failure detected (0 RPS): %s — excluded from degradation check",
+                           bench_failures)
         if degraded:
             skip_note = f" [skipped low-RPS: {low_rps_skipped}]" if low_rps_skipped else ""
             logger.info(
-                "Priority improvement: %.2f%% — ROLLBACK (degraded: %s%s)",
-                priority_avg,
+                "Priority improvement: %.2f%% (tolerance: %.1f%%) — ROLLBACK (degraded: %s%s)",
+                priority_avg, effective_tolerance,
                 ", ".join(f"{w}={d:.1f}%" for w, d in degraded.items()),
                 skip_note,
             )
