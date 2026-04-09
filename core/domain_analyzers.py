@@ -138,7 +138,7 @@ class NetworkAnalyzer:
         """Returns (fixes, summary, input_tokens, output_tokens)."""
         if self._module is None:
             self._module = self._build()
-        logger.info("Network analysis — calling LLM...")
+        logger.info("Network analysis — running inference...")
         t0 = datetime.now()
         pred = self._module(
             network_audit_section=network_section,
@@ -213,7 +213,7 @@ class KernelAnalyzer:
         """Returns (fixes, summary, input_tokens, output_tokens)."""
         if self._module is None:
             self._module = self._build()
-        logger.info("Kernel analysis — calling LLM...")
+        logger.info("Kernel analysis — running inference...")
         t0 = datetime.now()
         pred = self._module(
             kernel_audit_section=kernel_section,
@@ -292,7 +292,7 @@ class NginxAnalyzer:
         """Returns (fixes, input_tokens, output_tokens)."""
         if self._module is None:
             self._module = self._build()
-        logger.info("Nginx analysis — calling LLM...")
+        logger.info("Nginx analysis — running inference...")
         t0 = datetime.now()
         pred = self._module(
             nginx_audit_section=nginx_section,

@@ -100,7 +100,7 @@ class FixEvaluatorLLM:
             f"{w}={d:+.1f}%" for w, d in degraded_workloads.items()
         )
 
-        logger.info("LLM fix review — calling LLM for: %s", fix.get("description", ""))
+        logger.info("LLM fix review — running inference for: %s", fix.get("description", ""))
         t0 = datetime.now()
         pred = self._module(
             fix_description=fix_desc,
