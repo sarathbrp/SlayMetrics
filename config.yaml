@@ -25,7 +25,7 @@ remediation:
     tc_shaping: write
     iptables_connlimit: write
     nftables_ratelimit: write
-  max_fixes: 20                     # safety cap on fixes per run
+  max_fixes: 23                     # safety cap on fixes per run
 
 target:
   mode: ssh

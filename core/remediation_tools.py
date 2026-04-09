@@ -360,6 +360,158 @@ class CpuGovernorTool(RemediationTool):
 
 
 # ---------------------------------------------------------------------------
+# Group 1 — IRQ Balance
+# ---------------------------------------------------------------------------
+
+class IrqbalanceTool(RemediationTool):
+    """Enables and restarts irqbalance — fixes both inactive irqbalance
+    and pinned NIC IRQ affinity in one shot."""
+
+    name = "irqbalance"
+    params_schema = "{}"
+
+    @classmethod
+    def read_current(cls, executor: RemoteExecutor, params: dict) -> str:
+        out, _ = executor.run("systemctl is-active irqbalance 2>/dev/null || echo inactive")
+        return out.strip()
+
+    @classmethod
+    def is_no_op(cls, current_value: str, params: dict) -> bool:
+        return current_value.strip() == "active"
+
+    def apply(self, params: dict) -> None:
+        self._original = self._run(
+            "systemctl is-active irqbalance 2>/dev/null || echo inactive"
+        )
+        if self._original == "active":
+            raise ValueError("No-op: irqbalance is already active — skipping")
+        logger.info("irqbalance: %s → active", self._original)
+        self._run("systemctl enable irqbalance 2>/dev/null || true")
+        self._run("systemctl start irqbalance")
+        self._run("systemctl restart irqbalance")  # force re-balance all IRQ affinities
+        self._log_verified(
+            "systemctl is-active irqbalance", "irqbalance",
+        )
+
+    def rollback(self) -> None:
+        logger.info("Rollback irqbalance → %s", self._original)
+        self._run("systemctl stop irqbalance")
+        self._run("systemctl disable irqbalance")
+
+
+# ---------------------------------------------------------------------------
+# Group 1 — Readahead
+# ---------------------------------------------------------------------------
+
+class ReadaheadTool(RemediationTool):
+    """Sets block device readahead sectors."""
+
+    name = "readahead"
+    params_schema = '{"value": <integer_sectors>}'
+
+    _DETECT_DEV = (
+        "lsblk -dno NAME,TYPE | awk '$2==\"disk\" {print $1}' | grep -m1 nvme || "
+        "lsblk -dno NAME,TYPE | awk '$2==\"disk\" {print $1}' | head -1"
+    )
+
+    @classmethod
+    def read_current(cls, executor: RemoteExecutor, params: dict) -> str:
+        dev = cls._get_device(executor)
+        out, _ = executor.run(f"blockdev --getra /dev/{shlex.quote(dev)}")
+        return out.strip()
+
+    @classmethod
+    def _get_device(cls, executor: RemoteExecutor) -> str:
+        out, _ = executor.run(cls._DETECT_DEV)
+        return out.strip()
+
+    @classmethod
+    def is_no_op(cls, current_value: str, params: dict) -> bool:
+        return current_value.strip() == str(params.get("value", "")).strip()
+
+    def apply(self, params: dict) -> None:
+        value = int(params["value"])
+        if not (1 <= value <= 65536):
+            raise ValueError(f"readahead value {value} out of range (1-65536)")
+        self._dev = self._get_device(self.executor)
+        q_dev = shlex.quote(f"/dev/{self._dev}")
+        self._original = self._run(f"blockdev --getra {q_dev}")
+        self._no_op_check(self._original, str(value), "readahead")
+        logger.info("readahead %s: %s → %d", self._dev, self._original, value)
+        self._run(f"blockdev --setra {value} {q_dev}")
+        # Also fix partition devices
+        self._run(
+            f"for part in /dev/{shlex.quote(self._dev)}p*; do "
+            f"blockdev --setra {value} \"$part\" 2>/dev/null || true; done"
+        )
+        self._log_verified(f"blockdev --getra {q_dev}", f"readahead {self._dev}")
+
+    def rollback(self) -> None:
+        if self._original:
+            q_dev = shlex.quote(f"/dev/{self._dev}")
+            logger.info("Rollback readahead %s → %s", self._dev, self._original)
+            self._run(f"blockdev --setra {self._original} {q_dev}")
+
+
+# ---------------------------------------------------------------------------
+# Group 1 — I/O Scheduler
+# ---------------------------------------------------------------------------
+
+ALLOWED_IO_SCHEDULERS = {"none", "mq-deadline", "kyber", "bfq"}
+
+
+class IoSchedulerTool(RemediationTool):
+    """Sets the block device I/O scheduler."""
+
+    name = "io_scheduler"
+    params_schema = '{"value": "<none|mq-deadline|kyber|bfq>"}'
+
+    _DETECT_DEV = ReadaheadTool._DETECT_DEV
+
+    @classmethod
+    def read_current(cls, executor: RemoteExecutor, params: dict) -> str:
+        dev = cls._get_device(executor)
+        out, _ = executor.run(f"cat /sys/block/{shlex.quote(dev)}/queue/scheduler")
+        return out.strip()
+
+    @classmethod
+    def _get_device(cls, executor: RemoteExecutor) -> str:
+        out, _ = executor.run(cls._DETECT_DEV)
+        return out.strip()
+
+    @classmethod
+    def is_no_op(cls, current_value: str, params: dict) -> bool:
+        target = params.get("value", "").strip()
+        return f"[{target}]" in current_value
+
+    def apply(self, params: dict) -> None:
+        value = params["value"].strip()
+        if value not in ALLOWED_IO_SCHEDULERS:
+            raise ValueError(f"I/O scheduler '{value}' not in allowlist")
+        self._dev = self._get_device(self.executor)
+        q_dev = shlex.quote(self._dev)
+        sched_path = f"/sys/block/{q_dev}/queue/scheduler"
+        self._original_raw = self._run(f"cat {sched_path}")
+        # Extract current active scheduler from "[mq-deadline] none kyber"
+        import re
+        m = re.search(r"\[(\w[\w-]*)\]", self._original_raw)
+        self._original_sched = m.group(1) if m else "mq-deadline"
+        if f"[{value}]" in self._original_raw:
+            raise ValueError(f"No-op: I/O scheduler is already [{value}] — skipping")
+        logger.info("I/O scheduler %s: [%s] → %s", self._dev, self._original_sched, value)
+        self._run(f"echo {shlex.quote(value)} > {sched_path}")
+        self._log_verified(f"cat {sched_path}", f"io_scheduler {self._dev}")
+
+    def rollback(self) -> None:
+        if hasattr(self, "_original_sched"):
+            q_dev = shlex.quote(self._dev)
+            logger.info("Rollback I/O scheduler %s → %s", self._dev, self._original_sched)
+            self._run(
+                f"echo {shlex.quote(self._original_sched)} > /sys/block/{q_dev}/queue/scheduler"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Registry — core tools always available; network tools added if enabled
 # ---------------------------------------------------------------------------
 
@@ -371,6 +523,9 @@ _CORE_TOOLS = [
     NginxDirectiveTool,
     NginxListenBacklogTool,
     CpuGovernorTool,
+    IrqbalanceTool,
+    ReadaheadTool,
+    IoSchedulerTool,
 ]
 
 # Full registry (network tools included — filtered at agent level based on config)
@@ -389,6 +544,9 @@ _REQUIRED_PARAMS: dict[str, set[str]] = {
     "nginx_directive":    {"directive", "value"},
     "nginx_listen_backlog": {"value"},
     "cpu_governor":       {"governor"},
+    "irqbalance":         set(),
+    "readahead":          {"value"},
+    "io_scheduler":       {"value"},
     "tc_shaping":         set(),
     "iptables_connlimit": set(),
     "nftables_ratelimit": set(),

@@ -32,8 +32,11 @@ These are hard ceilings that make all other tuning irrelevant.
 | Setting | Flag if | Tool | Impact |
 |---------|---------|------|--------|
 | `CPU_Governor` | powersave or ondemand | `cpu_governor` | HIGH — freq scaling penalises burst workloads |
+| `IRQ_Balance_Active` | inactive | `irqbalance` | HIGH — NIC IRQs pinned to single CPU, causes softirq bottleneck |
+| `NIC_IRQ_Affinity` | single value (no range like "0-111") | `irqbalance` | HIGH — same fix as above, irqbalance re-balances all IRQ affinities |
+| `Readahead_sectors` | < 128 | `readahead` (value=256) | HIGH — degraded block device readahead starves I/O |
+| `IO_Scheduler` | contains [mq-deadline] or [kyber] or [bfq] | `io_scheduler` (value=none) | Medium — passthrough is optimal for NVMe |
 | `Softnet_Time_Squeeze` | > 10000 (cumulative) | note only | IRQ spreading issue — flag if irqbalance inactive |
-| `IO_Scheduler` | mq-deadline or kyber | note only | Medium — no tool available, note for operator |
 
 ## Layer 2 — Kernel Network Stack
 
@@ -77,6 +80,9 @@ Output ONLY valid JSON — no markdown, no explanation.
 - `"systemd_property"`: params={"property": "<LimitNOFILE|LimitNPROC|CPUQuota|CPUWeight|MemoryMax|IOWeight>", "value": "<value>"}
   **CPUQuota special rule:** To remove the CPUQuota limit, use value="infinity". The tool will translate this to an empty value internally. Never use "100%" — it sets a 100% cap, not removal.
 - `"cpu_governor"`: params={"governor": "<performance|powersave|ondemand|conservative>"}
+- `"irqbalance"`: params={} — enables and restarts irqbalance service; fixes both inactive irqbalance AND pinned NIC IRQ affinity in one shot
+- `"readahead"`: params={"value": <integer_sectors>} — sets block device readahead (e.g. 256)
+- `"io_scheduler"`: params={"value": "<none|mq-deadline|kyber|bfq>"} — sets I/O scheduler (none is optimal for NVMe)
 
 ## Using Similar Past Cases
 
