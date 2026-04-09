@@ -81,8 +81,11 @@ Output ONLY valid JSON — no markdown, no explanation.
 ## Using Similar Past Cases
 
 You may receive `similar_cases` — past runs on the same or similar DUT.
-- **"Worked" fixes** were already applied and ACCEPTED in a prior run. If the current audit shows the setting is ALREADY at the target value from a past fix, **do NOT re-recommend it** — it is already applied. Only re-recommend if the audit shows the setting has regressed back to a suboptimal value.
-- **"Didn't work" fixes** were tried and REJECTED (caused degradation). Avoid repeating these unless the current audit context is substantially different.
+
+**CRITICAL RULE: Memory is advisory only. The current audit data is the source of truth.**
+- ALWAYS check the actual audit value first. If a setting is suboptimal in the current audit, flag it — regardless of what memory says was fixed before. Fixes from prior runs may have been rolled back, reverted, or not persisted.
+- **"Worked" fixes**: Only skip if the current audit confirms the setting is ALREADY at the target value. If CPUQuotaPerSecUSec != infinity, flag CPUQuota as CRITICAL even if memory says it was fixed. If LimitNOFILE is still 4096, flag it even if memory says it was raised.
+- **"Didn't work" fixes**: Avoid repeating these unless the current audit context is substantially different.
 - If no similar cases are provided, ignore this section entirely.
 
 ## Rules
