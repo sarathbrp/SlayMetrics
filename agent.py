@@ -532,6 +532,7 @@ class RCAAgent:
         return g.compile()
 
     def run(self) -> None:
+        run_start = datetime.now()
         session_id = str(uuid4())
         logger.info("Session ID: %s", session_id)
         self.tracker.start(session_id)
@@ -600,18 +601,42 @@ class RCAAgent:
         )
 
         # Final extended benchmark if any fixes were accepted
+        final_rps = None
         if result["applied_fixes"]:
             dur = self.config.benchmark_final_duration_minutes
             logger.info("Running final %d-minute benchmark with all accepted fixes applied...", dur)
             try:
                 raw_final = self.benchmark.run_final(dur)
                 Display.benchmark_results(raw_final)
+                final_rps = self.evaluator.parse_rps(raw_final)
                 final_path = REPORTS_DIR / result["session_id"] / "final_benchmark.txt"
                 final_path.parent.mkdir(parents=True, exist_ok=True)
                 final_path.write_text(raw_final)
                 logger.info("Final benchmark saved to %s", final_path)
             except Exception as e:
                 logger.error("Final benchmark failed: %s", e)
+
+        # Generate final report
+        run_end = datetime.now()
+        try:
+            report_path = self.reporter.generate_final_report(
+                session_id=result["session_id"],
+                config=self.config,
+                baseline_rps=result["baseline_rps"],
+                final_rps=final_rps,
+                applied_fixes=result["applied_fixes"],
+                rejected_fixes=result["rejected_fixes"],
+                fixes=result.get("fixes", []),
+                llm_calls=result.get("llm_calls", []),
+                rca_report=result.get("rca_report", ""),
+                in_tok=in_tok,
+                out_tok=out_tok,
+                run_start=run_start,
+                run_end=run_end,
+            )
+            logger.info("Final report: %s", report_path)
+        except Exception as e:
+            logger.error("Failed to generate final report: %s", e)
 
 
 # ---------------------------------------------------------------------------
