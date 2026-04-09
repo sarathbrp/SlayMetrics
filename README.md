@@ -132,16 +132,39 @@ optimization:
 
 ## Setup
 
+**Requires Python 3.12+**
+
 ```bash
+# 1. Install dependencies
+python3.12 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 
-# Create .env on the agent machine (never committed):
-# GPT_OSS_BASE_URL=...
-# GPT_OSS_API_KEY=...
-# GPT_OSS_MODEL=...
+# 2. Configure environment variables
+cp .env.example .env
+# Edit .env with your values:
+#   GPT_OSS_BASE_URL   — LLM endpoint (required)
+#   GPT_OSS_API_KEY    — LLM API key (required)
+#   GPT_OSS_MODEL      — LLM model name (required)
+#   GPT_OSS_EMBED_MODEL — embedding model (optional, defaults to GPT_OSS_MODEL)
+#   SLAY_DUT_HOST      — target host IP (overrides config.yaml)
+#   SLAY_DUT_USER      — SSH user (overrides config.yaml)
+#   SLAY_DUT_KEY       — SSH private key path (overrides config.yaml)
+#   SLAY_DUT_PORT      — SSH port (overrides config.yaml)
+#   SLAY_DUT_TIMEOUT   — SSH timeout (overrides config.yaml)
+#   SLAY_MLFLOW_ENABLED — enable/disable MLflow (overrides config.yaml)
+#   SLAY_MLFLOW_URI    — MLflow tracking URI (overrides config.yaml)
+#   SLAY_MLFLOW_EXPERIMENT — MLflow experiment name (overrides config.yaml)
 
-# Edit config.yaml: target.host, target.user, target.private_key_path
+# 3. Configure config.yaml (defaults work if .env is set)
+#   target.*       — DUT connection (overridden by SLAY_DUT_* env vars)
+#   benchmark.*    — benchmark scripts, workloads, cooling period
+#   remediation.*  — fix thresholds, max fixes, network tool scopes
+#   mlflow.*       — experiment tracking (overridden by SLAY_MLFLOW_* env vars)
+#   memory.*       — semantic memory injection toggles
+#   optimization.* — DSPy BootstrapFewShot trigger thresholds
 
+# 4. Run
 python agent.py
 ```
 
@@ -152,6 +175,7 @@ python agent.py
 Each run produces a session folder:
 ```
 rca_reports/<session-uuid>/
+  final_report.md        # comprehensive run summary (baseline, fixes, final benchmark, runtime)
   rca_report.md          # combined summaries from all 3 LLM calls
   live_samples.csv       # raw runtime samples (25+ rows per benchmark)
   prompt_network.json    # full inputs + response for network LLM call
