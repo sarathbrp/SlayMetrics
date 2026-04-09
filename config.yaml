@@ -10,7 +10,7 @@ memory:
   inject_into_fix_extraction: true    # pass similar_cases to Call 2 (fix parser)
 
 optimization:
-  min_new_examples: 30      # trigger BootstrapFewShot after this many new examples
+  min_new_examples: 5       # trigger BootstrapFewShot after this many new examples
   max_bootstrap_demos: 3    # max few-shot demonstrations injected into prompt
 
 remediation:

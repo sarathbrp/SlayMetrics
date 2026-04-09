@@ -48,6 +48,13 @@ Output ONLY valid JSON — no markdown, no explanation.
 - `"nftables_ratelimit"`: params={}
 - `"sysctl"`: params={"param": "net.netfilter.nf_conntrack_max", "value": "262144"} — conntrack ONLY
 
+## Using Similar Past Cases
+
+You may receive `similar_cases` — past runs on the same or similar DUT.
+- **"Worked" fixes** were already applied and ACCEPTED in a prior run. If the current audit shows the setting is ALREADY at the target value from a past fix, **do NOT re-recommend it** — it is already applied. Only re-recommend if the audit shows the setting has regressed back to a suboptimal value.
+- **"Didn't work" fixes** were tried and REJECTED (caused degradation). Avoid repeating these unless the current audit context is substantially different.
+- If no similar cases are provided, ignore this section entirely.
+
 ## Rules
 
 1. Never flag TC unless TC_Active_Shaping is not "none"

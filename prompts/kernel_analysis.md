@@ -77,6 +77,13 @@ Output ONLY valid JSON — no markdown, no explanation.
 - `"systemd_property"`: params={"property": "<LimitNOFILE|LimitNPROC|CPUQuota|CPUWeight|MemoryMax|IOWeight>", "value": "<value>"}
 - `"cpu_governor"`: params={"governor": "<performance|powersave|ondemand|conservative>"}
 
+## Using Similar Past Cases
+
+You may receive `similar_cases` — past runs on the same or similar DUT.
+- **"Worked" fixes** were already applied and ACCEPTED in a prior run. If the current audit shows the setting is ALREADY at the target value from a past fix, **do NOT re-recommend it** — it is already applied. Only re-recommend if the audit shows the setting has regressed back to a suboptimal value.
+- **"Didn't work" fixes** were tried and REJECTED (caused degradation). Avoid repeating these unless the current audit context is substantially different.
+- If no similar cases are provided, ignore this section entirely.
+
 ## Rules
 
 1. Never raise somaxconn without also raising tcp_max_syn_backlog to match
