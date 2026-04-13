@@ -243,10 +243,15 @@ class NginxDirectiveTool(RemediationTool):
         if directive not in ALLOWED_NGINX:
             return f"unknown directive: {directive}"
         q_dir = shlex.quote(directive)
+        # Collect ALL occurrences — server block overrides http block
         out, _ = executor.run(
-            f"nginx -T 2>/dev/null | grep -E '^\\s*'{q_dir}'\\s+' | head -n1"
+            f"nginx -T 2>/dev/null | grep -E '^\\s*'{q_dir}'\\s+'"
         )
-        return out.strip() or "not set"
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        if not lines:
+            return "not set"
+        # Return last occurrence (server block wins over http block)
+        return lines[-1]
 
     @classmethod
     def is_no_op(cls, current_value: str, params: dict) -> bool:
@@ -263,9 +268,12 @@ class NginxDirectiveTool(RemediationTool):
         q_dir = shlex.quote(directive)
         q_value = shlex.quote(value)
         self._run(f"cp {q_conf} {q_conf}.bak")
-        self._original = self._run(
-            f"nginx -T 2>/dev/null | grep -E '^\\s*'{q_dir}'\\s+' | head -n1"
+        # Read all occurrences; last one is the effective value (server > http)
+        all_matches = self._run(
+            f"nginx -T 2>/dev/null | grep -E '^\\s*'{q_dir}'\\s+'"
         )
+        lines = [ln.strip() for ln in all_matches.strip().splitlines() if ln.strip()]
+        self._original = lines[-1] if lines else ""
         logger.info("nginx %s: [%s] → %s", directive, self._original.strip(), value)
         # Use awk for safer in-place editing instead of sed with unescaped regex
         self._run(

@@ -242,7 +242,8 @@ if [[ -n "$CONF_DUMP" ]]; then
         "output_buffers" "aio" "directio"
     )
     for n in "${NG_KNOBS[@]}"; do
-        VAL=$(echo "$CONF_DUMP" | grep -E "^\s*$n\s+" | head -n1 | awk '{$1=""; print $0}' | \
+        # Use tail -n1: server block overrides http block, last match = effective value
+        VAL=$(echo "$CONF_DUMP" | grep -E "^\s*$n\s+" | tail -n1 | awk '{$1=""; print $0}' | \
               sed 's/^ //;s/;$//')
         fmt_line "nginx_$n" "${VAL:-default}"
     done
