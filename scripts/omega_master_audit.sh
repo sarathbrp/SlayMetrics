@@ -12,7 +12,15 @@ echo -e "${CYAN}      OMEGA MASTER AUDIT: 112-CORE RHEL 9.7 STACK DATA          
 echo -e "${CYAN}==================================================================${NC}\n"
 
 # 1. System Context
-NGINX_PID=$(pgrep -n nginx)
+NGINX_PID=$(pgrep -n nginx 2>/dev/null || true)
+NGINX_RUNTIME="host"
+NGINX_CONTAINER_RUNTIME=""
+NGINX_CONTAINER_USER=""
+NGINX_CONTAINER_ID=""
+NGINX_CONTAINER_NAME=""
+NGINX_CONTAINER_IMAGE=""
+NGINX_CONTAINER_PORTS=""
+NGINX_CONTAINER_MOUNTS=""
 # Management NIC (default route) — used for general context
 NIC_DEV=$(ip -o -4 route show to default | awk '{print $5}')
 # Benchmark NIC — VLAN interface carrying test traffic (172.21.x.x subnet)
@@ -21,7 +29,7 @@ BENCH_VLAN=$(ip route get 172.21.89.124 2>/dev/null | grep -oP 'dev \K\S+' || \
              echo "$NIC_DEV")
 # TC shaping must be on the parent physical NIC (VLAN interfaces don't support tc)
 BENCH_NIC=$(echo "$BENCH_VLAN" | cut -d'.' -f1)
-CONF_DUMP=$(nginx -T 2>/dev/null)
+CONF_DUMP=""
 
 # Auto-detect primary block device (prefer NVMe over SATA)
 BLOCK_DEV=$(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}' | grep -m1 nvme || \
@@ -29,6 +37,96 @@ BLOCK_DEV=$(lsblk -dno NAME,TYPE | awk '$2=="disk" {print $1}' | grep -m1 nvme |
 
 # Helper: Consistent Formatting
 fmt_line() { printf "  %-34s | %-40s\n" "$1" "$2"; }
+
+run_as_user() {
+    local user="$1"
+    shift
+    local cmd="$*"
+    if [[ -z "$user" || -z "$cmd" ]]; then
+        return 1
+    fi
+    if [[ "$user" == "$(id -un)" ]]; then
+        bash -lc "$cmd" 2>/dev/null
+    else
+        su - "$user" -s /bin/bash -c "$cmd" 2>/dev/null
+    fi
+}
+
+discover_container_nginx() {
+    local runtime="$1"
+    local user="$2"
+    local ps_cmd inspect_pid_cmd inspect_ports_cmd inspect_mounts_cmd
+
+    case "$runtime" in
+        podman)
+            ps_cmd="podman ps --format '{{.ID}}|{{.Names}}|{{.Image}}'"
+            inspect_pid_cmd="podman inspect -f '{{.State.Pid}}' %s"
+            inspect_ports_cmd="podman inspect -f '{{range \$p, \$v := .NetworkSettings.Ports}}{{\$p}}={{\$v}};{{end}}' %s"
+            inspect_mounts_cmd="podman inspect -f '{{range .Mounts}}{{.Source}}->{{.Destination}};{{end}}' %s"
+            ;;
+        docker)
+            ps_cmd="docker ps --format '{{.ID}}|{{.Names}}|{{.Image}}'"
+            inspect_pid_cmd="docker inspect -f '{{.State.Pid}}' %s"
+            inspect_ports_cmd="docker inspect -f '{{range \$p, \$v := .NetworkSettings.Ports}}{{\$p}}={{\$v}};{{end}}' %s"
+            inspect_mounts_cmd="docker inspect -f '{{range .Mounts}}{{.Source}}->{{.Destination}};{{end}}' %s"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    local rows
+    rows=$(run_as_user "$user" "$ps_cmd")
+    [[ -z "$rows" ]] && return 1
+
+    while IFS='|' read -r cid cname cimg; do
+        [[ -z "$cid" ]] && continue
+        # Fast pre-filter to avoid exec into unrelated containers.
+        if ! echo "${cname,,} ${cimg,,}" | grep -Eq 'nginx|hub-web|gateway|controller|web'; then
+            continue
+        fi
+
+        local dump
+        dump=$(run_as_user "$user" "$runtime exec $cid sh -lc 'nginx -T 2>/dev/null'")
+        if [[ -n "$dump" ]]; then
+            CONF_DUMP="$dump"
+            NGINX_RUNTIME="container"
+            NGINX_CONTAINER_RUNTIME="$runtime"
+            NGINX_CONTAINER_USER="$user"
+            NGINX_CONTAINER_ID="$cid"
+            NGINX_CONTAINER_NAME="$cname"
+            NGINX_CONTAINER_IMAGE="$cimg"
+            NGINX_PID=$(run_as_user "$user" "$(printf "$inspect_pid_cmd" "$cid")" | tr -cd '0-9')
+            NGINX_CONTAINER_PORTS=$(run_as_user "$user" "$(printf "$inspect_ports_cmd" "$cid")")
+            NGINX_CONTAINER_MOUNTS=$(run_as_user "$user" "$(printf "$inspect_mounts_cmd" "$cid")")
+            return 0
+        fi
+    done <<< "$rows"
+    return 1
+}
+
+# Prefer host nginx first; if unavailable, fall back to containerized nginx.
+if command -v nginx >/dev/null 2>&1; then
+    CONF_DUMP=$(nginx -T 2>/dev/null)
+fi
+
+if [[ -z "$CONF_DUMP" ]]; then
+    USER_CANDIDATES=$(
+        printf "%s\n" \
+            "$(id -un)" root ansible awx \
+            $(awk -F: '$3>=1000 && $7 !~ /(nologin|false)$/ {print $1}' /etc/passwd 2>/dev/null) \
+            | awk 'NF && !seen[$0]++'
+    )
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        if command -v podman >/dev/null 2>&1 && discover_container_nginx podman "$u"; then
+            break
+        fi
+        if [[ -z "$CONF_DUMP" ]] && command -v docker >/dev/null 2>&1 && discover_container_nginx docker "$u"; then
+            break
+        fi
+    done <<< "$USER_CANDIDATES"
+fi
 
 # --- [GROUP 1: HARDWARE, TOPOLOGY & POWER] ---
 echo -e "${YELLOW}[1/5] Hardware & Power Topology${NC}"
@@ -39,8 +137,12 @@ NIC_IRQ=$(grep "$NIC_DEV" /proc/interrupts | head -n1 | awk '{print $1}' | tr -d
 fmt_line "NIC_IRQ_Affinity" "$(cat /proc/irq/${NIC_IRQ}/smp_affinity_list 2>/dev/null || echo 'N/A')"
 fmt_line "Block_Device" "${BLOCK_DEV}"
 fmt_line "Readahead_sectors" "$(blockdev --getra /dev/${BLOCK_DEV} 2>/dev/null || echo 'N/A')"
-command -v numastat &>/dev/null && fmt_line "NUMA_Local_Node_Hit" \
-    "$(numastat -p $NGINX_PID 2>/dev/null | grep 'local_node' | awk '{print $2}')"
+if command -v numastat &>/dev/null && [[ "$NGINX_PID" =~ ^[0-9]+$ ]]; then
+    fmt_line "NUMA_Local_Node_Hit" \
+        "$(numastat -p "$NGINX_PID" 2>/dev/null | grep 'local_node' | awk '{print $2}')"
+else
+    fmt_line "NUMA_Local_Node_Hit" "N/A"
+fi
 
 # --- [GROUP 2: KERNEL SYSCTL GATES (THE PIPE)] ---
 echo -e "\n${YELLOW}[2/5] Kernel Network Stack (The Pipe)${NC}"
@@ -58,16 +160,60 @@ for k in "${SYS_KNOBS[@]}"; do fmt_line "$k" "$(sysctl -n $k 2>/dev/null || echo
 
 # --- [GROUP 3: SYSTEMD & OS LIMITS (THE ENVELOPE)] ---
 echo -e "\n${YELLOW}[3/5] Systemd Service Envelope${NC}"
+
+# Service health — is nginx actually running?
+NGINX_ACTIVE=$(systemctl is-active nginx.service 2>/dev/null || echo "unknown")
+NGINX_FAILED=$(systemctl is-failed nginx.service 2>/dev/null || echo "unknown")
+NGINX_RESULT=$(systemctl show nginx.service -p Result 2>/dev/null | awk -F= '{print $2}')
+fmt_line "nginx_service_active" "$NGINX_ACTIVE"
+fmt_line "nginx_service_failed" "$NGINX_FAILED"
+fmt_line "nginx_service_result" "${NGINX_RESULT:-unknown}"
+if [[ "$NGINX_ACTIVE" != "active" ]]; then
+    # Capture the failure reason from journalctl
+    FAIL_REASON=$(journalctl -u nginx.service -n 5 --no-pager 2>/dev/null | tail -3)
+    fmt_line "nginx_failure_reason" "${FAIL_REASON:-(no journal output)}"
+fi
+
+# Systemd drop-in files — detect conflicting overrides
+DROPIN_DIR="/etc/systemd/system/nginx.service.d"
+DROPIN_CTRL="/etc/systemd/system.control/nginx.service.d"
+DROPIN_FILES=""
+if [[ -d "$DROPIN_DIR" ]]; then
+    DROPIN_FILES=$(ls -1 "$DROPIN_DIR"/*.conf 2>/dev/null | paste -sd ',')
+fi
+if [[ -d "$DROPIN_CTRL" ]]; then
+    CTRL_FILES=$(ls -1 "$DROPIN_CTRL"/*.conf 2>/dev/null | paste -sd ',')
+    [[ -n "$CTRL_FILES" ]] && DROPIN_FILES="${DROPIN_FILES:+$DROPIN_FILES,}$CTRL_FILES"
+fi
+fmt_line "systemd_dropin_files" "${DROPIN_FILES:-none}"
+# Dump each drop-in so the LLM can see conflicting values
+for df in $(echo "$DROPIN_FILES" | tr ',' ' '); do
+    [[ -f "$df" ]] && fmt_line "dropin:$(basename $df)" "$(grep -v '^\s*#\|^\s*$\|^\[' "$df" | paste -sd '|')"
+done
+
+# fs.nr_open vs LimitNOFILE cross-validation
+FS_NR_OPEN=$(sysctl -n fs.nr_open 2>/dev/null || echo "N/A")
+FS_FILE_MAX=$(sysctl -n fs.file-max 2>/dev/null || echo "N/A")
+EFFECTIVE_NOFILE=$(systemctl show nginx.service -p LimitNOFILE 2>/dev/null | awk -F= '{print $2}')
+fmt_line "fs.nr_open" "$FS_NR_OPEN"
+fmt_line "fs.file-max" "$FS_FILE_MAX"
+fmt_line "systemd_effective_LimitNOFILE" "${EFFECTIVE_NOFILE:-unknown}"
+if [[ "$EFFECTIVE_NOFILE" =~ ^[0-9]+$ && "$FS_NR_OPEN" =~ ^[0-9]+$ ]]; then
+    if (( EFFECTIVE_NOFILE > FS_NR_OPEN )); then
+        fmt_line "CONFLICT_LimitNOFILE_vs_nr_open" "FATAL: LimitNOFILE($EFFECTIVE_NOFILE) > fs.nr_open($FS_NR_OPEN)"
+    fi
+fi
+
 # CPUQuota: use CPUQuotaPerSecUSec (CPUQuota property returns empty on RHEL 9.7)
-CPU_QUOTA_US=$(systemctl show nginx.service -p CPUQuotaPerSecUSec | awk -F= '{print $2}')
+CPU_QUOTA_US=$(systemctl show nginx.service -p CPUQuotaPerSecUSec 2>/dev/null | awk -F= '{print $2}')
 if [[ "$CPU_QUOTA_US" == "infinity" || -z "$CPU_QUOTA_US" ]]; then
     fmt_line "systemd_CPUQuota" "none (unlimited)"
 else
     # Convert µs to % : value may be "150ms" or raw µs
-    fmt_line "systemd_CPUQuota" "${CPU_QUOTA_US} ($(systemctl show nginx.service -p CPUQuotaPerSecUSec | awk -F= '{print $2}'))"
+    fmt_line "systemd_CPUQuota" "${CPU_QUOTA_US} ($(systemctl show nginx.service -p CPUQuotaPerSecUSec 2>/dev/null | awk -F= '{print $2}'))"
 fi
-for s in "LimitNOFILE" "LimitNPROC" "CPUWeight" "MemoryMax" "IOWeight"; do
-    VAL=$(systemctl show nginx.service -p $s | awk -F= '{print $2}')
+for s in "LimitNOFILE" "LimitNPROC" "CPUWeight" "MemoryMax" "MemoryHigh" "IOWeight" "Nice" "OOMScoreAdjust" "TasksMax"; do
+    VAL=$(systemctl show nginx.service -p $s 2>/dev/null | awk -F= '{print $2}')
     fmt_line "systemd_$s" "${VAL:-[not set]}"
 done
 fmt_line "SELinux_State" "$(getenforce)"
@@ -76,6 +222,16 @@ fmt_line "IO_Scheduler" "$(cat /sys/block/${BLOCK_DEV}/queue/scheduler 2>/dev/nu
 
 # --- [GROUP 4: NGINX APPLICATION (THE ENGINE)] ---
 echo -e "\n${YELLOW}[4/5] NGINX Internal Directives${NC}"
+fmt_line "nginx_runtime" "$NGINX_RUNTIME"
+if [[ "$NGINX_RUNTIME" == "container" ]]; then
+    fmt_line "nginx_container_runtime" "${NGINX_CONTAINER_RUNTIME:-unknown}"
+    fmt_line "nginx_container_user" "${NGINX_CONTAINER_USER:-unknown}"
+    fmt_line "nginx_container_name" "${NGINX_CONTAINER_NAME:-unknown}"
+    fmt_line "nginx_container_image" "${NGINX_CONTAINER_IMAGE:-unknown}"
+    fmt_line "nginx_container_pid" "${NGINX_PID:-unknown}"
+    fmt_line "nginx_container_ports" "${NGINX_CONTAINER_PORTS:-none}"
+    fmt_line "nginx_container_mounts" "${NGINX_CONTAINER_MOUNTS:-none}"
+fi
 if [[ -n "$CONF_DUMP" ]]; then
     NG_KNOBS=(
         "worker_processes" "worker_connections" "worker_rlimit_nofile" "worker_cpu_affinity"
@@ -97,7 +253,9 @@ if [[ -n "$CONF_DUMP" ]]; then
     fmt_line "nginx_limit_conn" "${LIMIT_CONN:-default}"
     ERR_LEVEL=$(echo "$CONF_DUMP" | grep -E "^\s*error_log\s+" | head -n1 | awk '{print $3}' | tr -d ';')
     fmt_line "nginx_error_log_level" "${ERR_LEVEL:-error (default)}"
-    fmt_line "nginx_listen_backlog" "$(echo "$CONF_DUMP" | grep -oP "backlog=\K\d+" | head -n1)"
+    fmt_line "nginx_listen_backlog" "$(echo "$CONF_DUMP" | grep -oP "backlog=\K\d+" | head -n1 || echo 'default')"
+else
+    fmt_line "nginx_config_dump" "unavailable (host+container checks failed)"
 fi
 
 # --- [GROUP 5: NETWORK CHAOS DETECTION] ---

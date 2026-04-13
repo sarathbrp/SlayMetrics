@@ -1,0 +1,354 @@
+"""Execution graph nodes: audit, benchmark, merge_fixes, remediate_fix, save_partial_state."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from .audit import AuditRunner
+from .remediation_tools import TOOL_REGISTRY, NETWORK_TOOL_NAMES
+from .fix_applier import FixApplier
+from .display import Display
+from .constants import REPORTS_DIR, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT
+
+if TYPE_CHECKING:
+    from .rca_agent import RCAAgent, RCAState
+
+logger = logging.getLogger("slayMetrics.nodes")
+
+
+def save_partial_state(agent: RCAAgent) -> None:
+    """Persist whatever state has accumulated — called on signal or error."""
+    ps = agent._partial_state
+    if not ps:
+        return
+    session_id = ps.get("session_id", "")
+    rca_report = ps.get("rca_report", "")
+    if rca_report and session_id:
+        try:
+            agent.reporter.save(rca_report, session_id)
+        except Exception as e:
+            logger.error("Partial save — report failed: %s", e)
+    audit   = ps.get("audit_output", "")
+    bench   = ps.get("benchmark_results", "")
+    applied = ps.get("applied_fixes", [])
+    rejected = ps.get("rejected_fixes", [])
+    if audit and rca_report:
+        try:
+            agent.analyzer.save_example(audit, rca_report, bench,
+                                        applied_fixes=applied, rejected_fixes=rejected)
+        except Exception as e:
+            logger.error("Partial save — example failed: %s", e)
+    logger.info(
+        "Partial state saved (session: %s, applied: %d fixes) — skipping memory store",
+        session_id[:8] if session_id else "?", len(applied),
+    )
+
+
+def run_audit(state: RCAState, agent: RCAAgent) -> RCAState:
+    precomputed = state.get("audit_output", "")
+    if precomputed:
+        # Injected by fleet orchestrator — skip remote audit
+        logger.info("Using pre-collected audit output (%d bytes) — skipping remote audit.",
+                    len(precomputed))
+        return {**state, "error": ""}
+    try:
+        with agent._executor() as executor:
+            output = AuditRunner(executor, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT).deploy_and_run()
+        return {**state, "audit_output": output, "error": ""}
+    except Exception as e:
+        logger.error("run_audit failed: %s", e)
+        return {**state, "error": str(e)}
+
+
+def preflight_check(state: RCAState, agent: RCAAgent) -> RCAState:
+    """Verify nginx is running before benchmarking. Diagnose and recover if failed."""
+    if state.get("error"):
+        return state
+    try:
+        with agent._executor() as executor:
+            active, _ = executor.run("systemctl is-active nginx.service 2>/dev/null || echo unknown")
+            active = active.strip()
+            if active == "active":
+                logger.info("Preflight: nginx is active — proceeding to benchmark.")
+                return {**state, "error": ""}
+
+            logger.warning("Preflight: nginx is NOT active (state: %s) — diagnosing...", active)
+
+            # Gather failure details
+            result_prop, _ = executor.run(
+                "systemctl show nginx.service -p Result | awk -F= '{print $2}'"
+            )
+            journal, _ = executor.run(
+                "journalctl -u nginx.service -n 10 --no-pager 2>/dev/null"
+            )
+            logger.warning("nginx Result: %s", result_prop.strip())
+            logger.warning("Journal:\n%s", journal.strip())
+
+            # Check LimitNOFILE vs fs.nr_open conflict
+            nr_open, _ = executor.run("sysctl -n fs.nr_open 2>/dev/null")
+            nofile, _ = executor.run(
+                "systemctl show nginx.service -p LimitNOFILE | awk -F= '{print $2}'"
+            )
+            nr_open_val = int(nr_open.strip()) if nr_open.strip().isdigit() else 0
+            nofile_val = int(nofile.strip()) if nofile.strip().isdigit() else 0
+
+            if nofile_val > nr_open_val > 0:
+                logger.info(
+                    "Preflight fix: LimitNOFILE(%d) > fs.nr_open(%d) — raising fs.nr_open",
+                    nofile_val, nr_open_val,
+                )
+                new_nr_open = max(nofile_val, 1048576)
+                executor.run(f"sysctl -w fs.nr_open={new_nr_open}")
+                executor.run(f"sysctl -w fs.file-max={new_nr_open}")
+
+            # Scan for crippling drop-in overrides
+            dropin_dir = "/etc/systemd/system/nginx.service.d"
+            ls_out, _ = executor.run(f"ls -1 {dropin_dir}/*.conf 2>/dev/null")
+            for dropin in ls_out.strip().splitlines():
+                if not dropin:
+                    continue
+                content, _ = executor.run(f"cat {dropin}")
+                # Remove files that set sabotage-level limits
+                sabotage = False
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line.startswith("Nice=") and int(line.split("=")[1]) >= 15:
+                        sabotage = True
+                    elif line.startswith("OOMScoreAdjust=") and int(line.split("=")[1]) > 200:
+                        sabotage = True
+                    elif line.startswith("CPUWeight=") and int(line.split("=")[1]) <= 10:
+                        sabotage = True
+                    elif line.startswith("IOWeight=") and int(line.split("=")[1]) <= 10:
+                        sabotage = True
+                    elif line.startswith("TasksMax=") and int(line.split("=")[1]) <= 100:
+                        sabotage = True
+                if sabotage:
+                    logger.info("Preflight fix: removing crippling drop-in %s", dropin)
+                    executor.run(f"rm -f {dropin}")
+
+            # Attempt restart
+            executor.run("systemctl daemon-reload")
+            executor.run("systemctl restart nginx.service")
+            verify, _ = executor.run("systemctl is-active nginx.service 2>/dev/null || echo failed")
+            if verify.strip() == "active":
+                logger.info("Preflight: nginx recovered successfully after fixes.")
+                return {**state, "error": ""}
+            else:
+                return {**state, "error": f"Preflight: nginx still not active after recovery attempt (state: {verify.strip()})"}
+
+    except Exception as e:
+        logger.error("preflight_check failed: %s", e)
+        return {**state, "error": str(e)}
+
+
+def run_benchmark(state: RCAState, agent: RCAAgent) -> RCAState:
+    if state.get("error"):
+        return state
+    try:
+        session_id = state.get("session_id", "unknown")
+        csv_path   = REPORTS_DIR / session_id / "live_samples.csv"
+
+        if agent.orchestrator and agent.target:
+            raw, csv_text = agent.orchestrator.run_benchmark_with_live(agent.target)
+            if csv_text.strip():
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                csv_path.write_text(csv_text)
+        else:
+            agent.sampler.start(csv_path)
+            try:
+                raw = agent.benchmark.run()
+            finally:
+                agent.sampler.stop()
+
+        formatted    = agent.benchmark.format_for_llm(raw)
+        baseline_rps = agent.evaluator.parse_rps(raw)
+        logger.info("Benchmark captured (%d bytes, %d workloads)", len(formatted), len(baseline_rps))
+        Display.benchmark_results(formatted)
+        agent.tracker.log_baseline(baseline_rps)
+
+        live_audit = agent.sampler.analyze(csv_path) if csv_path.exists() else ""
+        Display.live_analysis(live_audit)
+
+        return {**state, "benchmark_results": formatted,
+                "baseline_rps": baseline_rps, "live_audit_output": live_audit}
+    except Exception as e:
+        logger.error("run_benchmark failed: %s", e)
+        return {**state, "error": str(e)}
+
+
+def merge_fixes(state: RCAState, agent: RCAAgent) -> RCAState:
+    """Combine all domain fixes, apply scope/no-op filters, build final plan."""
+    if state.get("error"):
+        return state
+    all_fixes = (
+        state.get("network_fixes", []) +
+        state.get("kernel_fixes", []) +
+        state.get("nginx_fixes", [])
+    )
+    scoped = []
+    for fix in all_fixes:
+        tool = fix.get("tool", "")
+        if tool in NETWORK_TOOL_NAMES:
+            scope = agent.config.remediation_network_tool_scope(tool)
+            if scope == "none":
+                logger.warning("Network tool '%s' scope=none — excluded", tool)
+                continue
+            fix["_net_scope"] = scope
+        if tool not in TOOL_REGISTRY:
+            logger.warning("Unknown tool '%s' — dropped", tool)
+            continue
+        scoped.append(fix)
+
+    def _sort_key(f: dict) -> tuple:
+        is_net    = 0 if f.get("tool") in NETWORK_TOOL_NAMES else 1
+        is_access = 0 if f.get("params", {}).get("directive") == "access_log" else 1
+        return (f.get("tier", 99), is_net, is_access)
+
+    scoped.sort(key=_sort_key)
+
+    if agent.audit_only:
+        Display.fix_plan(scoped)
+        return {**state, "fixes": scoped, "fix_index": 0}
+
+    with agent._executor() as executor:
+        for fix in scoped:
+            tool_cls = TOOL_REGISTRY.get(fix.get("tool", ""))
+            if tool_cls:
+                fix["current_value"] = tool_cls.read_current(executor, fix.get("params", {}))
+                fix["_no_op"] = tool_cls.is_no_op(fix["current_value"], fix.get("params", {}))
+
+    skipped = [f for f in scoped if f.get("_no_op")]
+    fixes   = [f for f in scoped if not f.get("_no_op")]
+    if skipped:
+        logger.info("Skipping %d no-op fixes: %s",
+                    len(skipped), [f.get("description") for f in skipped])
+    Display.fix_plan(fixes)
+    return {**state, "fixes": fixes, "fix_index": 0}
+
+
+def _llm_fix_review(
+    state: RCAState,
+    agent: RCAAgent,
+    fix: dict,
+    baseline: dict,
+    current_rps: dict,
+    keep: bool,
+    simple_pct: float,
+    weighted_pct: float,
+    degraded: dict,
+) -> tuple[bool, bool, RCAState]:
+    """Ask LLM to review a rejected fix when RPS-weighted improvement is positive.
+
+    Returns (keep, llm_overridden, updated_state).
+    """
+    if keep or not agent.config.remediation_llm_review_rejected or weighted_pct <= 0:
+        if not keep:
+            logger.info(
+                "LLM review SKIPPED — RPS-weighted improvement is %.2f%% (not positive). "
+                "simple avg: %+.2f%%, degraded: %s",
+                weighted_pct, simple_pct,
+                ", ".join(f"{w}={d:+.1f}%" for w, d in degraded.items()) if degraded else "none",
+            )
+        return keep, False, state
+
+    logger.info(
+        "LLM review TRIGGERED — gate rejected but RPS-weighted improvement is +%.2f%% "
+        "(simple avg: %+.2f%%, degraded: %s)",
+        weighted_pct, simple_pct,
+        ", ".join(f"{w}={d:+.1f}%" for w, d in degraded.items()),
+    )
+    rca_context = state.get("rca_report", "")
+    save_dir = REPORTS_DIR / state.get("session_id", "unknown")
+    accept, reasoning, r_in, r_out = agent.fix_reviewer.review(
+        fix, baseline, current_rps, rca_context, degraded, save_dir=save_dir,
+    )
+    verdict_tag = "override_accept" if accept else "confirm_reject"
+    calls = list(state.get("llm_calls", []))
+    calls.append(("fix_review", 0, r_in, r_out, 0))
+    updated = {**state, "llm_calls": calls,
+               "total_input_tokens": state.get("total_input_tokens", 0) + r_in,
+               "total_output_tokens": state.get("total_output_tokens", 0) + r_out}
+    agent.tracker.log_llm_call(f"fix_review:{verdict_tag}", 0, r_in, r_out, 0)
+    if accept:
+        logger.info("LLM OVERRIDE: fix accepted — %s", reasoning)
+    else:
+        logger.info("LLM CONFIRMED rejection — %s", reasoning)
+    return accept, accept, updated
+
+
+def remediate_fix(state: RCAState, agent: RCAAgent) -> RCAState:
+    fixes    = state["fixes"]
+    idx      = state["fix_index"]
+    fix      = fixes[idx]
+    baseline = state["baseline_rps"]
+    applied  = list(state.get("applied_fixes", []))
+    rejected = list(state.get("rejected_fixes", []))
+
+    logger.info(
+        "--- Fix %d/%d [Tier %s] ---\n  tool: %s\n  desc: %s\n  params: %s",
+        idx + 1, len(fixes), fix.get("tier", "?"),
+        fix.get("tool", ""), fix.get("description", ""), fix.get("params", {}),
+    )
+    try:
+        if fix.get("_net_scope") == "read":
+            logger.warning(
+                "Network tool '%s' scope=read — skipping apply. "
+                "Set scope to 'write' in config.yaml to allow.",
+                fix.get("tool", ""),
+            )
+            rejected.append((fix.get("description", ""), 0.0))
+            return {**state, "fix_index": idx + 1, "baseline_rps": baseline,
+                    "applied_fixes": applied, "rejected_fixes": rejected}
+
+        with agent._executor() as executor:
+            applier = FixApplier(executor)
+            agent._current_applier = applier
+            applier.apply(fix)
+
+            if fix.get("tool") in NETWORK_TOOL_NAMES:
+                logger.info("Network tool '%s' auto-accepted (no benchmark needed)", fix.get("tool"))
+                applied.append((fix.get("description", ""), 0.0))
+                agent._current_applier = None
+                agent._partial_state["applied_fixes"] = applied
+                return {**state, "fix_index": idx + 1, "baseline_rps": baseline,
+                        "applied_fixes": applied, "rejected_fixes": rejected}
+
+            raw = agent.benchmark.run()
+            current_rps = agent.evaluator.parse_rps(raw)
+            keep, pct, degraded = agent.evaluator.should_keep(
+                baseline, current_rps, agent.config.remediation_threshold,
+                agent.config.remediation_degradation_tolerance,
+            )
+            simple_pct  = agent.evaluator.improvement_pct(baseline, current_rps)
+            weighted_pct = agent.evaluator.weighted_improvement_pct(baseline, current_rps)
+
+            keep, llm_overridden, state = _llm_fix_review(
+                state, agent, fix, baseline, current_rps, keep, simple_pct, weighted_pct, degraded,
+            )
+
+            Display.fix_comparison(
+                idx + 1, len(fixes), fix.get("description", ""),
+                fix.get("tool", ""), fix.get("params", {}),
+                baseline, current_rps, keep, pct, llm_override=llm_overridden,
+            )
+            if keep:
+                applied.append((fix.get("description", ""), round(pct, 2)))
+                baseline = current_rps
+            else:
+                rejected.append((fix.get("description", ""), round(pct, 2)))
+                applier.rollback()
+            agent.tracker.log_fix(fix.get("description", ""), fix.get("tool", ""), keep, pct)
+            agent._current_applier = None
+            agent._partial_state["applied_fixes"]  = applied
+            agent._partial_state["rejected_fixes"] = rejected
+
+    except ValueError as e:
+        logger.info("remediate_fix [%d] skipped (no-op at apply time): %s", idx, e)
+        rejected.append((fix.get("description", ""), 0.0))
+    except Exception as e:
+        logger.error("remediate_fix [%d] failed: %s", idx, e)
+        rejected.append((fix.get("description", ""), 0.0))
+
+    return {**state, "fix_index": idx + 1, "baseline_rps": baseline,
+            "applied_fixes": applied, "rejected_fixes": rejected}

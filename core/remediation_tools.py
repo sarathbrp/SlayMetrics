@@ -28,10 +28,12 @@ ALLOWED_SYSCTL = {
     "net.ipv4.ip_local_port_range", "vm.swappiness", "vm.dirty_ratio",
     "vm.vfs_cache_pressure", "net.netfilter.nf_conntrack_max",
     "net.ipv4.tcp_syncookies",
+    "fs.nr_open", "fs.file-max",
 }
 
 ALLOWED_SYSTEMD = {
-    "LimitNOFILE", "LimitNPROC", "CPUQuota", "CPUWeight", "MemoryMax", "IOWeight",
+    "LimitNOFILE", "LimitNPROC", "CPUQuota", "CPUWeight", "MemoryMax", "MemoryHigh",
+    "IOWeight", "Nice", "OOMScoreAdjust", "TasksMax",
 }
 
 ALLOWED_NGINX = {
@@ -110,7 +112,8 @@ _DROPIN_PROPS = {"LimitNOFILE", "LimitNPROC"}
 _DROPIN_DIR = "/etc/systemd/system/nginx.service.d"
 
 # Properties that use systemctl set-property (runtime)
-_SETPROP_PROPS = {"CPUQuota", "CPUWeight", "MemoryMax", "IOWeight"}
+_SETPROP_PROPS = {"CPUQuota", "CPUWeight", "MemoryMax", "MemoryHigh", "IOWeight",
+                  "Nice", "OOMScoreAdjust", "TasksMax"}
 
 
 class SystemdPropertyTool(RemediationTool):
@@ -164,6 +167,18 @@ class SystemdPropertyTool(RemediationTool):
         self._original = self.read_current(self.executor, params)
         self._no_op_check(self._original, value, f"systemd {prop}")
         logger.info("systemd nginx.service %s: %s → %s", prop, self._original, value)
+
+        # Cross-validate: LimitNOFILE must not exceed fs.nr_open
+        if prop == "LimitNOFILE" and value.isdigit():
+            nr_open = self._run("sysctl -n fs.nr_open").strip()
+            if nr_open.isdigit() and int(value) > int(nr_open):
+                new_nr_open = max(int(value), 1048576)
+                logger.info(
+                    "LimitNOFILE(%s) > fs.nr_open(%s) — raising kernel limits first",
+                    value, nr_open,
+                )
+                self._run(f"sysctl -w fs.nr_open={new_nr_open}")
+                self._run(f"sysctl -w fs.file-max={new_nr_open}")
 
         if prop == "CPUQuota":
             # CPUQuota removal: empty value removes the limit entirely
