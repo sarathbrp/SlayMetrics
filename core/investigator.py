@@ -31,6 +31,33 @@ class InvestigationResult:
     layer: str = ""
 
 
+def _format_structured_findings(findings: dict) -> str:
+    """Convert structured findings dict into readable text for domain analyzers."""
+    sections = []
+    labels = {
+        "cross_layer_violations": "CROSS-LAYER VIOLATIONS",
+        "systemd_sabotage": "SYSTEMD SABOTAGE",
+        "effective_nginx_values": "EFFECTIVE NGINX VALUES (server block wins)",
+        "kernel_issues": "KERNEL ISSUES",
+        "hardware_issues": "HARDWARE ISSUES",
+        "network_path": "NETWORK PATH",
+    }
+    for key, title in labels.items():
+        val = findings.get(key)
+        if not val:
+            continue
+        if isinstance(val, dict):
+            items = [f"  {k}: {v}" for k, v in val.items()]
+        elif isinstance(val, list):
+            items = [f"  - {v}" for v in val]
+        else:
+            items = [f"  {val}"]
+        sections.append(f"[{title}]\n" + "\n".join(items))
+    severity = findings.get("severity", "unknown")
+    header = f"=== SRE Investigation Report (severity: {severity}) ==="
+    return header + "\n\n" + "\n\n".join(sections)
+
+
 def _parse_response(raw: str) -> InvestigationResult:
     """Parse LLM JSON response into InvestigationResult."""
     raw = raw.strip()
@@ -39,11 +66,17 @@ def _parse_response(raw: str) -> InvestigationResult:
         raw = "\n".join(lines[1:-1]) if len(lines) > 2 else ""
     try:
         data = json.loads(raw)
+        findings_raw = data.get("findings", "")
+        # When done=true, findings may be a structured dict — format it
+        if isinstance(findings_raw, dict):
+            findings_text = _format_structured_findings(findings_raw)
+        else:
+            findings_text = str(findings_raw)
         return InvestigationResult(
             done=bool(data.get("done", False)),
             commands=data.get("commands", []),
             reasoning=data.get("reasoning", ""),
-            findings=data.get("findings", ""),
+            findings=findings_text,
             layer=data.get("layer", ""),
         )
     except (json.JSONDecodeError, AttributeError):

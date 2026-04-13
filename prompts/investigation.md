@@ -74,18 +74,68 @@ You can investigate anything read-only. Common areas:
 
 ## Output Format
 
-Return JSON:
+### During investigation (done=false):
 ```json
 {
   "layer": "which layer you are investigating (1-5 or 'cross-layer')",
   "commands": ["cmd1", "cmd2", ...],
   "reasoning": "why you are running these commands",
-  "findings": "what you have learned so far from all iterations",
+  "findings": "brief progress note",
   "done": false
 }
 ```
 
-Set `done: true` when you have sufficient information across all 5 layers. When done, provide a comprehensive `findings` summary organized by layer.
+### When complete (done=true) — STRUCTURED SUMMARY:
+When done, return a structured findings object organized by layer. Include ONLY net-new findings that the static audit does NOT already cover (drop-in conflicts, cross-layer violations, effective vs reported values, hidden sabotage). Do NOT repeat values the static audit already shows correctly.
+
+```json
+{
+  "layer": "final",
+  "commands": [],
+  "reasoning": "investigation complete",
+  "done": true,
+  "findings": {
+    "cross_layer_violations": [
+      "LimitNOFILE(512) < worker_connections(256) — fd exhaustion under load",
+      "fs.nr_open(65536) blocks any LimitNOFILE raise above 65536"
+    ],
+    "systemd_sabotage": [
+      "hackathon_degrade.conf: Nice=19, CPUWeight=10, IOWeight=10, TasksMax=100, OOMScoreAdjust=500",
+      "LimitNOFILE=512 via drop-in (overrides base unit)"
+    ],
+    "effective_nginx_values": {
+      "sendfile": "on (server block override — http block says off)",
+      "tcp_nopush": "on (server block override)",
+      "worker_rlimit_nofile": "512 (matches LimitNOFILE cap)",
+      "worker_processes": "1 (should be auto for 112 CPUs)"
+    },
+    "kernel_issues": [
+      "somaxconn=128 with listen backlog=128 — connection drops guaranteed",
+      "tcp buffer max capped at 87380 (should be 16MB+)"
+    ],
+    "hardware_issues": [
+      "irqbalance inactive — all NIC IRQs pinned to CPU 0",
+      "readahead=8 sectors on NVMe (should be 256+)"
+    ],
+    "network_path": [
+      "No TC shaping detected",
+      "No iptables/nftables blocking"
+    ],
+    "severity": "critical"
+  }
+}
+```
+
+## Stopping Criteria
+
+Signal `done: true` when you have:
+1. Verified cross-layer constraints for all 5 layers
+2. Checked all systemd drop-in files
+3. Confirmed effective nginx values (server block vs http block)
+4. Checked for background sabotage processes
+5. Do NOT continue investigating values the static audit already shows — focus only on relationships and hidden overrides
+
+Typical investigation should complete in 3-5 iterations. If you have covered all layers by iteration 3, stop.
 
 ## Rules
 
@@ -96,3 +146,4 @@ Set `done: true` when you have sufficient information across all 5 layers. When 
 5. **Focus on relationships** — individual values matter less than whether they are consistent with each other
 6. **Flag anomalies explicitly** — if something looks deliberately sabotaged, say so
 7. **Be efficient** — if the baseline already shows a value clearly, do not re-check it
+8. **Stop early** — once you have verified all 5 layers and found the key issues, signal done immediately

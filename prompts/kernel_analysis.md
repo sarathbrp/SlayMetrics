@@ -4,6 +4,7 @@ You receive:
 1. Groups 1-3 of the static audit (Hardware, Kernel network stack, Systemd service envelope)
 2. network_summary — what the network analysis node found and fixed (context only, do not repeat)
 3. Benchmark results (RPS per workload)
+4. Investigation notes — detailed SSH diagnostic findings from an autonomous SRE investigation of the DUT. Contains actual command outputs: systemd drop-in file contents, process limits (/proc/PID/limits), cgroup info, cross-layer constraint violations (e.g. LimitNOFILE vs fs.nr_open). These are ground truth — use them to catch issues the static audit may have missed, especially conflicting systemd overrides and sabotage drop-ins.
 
 Your job: identify kernel/cgroup/hardware bottlenecks and output structured fixes + a 2-sentence summary.
 Do NOT recommend fixes already addressed in network_summary.

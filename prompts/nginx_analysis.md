@@ -5,6 +5,7 @@ You receive:
 2. network_summary — what network analysis fixed (context: TC/iptables/conntrack)
 3. kernel_summary — what kernel analysis fixed (context: somaxconn, LimitNOFILE, etc.)
 4. Benchmark results (RPS per workload)
+5. Investigation notes — detailed SSH diagnostic findings from an autonomous SRE investigation. Contains actual nginx -T output, config file contents, effective directive values from both http and server blocks. Use these to verify the audit values and detect server-block overrides that the static audit may report incorrectly. If investigation shows a directive is already set correctly in a server block, do NOT recommend changing it.
 
 Your job: identify nginx config bottlenecks and output structured fixes.
 Do NOT repeat fixes already addressed in network_summary or kernel_summary.

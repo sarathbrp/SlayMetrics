@@ -52,6 +52,7 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
     max_cmds = agent.config.investigation_max_commands_per_iteration
     save_dir = REPORTS_DIR / state.get("session_id", "unknown")
     findings: list[str] = []
+    conclusion = ""
     total_in = total_out = 0
     total_elapsed = 0.0
 
@@ -75,8 +76,10 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                         "Investigation complete at iteration %d (%.1fs total)",
                         iteration, total_elapsed,
                     )
+                    # Use the structured conclusion as the final notes
+                    # (replaces raw command dumps with clean summary)
                     if result.findings:
-                        findings.append(f"[CONCLUSION]\n{result.findings}")
+                        conclusion = result.findings
                     _save_iteration(save_dir, iteration, result.reasoning, [])
                     break
 
@@ -115,13 +118,14 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
 
     except Exception as e:
         logger.error("Investigation failed: %s", e)
-        findings.append(f"[ERROR] Investigation aborted: {e}")
+        conclusion = f"[ERROR] Investigation aborted: {e}"
 
-    notes = "\n---\n".join(findings)
+    # Prefer the structured conclusion over raw command dumps.
+    # Raw findings are still saved per-iteration in JSON files for debugging.
+    notes = conclusion if conclusion else "\n---\n".join(findings)
     logger.info(
-        "Investigation produced %d bytes of notes across %d findings (%.1fs, %d LLM calls)",
-        len(notes), len(findings), total_elapsed,
-        min(max_iter, len(findings)),
+        "Investigation produced %d bytes of notes (%d iterations, %.1fs, %d commands run)",
+        len(notes), min(max_iter, len(findings)), total_elapsed, len(findings),
     )
 
     calls = list(state.get("llm_calls", []))
