@@ -158,6 +158,30 @@ class Config:
     def optimization_max_bootstrap_demos(self) -> int:
         return self._cfg.get("optimization", {}).get("max_bootstrap_demos", 3)
 
+    # --- investigation ---
+    def _inv(self, key: str, default: int | bool) -> int | bool:
+        return self._cfg.get("investigation", {}).get(key, default)
+
+    @property
+    def investigation_enabled(self) -> bool:
+        return bool(self._inv("enabled", True))
+
+    @property
+    def investigation_max_iterations(self) -> int:
+        return int(self._inv("max_iterations", 8))
+
+    @property
+    def investigation_command_timeout(self) -> int:
+        return int(self._inv("command_timeout_seconds", 30))
+
+    @property
+    def investigation_max_output_bytes(self) -> int:
+        return int(self._inv("max_output_bytes", 8192))
+
+    @property
+    def investigation_max_commands_per_iteration(self) -> int:
+        return int(self._inv("max_commands_per_iteration", 5))
+
     # --- misc ---
     @property
     def log_level(self) -> str:
@@ -177,53 +201,32 @@ class Config:
             )
         )
 
+    def _installer(self, key: str, default: Any) -> Any:
+        return self._cfg.get("orchestration", {}).get("installer", {}).get(key, default)
+
     @property
     def orchestration_installer_user(self) -> str:
-        return str(
-            self._cfg.get("orchestration", {})
-            .get("installer", {})
-            .get("user", "root")
-        )
+        return str(self._installer("user", "root"))
 
     @property
     def orchestration_installer_key(self) -> str:
-        return str(
-            self._cfg.get("orchestration", {})
-            .get("installer", {})
-            .get("private_key_path", self.dut_key)
-        )
+        return str(self._installer("private_key_path", self.dut_key))
 
     @property
     def orchestration_installer_port(self) -> int:
-        return int(
-            self._cfg.get("orchestration", {})
-            .get("installer", {})
-            .get("port", 22)
-        )
+        return int(self._installer("port", 22))
 
     @property
     def orchestration_installer_timeout(self) -> int:
-        return int(
-            self._cfg.get("orchestration", {})
-            .get("installer", {})
-            .get("connect_timeout_seconds", 30)
-        )
+        return int(self._installer("connect_timeout_seconds", 30))
 
     @property
     def orchestration_installer_remote_tmp(self) -> str:
-        return str(
-            self._cfg.get("orchestration", {})
-            .get("installer", {})
-            .get("remote_tmp", "/tmp/slaymetrics_orchestrate")
-        )
+        return str(self._installer("remote_tmp", "/tmp/slaymetrics_orchestrate"))
 
     @property
     def orchestration_installer_auto_install_wrk(self) -> bool:
-        return bool(
-            self._cfg.get("orchestration", {})
-            .get("installer", {})
-            .get("auto_install_wrk", True)
-        )
+        return bool(self._installer("auto_install_wrk", True))
 
     @property
     def target_specs(self) -> list[dict[str, Any]]:

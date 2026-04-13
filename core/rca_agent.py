@@ -27,9 +27,11 @@ from .live_sampler import LiveSampler
 from .domain_analyzers import NetworkAnalyzer, KernelAnalyzer, NginxAnalyzer
 from .tracking import RunTracker
 from .orchestrator import FleetTarget, InstallerOrchestrator
+from .investigator import SREInvestigator
 from .constants import PROMPTS_DIR, DSPY_DIR, REPORTS_DIR, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT
 from . import rca_nodes
 from . import rca_analysis
+from . import investigation_node
 
 logger = logging.getLogger("slayMetrics.agent")
 
@@ -40,6 +42,7 @@ class RCAState(TypedDict):
     audit_output: str
     benchmark_results: str        # latest benchmark output (raw text)
     live_audit_output: str        # dynamic metrics collected during benchmark
+    investigation_notes: str      # accumulated findings from SRE investigation
     baseline_rps: dict            # {workload: float} from initial benchmark
     network_fixes: list
     network_summary: str          # chained → analyze_kernel
@@ -71,6 +74,7 @@ class RCAAgent:
         self.net_analyzer    = NetworkAnalyzer(config, PROMPTS_DIR)
         self.kernel_analyzer = KernelAnalyzer(config, PROMPTS_DIR)
         self.nginx_analyzer  = NginxAnalyzer(config, PROMPTS_DIR)
+        self.investigator     = SREInvestigator(config, PROMPTS_DIR)
         self.benchmark       = BenchmarkRunner(config)
         self.evaluator       = Evaluator()
         self.fix_reviewer    = FixEvaluatorLLM(config, PROMPTS_DIR)
@@ -127,6 +131,10 @@ class RCAAgent:
 
     @staticmethod
     def _route_benchmark(state: RCAState) -> str:
+        return "error" if state.get("error") else "investigate"
+
+    @staticmethod
+    def _route_investigate(state: RCAState) -> str:
         return "error" if state.get("error") else "analyze_network"
 
     def _route_remediate(self, state: RCAState) -> str:
@@ -145,6 +153,7 @@ class RCAAgent:
         g.add_node("run_audit",        lambda s: rca_nodes.run_audit(s, self))
         g.add_node("preflight_check", lambda s: rca_nodes.preflight_check(s, self))
         g.add_node("run_benchmark",   lambda s: rca_nodes.run_benchmark(s, self))
+        g.add_node("investigate",     lambda s: investigation_node.investigate(s, self))
         g.add_node("analyze_network", lambda s: rca_analysis.analyze_network(s, self))
         g.add_node("analyze_kernel",  lambda s: rca_analysis.analyze_kernel(s, self))
         g.add_node("analyze_nginx",   lambda s: rca_analysis.analyze_nginx(s, self))
@@ -156,6 +165,8 @@ class RCAAgent:
         g.add_conditional_edges("preflight_check", self._route_preflight,
                                 {"run_benchmark": "run_benchmark", "error": END})
         g.add_conditional_edges("run_benchmark",   self._route_benchmark,
+                                {"investigate": "investigate", "error": END})
+        g.add_conditional_edges("investigate",     self._route_investigate,
                                 {"analyze_network": "analyze_network", "error": END})
         g.add_edge("analyze_network", "analyze_kernel")
         g.add_edge("analyze_kernel",  "analyze_nginx")
@@ -173,7 +184,8 @@ class RCAAgent:
         self.tracker.start(session_id)
         initial: RCAState = {
             "session_id": session_id, "similar_cases": "", "live_audit_output": "",
-            "audit_output": "", "benchmark_results": "", "baseline_rps": {},
+            "audit_output": "", "benchmark_results": "", "investigation_notes": "",
+            "baseline_rps": {},
             "network_fixes": [], "network_summary": "",
             "kernel_fixes":  [], "kernel_summary":  "",
             "nginx_fixes":   [],

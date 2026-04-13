@@ -13,6 +13,13 @@ optimization:
   min_new_examples: 5       # trigger BootstrapFewShot after this many new examples
   max_bootstrap_demos: 3    # max few-shot demonstrations injected into prompt
 
+investigation:
+  enabled: true
+  max_iterations: 8
+  command_timeout_seconds: 30
+  max_output_bytes: 8192
+  max_commands_per_iteration: 5
+
 remediation:
   improvement_threshold_pct: -0.2  # reject only if priority workloads degrade by more than 0.2%
   degradation_tolerance_pct: -5.0  # max allowed degradation in non-priority workloads

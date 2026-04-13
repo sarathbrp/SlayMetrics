@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from .domain_analyzers import extract_audit_groups
+from .analyzer_utils import extract_audit_groups
 from .constants import REPORTS_DIR
 
 if TYPE_CHECKING:
@@ -28,6 +28,7 @@ def analyze_network(state: RCAState, agent: RCAAgent) -> RCAState:
     try:
         fixes, summary, in_tok, out_tok, elapsed = agent.net_analyzer.analyze(
             network_section, state.get("live_audit_output", ""), similar_cases,
+            investigation_notes=state.get("investigation_notes", ""),
             save_dir=save_dir,
         )
         calls = list(state.get("llm_calls", []))
@@ -59,6 +60,7 @@ def analyze_kernel(state: RCAState, agent: RCAAgent) -> RCAState:
         fixes, summary, in_tok, out_tok, elapsed = agent.kernel_analyzer.analyze(
             kernel_section, state.get("benchmark_results", ""),
             state.get("network_summary", ""), sc,
+            investigation_notes=state.get("investigation_notes", ""),
             save_dir=save_dir,
         )
         calls = list(state.get("llm_calls", []))
@@ -83,6 +85,7 @@ def analyze_nginx(state: RCAState, agent: RCAAgent) -> RCAState:
         fixes, in_tok, out_tok, elapsed = agent.nginx_analyzer.analyze(
             nginx_section, state.get("benchmark_results", ""),
             state.get("network_summary", ""), state.get("kernel_summary", ""), sc,
+            investigation_notes=state.get("investigation_notes", ""),
             save_dir=save_dir,
         )
         calls = list(state.get("llm_calls", []))
