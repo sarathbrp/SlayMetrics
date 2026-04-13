@@ -220,12 +220,18 @@ def _run_fleet(args: argparse.Namespace, config: Config, targets: list[FleetTarg
 
 
 def _run_single(args: argparse.Namespace, config: Config, targets: list[FleetTarget]) -> None:
-    if len(targets) > 1:
-        logger.warning(
-            "Found %d targets in config.yaml; running only first target in single-target mode. "
-            "Use --fleet to process all targets.", len(targets),
-        )
-    target = targets[0]
+    # In single-target mode, always use the target: section (with .env overrides)
+    # rather than the fleet targets: list.
+    target: FleetTarget = {
+        "name": "dut",
+        "group": "default",
+        "host": config.dut_host,
+        "user": config.dut_user,
+        "private_key_path": config.dut_key,
+        "password": config.orchestration_target_password,
+        "port": config.dut_port,
+        "connect_timeout_seconds": config.dut_timeout,
+    }
     logger.info("Single target mode: [%s %s]", target["name"], target["host"])
     with _target_env(target):
         agent = RCAAgent(config, audit_only=args.audit)
