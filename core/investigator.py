@@ -34,15 +34,57 @@ class InvestigationResult:
 def _format_structured_findings(findings: dict) -> str:
     """Convert structured findings dict into readable text for domain analyzers."""
     sections = []
-    labels = {
+    severity = findings.get("severity", "unknown")
+
+    # System blueprint
+    bp = findings.get("system_blueprint")
+    if bp and isinstance(bp, dict):
+        util = bp.get("capacity_utilization", "?")
+        sections.append(
+            f"[SYSTEM BLUEPRINT]\n"
+            f"  CPU: {bp.get('cpu_cores', '?')} cores | Memory: {bp.get('memory_gb', '?')}GB | "
+            f"NIC: {bp.get('nic_speed', '?')} | Disk: {bp.get('disk_type', '?')}\n"
+            f"  Theoretical max small RPS: {bp.get('theoretical_max_rps_small', '?')}\n"
+            f"  Actual small RPS: {bp.get('actual_rps_small', '?')}\n"
+            f"  Capacity utilization: {util}"
+        )
+
+    # Bottleneck ranking
+    ranking = findings.get("bottleneck_ranking")
+    if ranking and isinstance(ranking, list):
+        items = []
+        for i, b in enumerate(ranking, 1):
+            if isinstance(b, dict):
+                items.append(f"  {i}. [{b.get('severity', '?').upper()}] "
+                             f"{b.get('issue', '?')} — {b.get('impact', '?')}")
+            else:
+                items.append(f"  {i}. {b}")
+        sections.append("[BOTTLENECK RANKING]\n" + "\n".join(items))
+
+    # Fix dependency chain
+    chain = findings.get("fix_dependency_chain")
+    if chain and isinstance(chain, list):
+        sections.append("[FIX DEPENDENCY CHAIN]\n" + "\n".join(f"  {c}" for c in chain))
+
+    # Attack plan
+    plan = findings.get("attack_plan")
+    if plan and isinstance(plan, list):
+        items = []
+        for p in plan:
+            if isinstance(p, dict):
+                fixes = ", ".join(p.get("fixes", []))
+                items.append(f"  Phase {p.get('phase', '?')}: {p.get('label', '?')} → {fixes}")
+            else:
+                items.append(f"  {p}")
+        sections.append("[ATTACK PLAN]\n" + "\n".join(items))
+
+    # Remaining sections (cross_layer_violations, systemd_sabotage, etc.)
+    extra_labels = {
         "cross_layer_violations": "CROSS-LAYER VIOLATIONS",
         "systemd_sabotage": "SYSTEMD SABOTAGE",
-        "effective_nginx_values": "EFFECTIVE NGINX VALUES (server block wins)",
-        "kernel_issues": "KERNEL ISSUES",
-        "hardware_issues": "HARDWARE ISSUES",
-        "network_path": "NETWORK PATH",
+        "effective_nginx_values": "EFFECTIVE NGINX VALUES",
     }
-    for key, title in labels.items():
+    for key, title in extra_labels.items():
         val = findings.get(key)
         if not val:
             continue
@@ -53,7 +95,7 @@ def _format_structured_findings(findings: dict) -> str:
         else:
             items = [f"  {val}"]
         sections.append(f"[{title}]\n" + "\n".join(items))
-    severity = findings.get("severity", "unknown")
+
     header = f"=== SRE Investigation Report (severity: {severity}) ==="
     return header + "\n\n" + "\n\n".join(sections)
 
