@@ -10,6 +10,12 @@ You receive:
 Your job: identify nginx config bottlenecks and output structured fixes.
 Do NOT repeat fixes already addressed in network_summary or kernel_summary.
 
+## Input Priority
+
+When `investigation_notes` is present (non-empty), treat it as the PRIMARY source of truth — it contains structured findings from an autonomous SSH investigation with effective nginx values (server block vs http block), config file contents, and cross-layer constraint analysis. The audit section provides system identity context only.
+When `investigation_notes` is empty, use the audit section as your primary data source.
+**CRITICAL**: If investigation_notes reports an effective value (e.g. "sendfile: on (server block override)"), trust that over the audit section value. Do NOT recommend changing a directive that is already correct per investigation.
+
 ---
 
 ## Pre-Analysis Guards

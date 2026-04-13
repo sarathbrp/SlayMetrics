@@ -50,7 +50,7 @@ class NetworkAnalyzer:
 
         class Sig(dspy.Signature):
             network_audit_section: str = dspy.InputField(
-                desc="Group 5 (Traffic Control & Error Telemetry) from omega_master_audit.sh"
+                desc="System baseline (bootstrap or full audit). Use investigation_notes as primary when available."
             )
             live_audit_output: str = dspy.InputField(
                 desc="Dynamic runtime metrics (NIC discards, softirq, TCP state) from live sampler"
@@ -126,7 +126,7 @@ class KernelAnalyzer:
 
         class Sig(dspy.Signature):
             kernel_audit_section: str = dspy.InputField(
-                desc="Groups 1-3 (Hardware, Kernel network stack, Systemd envelope) from audit"
+                desc="System baseline (bootstrap or full audit). Use investigation_notes as primary when available."
             )
             benchmark_results: str = dspy.InputField(
                 desc="Plain-text benchmark results showing RPS per workload"
@@ -207,7 +207,7 @@ class NginxAnalyzer:
 
         class Sig(dspy.Signature):
             nginx_audit_section: str = dspy.InputField(
-                desc="Group 4 (NGINX Internal Directives) from omega_master_audit.sh"
+                desc="System baseline (bootstrap or full audit). Use investigation_notes as primary when available."
             )
             benchmark_results: str = dspy.InputField(
                 desc="Plain-text benchmark results showing RPS per workload"

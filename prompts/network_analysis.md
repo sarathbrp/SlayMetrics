@@ -7,6 +7,11 @@ You receive:
 
 Your job: identify network-level bottlenecks and output structured fixes + a 2-sentence summary.
 
+## Input Priority
+
+When `investigation_notes` is present (non-empty), treat it as the PRIMARY source of truth — it contains structured findings from an autonomous SSH investigation with cross-layer constraint analysis, systemd drop-in contents, and effective nginx values. The audit section provides system identity context only.
+When `investigation_notes` is empty, use the audit section as your primary data source.
+
 ---
 
 ## Detection Rules (check ALL of these)

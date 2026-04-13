@@ -9,7 +9,7 @@ from .audit import AuditRunner
 from .remediation_tools import TOOL_REGISTRY, NETWORK_TOOL_NAMES
 from .fix_applier import FixApplier
 from .display import Display
-from .constants import REPORTS_DIR, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT
+from .constants import REPORTS_DIR, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT, BOOTSTRAP_SCRIPT
 
 if TYPE_CHECKING:
     from .rca_agent import RCAAgent, RCAState
@@ -52,9 +52,17 @@ def run_audit(state: RCAState, agent: RCAAgent) -> RCAState:
         logger.info("Using pre-collected audit output (%d bytes) — skipping remote audit.",
                     len(precomputed))
         return {**state, "error": ""}
+    # Use lightweight bootstrap when investigation is enabled (SRE agent is primary);
+    # fall back to full static audit when investigation is disabled.
+    if agent.config.investigation_enabled:
+        script = BOOTSTRAP_SCRIPT
+        logger.info("Investigation enabled — using lightweight bootstrap audit.")
+    else:
+        script = AUDIT_SCRIPT
+        logger.info("Investigation disabled — using full static audit.")
     try:
         with agent._executor() as executor:
-            output = AuditRunner(executor, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT).deploy_and_run()
+            output = AuditRunner(executor, SCRIPTS_DIR, REMOTE_TMP, script).deploy_and_run()
         return {**state, "audit_output": output, "error": ""}
     except Exception as e:
         logger.error("run_audit failed: %s", e)
