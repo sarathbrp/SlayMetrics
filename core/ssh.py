@@ -85,3 +85,12 @@ class RemoteExecutor:
         finally:
             sftp.close()
         return True
+
+    def download(self, remote_path: str, local_path: Path) -> None:
+        """Download a remote file to local path."""
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        sftp = self._client.open_sftp()
+        try:
+            sftp.get(remote_path, str(local_path))
+        finally:
+            sftp.close()

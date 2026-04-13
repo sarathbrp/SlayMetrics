@@ -161,13 +161,32 @@ class Display:
 
     @staticmethod
     def run_summary(rca_report: str, applied: list, rejected: list,
-                    in_tok: int, out_tok: int) -> None:
+                    in_tok: int, out_tok: int,
+                    audit_only: bool = False, fixes: list[dict] | None = None) -> None:
         # Extract up to 200 words from the RCA report for the console summary
         words = rca_report.split()
         snippet = " ".join(words[:200])
         if len(words) > 200:
             snippet += " ..."
         logger.info("RCA Summary\n%s\n%s\n%s", "=" * 70, snippet, "=" * 70)
+
+        if audit_only:
+            directives = fixes or []
+            t = PrettyTable()
+            t.field_names = ["#", "Tier", "Tool", "Directive", "Target"]
+            t.align["#"] = "r"
+            t.align["Tier"] = "c"
+            t.align["Tool"] = "l"
+            t.align["Directive"] = "l"
+            t.align["Target"] = "l"
+            for i, fix in enumerate(directives, 1):
+                params = ", ".join(f"{k}={v}" for k, v in fix.get("params", {}).items())
+                t.add_row([i, fix.get("tier", "?"), fix.get("tool", ""),
+                           fix.get("description", ""), params])
+            logger.info("Audit Directives\n%s",
+                        t.get_string(title=f"Audit Directives — {len(directives)} suggested fixes | "
+                                           f"Tokens: {in_tok + out_tok:,}"))
+            return
 
         # Remediation results table
         t = PrettyTable()

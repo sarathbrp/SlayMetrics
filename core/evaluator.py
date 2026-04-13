@@ -5,6 +5,12 @@ logger = logging.getLogger("slayMetrics.evaluator")
 
 _WORKLOAD_RE = re.compile(r"\[\d+/\d+\]\s+(\w+):")
 _RPS_RE      = re.compile(r"rps=([\d.]+)")
+_RUNNING_WORKLOAD_RE = re.compile(r"Running Benchmark \[\d+/\d+\]:\s*(\w+)", re.IGNORECASE)
+_REQ_PER_SEC_RE = re.compile(r"Requests/sec:\s*([\d.]+)")
+_TABLE_ROW_RE = re.compile(
+    r"^\s*(homepage|small|medium|large|mixed)\s+\|\s+[^|]+\|\s+([\d.]+)\s+\|",
+    re.IGNORECASE,
+)
 
 # Workloads that must improve by >= threshold to keep a fix.
 # All other workloads must not degrade (improvement >= 0%).
@@ -21,10 +27,27 @@ class Evaluator:
         current_workload: str | None = None
 
         for line in benchmark_output.splitlines():
+            table_m = _TABLE_ROW_RE.search(line)
+            if table_m:
+                result[table_m.group(1).lower()] = float(table_m.group(2))
+                continue
+
+            run_m = _RUNNING_WORKLOAD_RE.search(line)
+            if run_m:
+                current_workload = run_m.group(1).lower()
+                continue
+
             m = _WORKLOAD_RE.search(line)
             if m:
                 current_workload = m.group(1)
                 continue
+
+            req_m = _REQ_PER_SEC_RE.search(line)
+            if req_m and current_workload:
+                result[current_workload] = float(req_m.group(1))
+                current_workload = None
+                continue
+
             rps_m = _RPS_RE.search(line)
             if rps_m and current_workload:
                 result[current_workload] = float(rps_m.group(1))

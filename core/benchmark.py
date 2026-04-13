@@ -49,8 +49,13 @@ class BenchmarkRunner:
 
         output = result.stdout.strip()
         if result.returncode != 0:
-            logger.warning("Benchmark exited %d. stderr: %s",
-                           result.returncode, result.stderr.strip())
+            stderr = result.stderr.strip()
+            logger.error("Benchmark exited %d. stderr: %s",
+                         result.returncode, stderr)
+            detail = output or stderr or "no output"
+            raise RuntimeError(
+                f"Benchmark failed with exit code {result.returncode}: {detail}"
+            )
 
         if not output:
             raise RuntimeError(
@@ -91,8 +96,13 @@ class BenchmarkRunner:
 
         output = result.stdout.strip()
         if result.returncode != 0:
-            logger.warning("Final benchmark exited %d. stderr: %s",
-                           result.returncode, result.stderr.strip())
+            stderr = result.stderr.strip()
+            logger.error("Final benchmark exited %d. stderr: %s",
+                         result.returncode, stderr)
+            detail = output or stderr or "no output"
+            raise RuntimeError(
+                f"Final benchmark failed with exit code {result.returncode}: {detail}"
+            )
         if not output:
             raise RuntimeError(
                 f"Final benchmark produced no output. stderr: {result.stderr.strip()}"

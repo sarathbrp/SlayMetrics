@@ -1,0 +1,83 @@
+#!/bin/bash
+# Fast benchmark script - 2.5 min total (halved durations for rapid iteration)
+# Original: homepage=30s, others=60s (~5 min)
+# Fast:     homepage=15s, others=30s (~2.5 min)
+
+set -e
+
+CONTESTANT_NAME="${1:-anonymous}"
+ALL_WORKLOADS=("homepage" "small" "medium" "large" "mixed")
+
+declare -A WORKLOAD_SETTINGS
+WORKLOAD_SETTINGS["homepage"]="16 1000 15s"
+WORKLOAD_SETTINGS["small"]="16 1000 30s"
+WORKLOAD_SETTINGS["medium"]="16 300 30s"
+WORKLOAD_SETTINGS["large"]="16 100 30s"
+WORKLOAD_SETTINGS["mixed"]="16 100 30s"
+
+if [ -z "$TARGET_HOST" ]; then
+    if [ -f /root/.hackathon_env ]; then source /root/.hackathon_env; fi
+fi
+if [ -z "$TARGET_HOST" ]; then
+    TARGET_HOST=$(grep -A 10 '^\[test_machines\]' /etc/ansible/hosts 2>/dev/null | grep -v '^\[' | grep -v '^$' | head -1 | awk '{print $2}' | cut -d= -f2)
+fi
+if [ -z "$TARGET_HOST" ]; then
+    TARGET_HOST=$(grep 'test-machine' /etc/hosts 2>/dev/null | awk '{print $1}' | head -1)
+fi
+
+RESULTS_DIR="${RESULTS_DIR:-/root/hackathon-results}"
+
+if [ -z "$CONTESTANT_NAME" ]; then echo "Contestant name cannot be empty"; exit 1; fi
+if ! echo "$CONTESTANT_NAME" | grep -qE '^[a-zA-Z0-9_-]+$'; then echo "Invalid contestant name"; exit 1; fi
+if [ -z "$TARGET_HOST" ]; then echo "TARGET_HOST not set"; exit 1; fi
+
+echo "Contestant: $CONTESTANT_NAME (FAST mode: ~2.5 min)"
+echo "Target: $TARGET_HOST"
+mkdir -p "$RESULTS_DIR"
+
+if ! command -v wrk &> /dev/null; then echo "wrk not installed"; exit 1; fi
+if ! curl -s -o /dev/null -w "%{http_code}" "http://${TARGET_HOST}/" | grep -q "200\|403"; then echo "Cannot reach target"; exit 1; fi
+
+TOTAL_WORKLOADS=${#ALL_WORKLOADS[@]}
+CURRENT=0
+
+for WORKLOAD in "${ALL_WORKLOADS[@]}"; do
+    CURRENT=$((CURRENT + 1))
+    read THREADS CONNECTIONS DURATION <<< "${WORKLOAD_SETTINGS[$WORKLOAD]}"
+    echo "[$CURRENT/$TOTAL_WORKLOADS] $WORKLOAD: ${THREADS}t ${CONNECTIONS}c ${DURATION}"
+
+    TIMESTAMP=$(date +%s)
+    RAW_OUTPUT="${RESULTS_DIR}/${CONTESTANT_NAME}_${WORKLOAD}_${TIMESTAMP}_raw.txt"
+    JSON_OUTPUT="${RESULTS_DIR}/${CONTESTANT_NAME}_${WORKLOAD}.json"
+
+    if [ "$WORKLOAD" = "homepage" ]; then
+        wrk -t${THREADS} -c${CONNECTIONS} -d${DURATION} --latency "http://${TARGET_HOST}/" | tee "$RAW_OUTPUT"
+    else
+        LUA_SCRIPT="/root/hackathon-tools/${WORKLOAD}.lua"
+        wrk -t${THREADS} -c${CONNECTIONS} -d${DURATION} --latency -s "$LUA_SCRIPT" "http://${TARGET_HOST}/" | tee "$RAW_OUTPUT"
+    fi
+
+    REQ_PER_SEC=$(grep "Requests/sec:" "$RAW_OUTPUT" | awk '{print $2}')
+    LATENCY_AVG=$(grep "Latency" "$RAW_OUTPUT" | awk '{print $2}')
+
+    if command -v python3 &> /dev/null && [ -f "/root/hackathon-tools/parse_wrk_output.py" ]; then
+        python3 /root/hackathon-tools/parse_wrk_output.py "$RAW_OUTPUT" > "${RAW_OUTPUT}.json"
+        cat > "$JSON_OUTPUT" << EOF
+{
+  "contestant": "$CONTESTANT_NAME",
+  "workload": "$WORKLOAD",
+  "timestamp": "$(date -Iseconds)",
+  "timestamp_epoch": $TIMESTAMP,
+  "target_host": "$TARGET_HOST",
+  "test_config": {"workload": "$WORKLOAD", "duration": "$DURATION", "threads": $THREADS, "connections": $CONNECTIONS},
+  "results": $(cat "${RAW_OUTPUT}.json")
+}
+EOF
+        rm "${RAW_OUTPUT}.json"
+    fi
+
+    echo "  rps=$REQ_PER_SEC latency=$LATENCY_AVG"
+    if [ $CURRENT -lt $TOTAL_WORKLOADS ]; then sleep 5; fi
+done
+
+echo "Done."

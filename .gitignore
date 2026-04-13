@@ -36,3 +36,10 @@ facts/default_nginx.conf
 trace-*.json
 CLAUDE.md
 
+# Runtime artifacts
+commands.txt
+mlflow.db
+logs/
+dspy_data/
+rca_reports/
+

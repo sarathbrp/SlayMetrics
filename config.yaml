@@ -31,17 +31,78 @@ target:
   mode: ssh
   host: 172.21.90.178                    # override: SLAY_DUT_HOST
   user: root                             # override: SLAY_DUT_USER
-  private_key_path: /root/.ssh/id_ed25519  # override: SLAY_DUT_KEY
+  private_key_path: /path/to/dut_key              # override: SLAY_DUT_KEY
   port: 22                               # override: SLAY_DUT_PORT
   connect_timeout_seconds: 30            # override: SLAY_DUT_TIMEOUT
+
+orchestration:
+  max_parallel_audits: 10                # fleet mode: audit fan-out parallelism
+  # Optional shared password for installer -> target SSH in orchestrate mode.
+  # Prefer env var SLAY_TARGET_PASSWORD or CLI --target-password to avoid storing secrets.
+  target_password: ""
+  installer:
+    user: root                            # Mac -> installer SSH user (orchestrate mode)
+    private_key_path: /path/to/installer_key        # Mac -> installer SSH key path
+    port: 22
+    connect_timeout_seconds: 30
+    remote_tmp: /tmp/slaymetrics_orchestrate
+    auto_install_wrk: true                # auto-install wrk on installer if missing
+
+targets:
+  # group is optional; default is inferred from name prefix before last '-'
+  # automationgateway (5 nodes)
+  - name: automationgateway-0
+    host: 10.1.89.79
+  - name: automationgateway-1
+    host: 10.1.91.251
+  - name: automationgateway-2
+    host: 10.1.89.200
+  - name: automationgateway-3
+    host: 10.1.88.242
+  - name: automationgateway-4
+    host: 10.1.90.159
+
+  # automationcontroller (10 nodes)
+  - name: automationcontroller-0
+    host: 10.1.37.59
+  - name: automationcontroller-1
+    host: 10.1.38.143
+  - name: automationcontroller-2
+    host: 10.1.38.87
+  - name: automationcontroller-3
+    host: 10.1.37.120
+  - name: automationcontroller-4
+    host: 10.1.38.1
+  - name: automationcontroller-5
+    host: 10.1.38.217
+  - name: automationcontroller-6
+    host: 10.1.36.32
+  - name: automationcontroller-7
+    host: 10.1.39.153
+  - name: automationcontroller-8
+    host: 10.1.36.157
+  - name: automationcontroller-9
+    host: 10.1.37.3
+
+  # automationedacontroller (3 nodes)
+  - name: automationedacontroller-0
+    host: 10.1.91.191
+  - name: automationedacontroller-1
+    host: 10.1.91.15
+  - name: automationedacontroller-2
+    host: 10.1.91.149
+
+  # automationhub (1 node)
+  - name: automationhub-0
+    host: 10.1.88.193
 
 benchmark:
   runner:
     mode: local
   contestant_name: slaymetrics 
-  script_path: /root/hackathon-tools/benchmark.sh
-  compare_script_path: /root/hackathon-tools/compare-results.sh
-  results_directory: /root/hackathon-results
+  script_path: scripts/benchmark/benchmark.sh
+  compare_script_path: scripts/benchmark/compare-results.sh
+  results_directory: scripts/benchmark/results
   cooling_period_seconds: 30
   final_benchmark_duration_minutes: 5
   collect_live_audit: true     # collect dynamic runtime metrics during benchmark

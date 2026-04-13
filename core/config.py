@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -161,3 +162,123 @@ class Config:
     @property
     def log_level(self) -> str:
         return self._cfg.get("log_level", "INFO").upper()
+
+    # --- fleet/orchestration ---
+    @property
+    def orchestration_max_parallel_audits(self) -> int:
+        return int(self._cfg.get("orchestration", {}).get("max_parallel_audits", 10))
+
+    @property
+    def orchestration_target_password(self) -> str:
+        return str(
+            os.environ.get(
+                "SLAY_TARGET_PASSWORD",
+                self._cfg.get("orchestration", {}).get("target_password", ""),
+            )
+        )
+
+    @property
+    def orchestration_installer_user(self) -> str:
+        return str(
+            self._cfg.get("orchestration", {})
+            .get("installer", {})
+            .get("user", "root")
+        )
+
+    @property
+    def orchestration_installer_key(self) -> str:
+        return str(
+            self._cfg.get("orchestration", {})
+            .get("installer", {})
+            .get("private_key_path", self.dut_key)
+        )
+
+    @property
+    def orchestration_installer_port(self) -> int:
+        return int(
+            self._cfg.get("orchestration", {})
+            .get("installer", {})
+            .get("port", 22)
+        )
+
+    @property
+    def orchestration_installer_timeout(self) -> int:
+        return int(
+            self._cfg.get("orchestration", {})
+            .get("installer", {})
+            .get("connect_timeout_seconds", 30)
+        )
+
+    @property
+    def orchestration_installer_remote_tmp(self) -> str:
+        return str(
+            self._cfg.get("orchestration", {})
+            .get("installer", {})
+            .get("remote_tmp", "/tmp/slaymetrics_orchestrate")
+        )
+
+    @property
+    def orchestration_installer_auto_install_wrk(self) -> bool:
+        return bool(
+            self._cfg.get("orchestration", {})
+            .get("installer", {})
+            .get("auto_install_wrk", True)
+        )
+
+    @property
+    def target_specs(self) -> list[dict[str, Any]]:
+        """Return normalized target specs for single or fleet mode.
+
+        Uses top-level `targets:` list when present; otherwise falls back to
+        the single `target:` section (including env-var overrides).
+        """
+        defaults = {
+            "host": self.dut_host,
+            "user": self.dut_user,
+            "private_key_path": self.dut_key,
+            "port": self.dut_port,
+            "connect_timeout_seconds": self.dut_timeout,
+        }
+
+        raw_targets = self._cfg.get("targets")
+        if raw_targets is None:
+            raw_targets = [{
+                "name": "default",
+                "host": defaults["host"],
+                "user": defaults["user"],
+                "private_key_path": defaults["private_key_path"],
+                "port": defaults["port"],
+                "connect_timeout_seconds": defaults["connect_timeout_seconds"],
+            }]
+
+        if not isinstance(raw_targets, list):
+            raise ValueError("config.yaml field 'targets' must be a list when provided")
+
+        specs: list[dict[str, Any]] = []
+        for idx, raw in enumerate(raw_targets, 1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"targets[{idx - 1}] must be a mapping, got {type(raw).__name__}")
+
+            host = str(raw.get("host", defaults["host"])).strip()
+            if not host:
+                raise ValueError(f"targets[{idx - 1}] is missing required 'host'")
+
+            user = str(raw.get("user", defaults["user"])).strip()
+            key_path = str(raw.get("private_key_path", defaults["private_key_path"])).strip()
+            port = int(raw.get("port", defaults["port"]))
+            timeout = int(raw.get("connect_timeout_seconds", defaults["connect_timeout_seconds"]))
+            name = str(raw.get("name", "")).strip() or host
+            inferred_group = name.rsplit("-", 1)[0] if "-" in name else "default"
+            group = str(raw.get("group", inferred_group)).strip() or inferred_group
+
+            specs.append({
+                "name": f"{name}-{idx}" if any(t["name"] == name for t in specs) else name,
+                "group": group,
+                "host": host,
+                "user": user,
+                "private_key_path": key_path,
+                "password": str(raw.get("password", self.orchestration_target_password)),
+                "port": port,
+                "connect_timeout_seconds": timeout,
+            })
+        return specs

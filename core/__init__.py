@@ -15,6 +15,8 @@ from .memory import SemanticMemory
 from .live_sampler import LiveSampler
 from .domain_analyzers import NetworkAnalyzer, KernelAnalyzer, NginxAnalyzer, extract_audit_groups
 from .tracking import RunTracker
+from .orchestrator import FleetTarget, InstallerOrchestrator
+from .rca_agent import RCAAgent, RCAState
 
 __all__ = [
     "Config",
@@ -39,4 +41,8 @@ __all__ = [
     "NginxAnalyzer",
     "extract_audit_groups",
     "RunTracker",
+    "FleetTarget",
+    "InstallerOrchestrator",
+    "RCAAgent",
+    "RCAState",
 ]

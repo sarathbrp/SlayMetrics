@@ -101,6 +101,23 @@ Samples saved to `rca_reports/<session-id>/live_samples.csv`. Pandas analysis co
 target:
   connect_timeout_seconds: 30  # SSH timeout per attempt (3 retries with 5s backoff)
 
+orchestration:
+  max_parallel_audits: 10      # --fleet: static audits fan out in parallel
+  target_password: ""          # optional installer->target SSH password
+  installer:
+    user: root                 # Mac -> installer SSH user
+    private_key_path: /path/to/key
+    port: 22
+    auto_install_wrk: true     # auto-install wrk on installer if missing
+
+targets:                       # optional inventory for --fleet mode
+  - name: node01
+    host: 172.21.90.178
+  - name: node02
+    host: 172.21.90.179
+    # group is optional; if omitted, inferred from name prefix before the last '-'
+    # group: automationcontroller
+
 remediation:
   improvement_threshold_pct: -0.2   # reject only if priority workloads degrade > 0.2%
   degradation_tolerance_pct: -5.0   # non-priority workloads noise floor
@@ -166,6 +183,33 @@ cp .env.example .env
 
 # 4. Run
 python agent.py
+
+# Audit-only mode (no fix application; RCA + recommended fixes only)
+python agent.py --audit
+
+# Fleet mode: audits in parallel, benchmark/RCA sequential per target
+python agent.py --fleet
+
+# Fleet + audit-only directives (no fix apply on any target)
+python agent.py --fleet --audit
+
+# Fleet via installer (required flags for installer-orchestrated execution)
+python agent.py --fleet --audit --orchestrate --installer <installer-ip>
+
+# Force password auth from installer -> selected targets
+python agent.py --fleet --audit --orchestrate --installer <installer-ip> --target-password '<password>'
+
+# Choose only one group from CLI
+python agent.py --fleet --audit --orchestrate --installer <installer-ip> --target-group automationcontroller
+
+# Choose specific nodes from CLI (name or IP)
+python agent.py --fleet --audit --orchestrate --installer <installer-ip> --target automationhub-0,10.1.91.191
+
+# List available groups/nodes from config
+python agent.py --list-targets
+
+# Remediation via installer requires explicit confirmation flag
+python agent.py --fleet --orchestrate --installer <installer-ip> --confirm-remediation
 ```
 
 ---
