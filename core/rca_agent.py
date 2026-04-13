@@ -29,6 +29,7 @@ from .tracking import RunTracker
 from .orchestrator import FleetTarget, InstallerOrchestrator
 from .investigator import SREInvestigator
 from .constants import PROMPTS_DIR, DSPY_DIR, REPORTS_DIR, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT
+from .comparison import run_comparisons
 from . import rca_nodes
 from . import rca_analysis
 from . import investigation_node
@@ -285,4 +286,8 @@ class RCAAgent:
             logger.info("Final report: %s", report_path)
         except Exception as e:
             logger.error("Failed to generate final report: %s", e)
+
+        # Run benchmark comparison against baseline and vanilla
+        run_comparisons(self.config)
+
         return result
