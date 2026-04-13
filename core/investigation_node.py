@@ -120,6 +120,33 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
         logger.error("Investigation failed: %s", e)
         conclusion = f"[ERROR] Investigation aborted: {e}"
 
+    # If the LLM never signaled done, force a final summary call
+    if not conclusion and findings:
+        logger.info("Investigation hit max iterations without structured conclusion — forcing summary.")
+        try:
+            summary_prompt = (
+                "\n---\n".join(findings) +
+                "\n\n=== FINAL ITERATION: You MUST now produce the structured report. "
+                "Set done=true and return the findings object with system_blueprint, "
+                "bottleneck_ranking, fix_dependency_chain, attack_plan, "
+                "cross_layer_violations, systemd_sabotage, effective_nginx_values, "
+                "and severity. Do NOT request more commands. ==="
+            )
+            result, in_tok, out_tok, elapsed = agent.investigator.step(
+                audit_baseline=state["audit_output"],
+                benchmark_results=state.get("benchmark_results", ""),
+                live_audit_output=state.get("live_audit_output", ""),
+                previous_findings=summary_prompt,
+            )
+            total_in += in_tok
+            total_out += out_tok
+            total_elapsed += elapsed
+            if result.findings:
+                conclusion = result.findings
+                logger.info("Forced summary produced (%d bytes)", len(conclusion))
+        except Exception as e:
+            logger.warning("Forced summary call failed: %s", e)
+
     # Prefer the structured conclusion over raw command dumps.
     # Raw findings are still saved per-iteration in JSON files for debugging.
     notes = conclusion if conclusion else "\n---\n".join(findings)
