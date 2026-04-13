@@ -13,7 +13,8 @@ from .report import ReportWriter
 from .optimizer import FeedbackOptimizer
 from .memory import SemanticMemory
 from .live_sampler import LiveSampler
-from .domain_analyzers import NetworkAnalyzer, KernelAnalyzer, NginxAnalyzer, extract_audit_groups
+from .domain_analyzers import NetworkAnalyzer, KernelAnalyzer, NginxAnalyzer
+from .analyzer_utils import extract_audit_groups
 from .tracking import RunTracker
 from .orchestrator import FleetTarget, InstallerOrchestrator
 from .rca_agent import RCAAgent, RCAState
