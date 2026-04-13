@@ -70,7 +70,18 @@ def preflight_check(state: RCAState, agent: RCAAgent) -> RCAState:
             active, _ = executor.run("systemctl is-active nginx.service 2>/dev/null || echo unknown")
             active = active.strip()
             if active == "active":
-                logger.info("Preflight: nginx is active — proceeding to benchmark.")
+                # Verify nginx is actually serving HTTP
+                http_check, _ = executor.run(
+                    "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 http://127.0.0.1/ 2>/dev/null || echo 000"
+                )
+                http_code = http_check.strip()
+                if http_code in ("200", "403", "301", "302", "304"):
+                    logger.info("Preflight: nginx is active and serving HTTP (%s).", http_code)
+                    return {**state, "error": ""}
+                logger.warning(
+                    "Preflight: nginx is active but HTTP check returned %s — may have config issues.",
+                    http_code,
+                )
                 return {**state, "error": ""}
 
             logger.warning("Preflight: nginx is NOT active (state: %s) — diagnosing...", active)
@@ -131,11 +142,18 @@ def preflight_check(state: RCAState, agent: RCAAgent) -> RCAState:
             executor.run("systemctl daemon-reload")
             executor.run("systemctl restart nginx.service")
             verify, _ = executor.run("systemctl is-active nginx.service 2>/dev/null || echo failed")
-            if verify.strip() == "active":
-                logger.info("Preflight: nginx recovered successfully after fixes.")
-                return {**state, "error": ""}
-            else:
+            if verify.strip() != "active":
                 return {**state, "error": f"Preflight: nginx still not active after recovery attempt (state: {verify.strip()})"}
+
+            # Verify HTTP is actually reachable after recovery
+            http_check, _ = executor.run(
+                "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 http://127.0.0.1/ 2>/dev/null || echo 000"
+            )
+            http_code = http_check.strip()
+            if http_code in ("000",):
+                return {**state, "error": f"Preflight: nginx is active but not serving HTTP (code: {http_code})"}
+            logger.info("Preflight: nginx recovered successfully and serving HTTP (%s).", http_code)
+            return {**state, "error": ""}
 
     except Exception as e:
         logger.error("preflight_check failed: %s", e)
