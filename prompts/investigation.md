@@ -18,6 +18,7 @@ Before investigating problems, understand WHAT you are optimizing. From the boot
 4. **Run initial commands** to fill in what the bootstrap doesn't show:
    - `systemctl show nginx.service -p CPUQuotaPerSecUSec -p LimitNOFILE -p LimitNPROC -p LimitMEMLOCK -p LimitSTACK -p LimitNICE -p LimitSIGPENDING -p MemoryMax -p MemoryHigh -p CPUWeight -p Nice -p IOWeight -p OOMScoreAdjust -p TasksMax` (check ALL resource limits — any can be used to throttle)
    - `ls -1 /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null && cat /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null` (read drop-in contents in same command)
+   - `cat /etc/systemd/system.conf.d/*.conf 2>/dev/null || echo "no system-wide defaults"` (check global DefaultLimit* overrides)
    - `nginx -T 2>/dev/null | head -30`
    - `sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog fs.nr_open fs.file-max`
 
