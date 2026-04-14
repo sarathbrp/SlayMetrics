@@ -69,3 +69,5 @@ Fixes MUST be tiered in this order:
 16. Directive inheritance: child context (server/location) OVERRIDES parent (http) — values are NOT added together. When same directive appears in both http{} and server{}, only the server{} value applies
 17. NEVER disable proxy_buffering unless specifically required (long polling). Disabling it breaks rate limiting, caching, and degrades performance
 18. `sendfile` is automatically disabled by nginx when content-changing filters (gzip, sub_filter) are active in the same context — this is expected behavior, not a bug
+19. On multi-core systems (>4 cores), `listen 80 reuseport;` enables SO_REUSEPORT socket sharding — each worker gets its own socket listener, eliminating kernel accept lock contention. This makes accept_mutex redundant (automatically disabled when reuseport is set). Combine with backlog: `listen 80 reuseport backlog=65535;`
+20. The `listen` directive parameters (reuseport, backlog) are in the server{} block (conf.d/), NOT in nginx.conf main/http context
