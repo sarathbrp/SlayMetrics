@@ -5,6 +5,8 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from .llm_response_parser import extract_json, extract_json_or_text
+
 logger = logging.getLogger("slayMetrics.investigator")
 
 
@@ -122,58 +124,61 @@ def _extract_from_reasoning(reasoning: str, field_name: str) -> str:
 
 def parse_response(raw: str) -> InvestigationResult:
     """Parse LLM JSON response into InvestigationResult."""
-    raw = _strip_code_fence(raw)
-    try:
-        data = json.loads(raw)
-        findings_raw = data.get("findings", "")
-        if isinstance(findings_raw, dict):
-            findings_text = format_structured_findings(findings_raw)
-        else:
-            findings_text = str(findings_raw)
-
-        reasoning = data.get("reasoning", "")
-        hypothesis = data.get("hypothesis", "")
-        evidence = data.get("evidence", "")
-        plan = data.get("plan", "")
-
-        if not hypothesis and reasoning:
-            hypothesis = _extract_from_reasoning(reasoning, "hypothesis")
-        if not evidence and reasoning:
-            evidence = _extract_from_reasoning(reasoning, "evidence")
-        if not plan and reasoning:
-            plan = _extract_from_reasoning(reasoning, "plan")
-
-        return InvestigationResult(
-            done=bool(data.get("done", False)),
-            commands=data.get("commands", []),
-            hypothesis=hypothesis, evidence=evidence, plan=plan,
-            reasoning=reasoning, findings=findings_text,
-            layer=data.get("layer", ""),
-        )
-    except (json.JSONDecodeError, AttributeError):
+    data = extract_json(raw)
+    if not isinstance(data, dict):
+        # Last resort: use raw text as findings rather than discarding
+        text = extract_json_or_text(raw)
+        if isinstance(text, str) and len(text) > 20:
+            logger.warning("Investigation response not JSON — using raw text as findings")
+            return InvestigationResult(done=False, findings=text)
         logger.warning("Failed to parse investigation response, treating as done")
         return InvestigationResult(done=True, findings="(parse error — investigation ended)")
+
+    findings_raw = data.get("findings", "")
+    if isinstance(findings_raw, dict):
+        findings_text = format_structured_findings(findings_raw)
+    else:
+        findings_text = str(findings_raw)
+
+    reasoning = data.get("reasoning", "")
+    hypothesis = data.get("hypothesis", "")
+    evidence = data.get("evidence", "")
+    plan = data.get("plan", "")
+
+    if not hypothesis and reasoning:
+        hypothesis = _extract_from_reasoning(reasoning, "hypothesis")
+    if not evidence and reasoning:
+        evidence = _extract_from_reasoning(reasoning, "evidence")
+    if not plan and reasoning:
+        plan = _extract_from_reasoning(reasoning, "plan")
+
+    return InvestigationResult(
+        done=bool(data.get("done", False)),
+        commands=data.get("commands", []),
+        hypothesis=hypothesis, evidence=evidence, plan=plan,
+        reasoning=reasoning, findings=findings_text,
+        layer=data.get("layer", ""),
+    )
 
 
 def parse_plan(raw: str) -> InvestigationPlan:
     """Parse the planning LLM response into an InvestigationPlan."""
-    raw = _strip_code_fence(raw)
-    try:
-        data = json.loads(raw)
-        blueprint = data.get("system_blueprint", {})
-        raw_plan = data.get("investigation_plan", [])
-        hypotheses = []
-        for item in raw_plan:
-            if isinstance(item, dict):
-                hypotheses.append(PlannedHypothesis(
-                    priority=item.get("priority", 99),
-                    hypothesis=item.get("hypothesis", ""),
-                    estimated_impact=item.get("estimated_impact", ""),
-                    evidence_so_far=item.get("evidence_so_far", ""),
-                    commands_to_verify=item.get("commands_to_verify", []),
-                ))
-        hypotheses.sort(key=lambda h: h.priority)
-        return InvestigationPlan(system_blueprint=blueprint, hypotheses=hypotheses)
-    except (json.JSONDecodeError, AttributeError):
+    data = extract_json(raw)
+    if not isinstance(data, dict):
         logger.warning("Failed to parse investigation plan")
         return InvestigationPlan()
+
+    blueprint = data.get("system_blueprint", {})
+    raw_plan = data.get("investigation_plan", [])
+    hypotheses = []
+    for item in raw_plan:
+        if isinstance(item, dict):
+            hypotheses.append(PlannedHypothesis(
+                priority=item.get("priority", 99),
+                hypothesis=item.get("hypothesis", ""),
+                estimated_impact=item.get("estimated_impact", ""),
+                evidence_so_far=item.get("evidence_so_far", ""),
+                commands_to_verify=item.get("commands_to_verify", []),
+            ))
+    hypotheses.sort(key=lambda h: h.priority)
+    return InvestigationPlan(system_blueprint=blueprint, hypotheses=hypotheses)

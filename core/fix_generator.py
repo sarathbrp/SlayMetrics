@@ -25,25 +25,22 @@ def _parse_fix_groups(raw: str) -> tuple[list[dict], str]:
     Each group: {"group": N, "label": "...", "rationale": "...", "fixes": [...]}
     Falls back to flat fixes list if fix_groups key is missing.
     """
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        raw = "\n".join(lines[1:-1]) if len(lines) > 2 else ""
-    try:
-        data = json.loads(raw)
-        summary = data.get("rca_summary", "") if isinstance(data, dict) else ""
-        groups = data.get("fix_groups", [])
-        if groups:
-            return groups, summary
-        # Fallback: flat fixes list → wrap in single group
-        flat = data.get("fixes", [])
-        if flat:
-            return [{"group": 1, "label": "all fixes", "rationale": "flat list",
-                     "fixes": flat}], summary
-        return [], summary
-    except (json.JSONDecodeError, AttributeError):
+    from .llm_response_parser import extract_json
+    data = extract_json(raw)
+    if not isinstance(data, dict):
         logger.warning("Failed to parse fix generator response")
         return [], ""
+
+    summary = data.get("rca_summary", "")
+    groups = data.get("fix_groups", [])
+    if groups:
+        return groups, summary
+    # Fallback: flat fixes list → wrap in single group
+    flat = data.get("fixes", [])
+    if flat:
+        return [{"group": 1, "label": "all fixes", "rationale": "flat list",
+                 "fixes": flat}], summary
+    return [], summary
 
 
 class FixGenerator:
