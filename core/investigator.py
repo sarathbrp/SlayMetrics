@@ -153,6 +153,9 @@ class SREInvestigator:
                     "Empty on first iteration. Build on these — do not repeat."
                 )
             )
+            performance_rules: str = dspy.InputField(
+                desc="Mandatory performance rules — constraint chains, fix ordering, hard rules. MUST follow."
+            )
             response_json: str = dspy.OutputField(
                 desc=(
                     'JSON: {"layer": "1-5 or cross-layer", "commands": ["cmd1", ...], '
@@ -169,6 +172,7 @@ class SREInvestigator:
         benchmark_results: str,
         live_audit_output: str,
         previous_findings: str,
+        performance_rules: str = "",
     ) -> tuple[InvestigationResult, int, int, float]:
         """Run one investigation turn.
 
@@ -183,6 +187,7 @@ class SREInvestigator:
             benchmark_results=benchmark_results,
             live_audit_output=live_audit_output,
             previous_findings=previous_findings or "First iteration — no prior findings.",
+            performance_rules=performance_rules,
         )
         elapsed = (datetime.now() - t0).total_seconds()
         result = _parse_response(pred.response_json)

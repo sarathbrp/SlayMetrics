@@ -71,6 +71,7 @@ class RCAAgent:
         self.audit_only      = audit_only
         self.orchestrator    = orchestrator
         self.target          = target
+        self.perf_rules      = (PROMPTS_DIR / "performance_rules.md").read_text()
         self.analyzer        = RCAAnalyzer(config, PROMPTS_DIR, DSPY_DIR)
         self.net_analyzer    = NetworkAnalyzer(config, PROMPTS_DIR)
         self.kernel_analyzer = KernelAnalyzer(config, PROMPTS_DIR)

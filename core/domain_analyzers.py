@@ -61,6 +61,9 @@ class NetworkAnalyzer:
             investigation_notes: str = dspy.InputField(
                 desc="Findings from autonomous SRE investigation (SSH diagnostics). May be empty."
             )
+            performance_rules: str = dspy.InputField(
+                desc="Mandatory performance rules — constraint chains, fix ordering, hard rules. MUST follow."
+            )
             result_json: str = dspy.OutputField(
                 desc=(
                     f'JSON: {{"fixes": [...], "summary": "2-sentence paragraph"}}. '
@@ -74,6 +77,7 @@ class NetworkAnalyzer:
     @_trace
     def analyze(self, network_section: str, live_audit: str,
                 similar_cases: str, investigation_notes: str = "",
+                performance_rules: str = "",
                 save_dir: Path | None = None) -> tuple[list[dict], str, int, int, float]:
         """Returns (fixes, summary, input_tokens, output_tokens)."""
         if self._module is None:
@@ -85,6 +89,7 @@ class NetworkAnalyzer:
             live_audit_output=live_audit,
             similar_cases=similar_cases,
             investigation_notes=investigation_notes,
+            performance_rules=performance_rules,
         )
         elapsed = (datetime.now() - t0).total_seconds()
         fixes, summary = parse_fixes_json(pred.result_json)
@@ -140,6 +145,9 @@ class KernelAnalyzer:
             investigation_notes: str = dspy.InputField(
                 desc="Findings from autonomous SRE investigation (SSH diagnostics). May be empty."
             )
+            performance_rules: str = dspy.InputField(
+                desc="Mandatory performance rules — constraint chains, fix ordering, hard rules. MUST follow."
+            )
             result_json: str = dspy.OutputField(
                 desc=(
                     f'JSON: {{"fixes": [...], "summary": "2-sentence paragraph"}}. '
@@ -154,6 +162,7 @@ class KernelAnalyzer:
     def analyze(self, kernel_section: str, benchmark_results: str,
                 network_summary: str, similar_cases: str,
                 investigation_notes: str = "",
+                performance_rules: str = "",
                 save_dir: Path | None = None) -> tuple[list[dict], str, int, int, float]:
         """Returns (fixes, summary, input_tokens, output_tokens)."""
         if self._module is None:
@@ -166,6 +175,7 @@ class KernelAnalyzer:
             network_summary=network_summary,
             similar_cases=similar_cases,
             investigation_notes=investigation_notes,
+            performance_rules=performance_rules,
         )
         elapsed = (datetime.now() - t0).total_seconds()
         fixes, summary = parse_fixes_json(pred.result_json)
@@ -224,6 +234,9 @@ class NginxAnalyzer:
             investigation_notes: str = dspy.InputField(
                 desc="Findings from autonomous SRE investigation (SSH diagnostics). May be empty."
             )
+            performance_rules: str = dspy.InputField(
+                desc="Mandatory performance rules — constraint chains, fix ordering, hard rules. MUST follow."
+            )
             result_json: str = dspy.OutputField(
                 desc=(
                     f'JSON: {{"fixes": [...]}}. '
@@ -238,6 +251,7 @@ class NginxAnalyzer:
     def analyze(self, nginx_section: str, benchmark_results: str, network_summary: str,
                 kernel_summary: str, similar_cases: str,
                 investigation_notes: str = "",
+                performance_rules: str = "",
                 save_dir: Path | None = None) -> tuple[list[dict], int, int, float]:
         """Returns (fixes, input_tokens, output_tokens)."""
         if self._module is None:
@@ -251,6 +265,7 @@ class NginxAnalyzer:
             kernel_summary=kernel_summary,
             similar_cases=similar_cases,
             investigation_notes=investigation_notes,
+            performance_rules=performance_rules,
         )
         elapsed = (datetime.now() - t0).total_seconds()
         fixes, _ = parse_fixes_json(pred.result_json)

@@ -66,6 +66,7 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                     benchmark_results=state.get("benchmark_results", ""),
                     live_audit_output=state.get("live_audit_output", ""),
                     previous_findings="\n---\n".join(findings),
+                    performance_rules=agent.perf_rules,
                 )
                 total_in += in_tok
                 total_out += out_tok
@@ -141,6 +142,7 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                 benchmark_results=state.get("benchmark_results", ""),
                 live_audit_output=state.get("live_audit_output", ""),
                 previous_findings=summary_prompt,
+                performance_rules=agent.perf_rules,
             )
             total_in += in_tok
             total_out += out_tok
