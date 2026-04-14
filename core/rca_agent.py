@@ -39,32 +39,30 @@ logger = logging.getLogger("slayMetrics.agent")
 
 class RCAState(TypedDict):
     session_id: str
-    similar_cases: str            # retrieved from semantic memory
+    similar_cases: str
     audit_output: str
-    benchmark_results: str        # latest benchmark output (raw text)
-    live_audit_output: str        # dynamic metrics collected during benchmark
-    investigation_notes: str      # accumulated findings from SRE investigation
-    baseline_rps: dict            # {workload: float} from initial benchmark
+    benchmark_results: str
+    live_audit_output: str
+    investigation_notes: str
+    baseline_rps: dict
     network_fixes: list
-    network_summary: str          # chained → analyze_kernel
+    network_summary: str
     kernel_fixes: list
-    kernel_summary: str           # chained → analyze_nginx
+    kernel_summary: str
     nginx_fixes: list
-    rca_report: str               # combined summaries
-    fix_groups: list               # LLM-grouped fixes for group remediation
-    fixes: list                   # flattened fixes with _group metadata
+    rca_report: str
+    fix_groups: list
+    fixes: list
     fix_index: int
-    applied_fixes: list           # [(description, improvement_pct)]
-    rejected_fixes: list          # [(description, improvement_pct)]
+    applied_fixes: list
+    rejected_fixes: list
     total_input_tokens: int
     total_output_tokens: int
-    llm_calls: list               # [(domain, elapsed_s, in_tok, out_tok, num_fixes)]
+    llm_calls: list
     error: str
 
 
 class RCAAgent:
-    """LangGraph agent: audit → benchmark → RCA → remediation loop."""
-
     def __init__(self, config: Config, audit_only: bool = False,
                  orchestrator: InstallerOrchestrator | None = None,
                  target: FleetTarget | None = None):
@@ -128,29 +126,26 @@ class RCAAgent:
     @staticmethod
     def _route_deploy(state: RCAState) -> str:
         return "error" if state.get("error") else "preflight_check"
-
     @staticmethod
     def _route_preflight(state: RCAState) -> str:
         return "error" if state.get("error") else "run_benchmark"
-
     @staticmethod
     def _route_benchmark(state: RCAState) -> str:
         return "error" if state.get("error") else "investigate"
-
     def _route_investigate(self, state: RCAState) -> str:
         if state.get("error"):
             return "error"
         return "generate_fixes" if state.get("investigation_notes") else "analyze_network"
-
     def _route_remediate(self, state: RCAState) -> str:
         if state.get("error"):
             return "end"
         if self.audit_only:
-            logger.info("Audit mode enabled — skipping remediation loop.")
             return "end"
         idx = state.get("fix_index", 0)
         if idx < len(state.get("fixes", [])) and idx < self.config.remediation_max_fixes:
             return "remediate_fix"
+        if not state.get("_retry_done") and state.get("rejected_fixes"):
+            return "retry_rejected"
         return "end"
 
     def _build_graph(self):
@@ -165,6 +160,7 @@ class RCAAgent:
         g.add_node("analyze_nginx",   lambda s: rca_analysis.analyze_nginx(s, self))
         g.add_node("merge_fixes",     lambda s: rca_nodes.merge_fixes(s, self))
         g.add_node("remediate_fix",   lambda s: rca_nodes.remediate_fix(s, self))
+        g.add_node("retry_rejected",  lambda s: rca_nodes.retry_rejected(s, self))
         g.set_entry_point("run_audit")
         g.add_conditional_edges("run_audit",       self._route_deploy,
                                 {"preflight_check": "preflight_check", "error": END})
@@ -180,8 +176,12 @@ class RCAAgent:
         g.add_edge("analyze_kernel",  "analyze_nginx")
         g.add_edge("analyze_nginx",   "merge_fixes")
         g.add_conditional_edges("merge_fixes",   self._route_remediate,
-                                {"remediate_fix": "remediate_fix", "end": END})
+                                {"remediate_fix": "remediate_fix",
+                                 "retry_rejected": "retry_rejected", "end": END})
         g.add_conditional_edges("remediate_fix", self._route_remediate,
+                                {"remediate_fix": "remediate_fix",
+                                 "retry_rejected": "retry_rejected", "end": END})
+        g.add_conditional_edges("retry_rejected", self._route_remediate,
                                 {"remediate_fix": "remediate_fix", "end": END})
         return g.compile()
 

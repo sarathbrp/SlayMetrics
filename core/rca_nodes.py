@@ -409,3 +409,31 @@ def remediate_fix(state: RCAState, agent: RCAAgent) -> RCAState:
 
     return {**state, "fix_index": next_idx, "baseline_rps": baseline,
             "applied_fixes": applied, "rejected_fixes": rejected}
+
+
+def retry_rejected(state: RCAState, agent: RCAAgent) -> RCAState:
+    """Re-queue rejected fixes for a second pass on the improved system."""
+    rejected = state.get("rejected_fixes", [])
+    fixes = state.get("fixes", [])
+    if not rejected:
+        return {**state, "_retry_done": True}
+
+    # Find the original fix dicts for rejected descriptions
+    rejected_descs = {desc for desc, _ in rejected}
+    retry_fixes = [f for f in fixes if f.get("description", "") in rejected_descs]
+
+    if not retry_fixes:
+        logger.info("Retry: no rejected fixes found to re-queue.")
+        return {**state, "_retry_done": True}
+
+    logger.info("=== RETRY PASS: re-testing %d rejected fixes on improved system ===",
+                len(retry_fixes))
+    for f in retry_fixes:
+        logger.info("  Retry: %s (tool=%s)", f.get("description", ""), f.get("tool", ""))
+
+    # Reset fix list to only rejected fixes, clear rejected list, reset index
+    return {**state,
+            "fixes": retry_fixes,
+            "fix_index": 0,
+            "rejected_fixes": [],
+            "_retry_done": True}
