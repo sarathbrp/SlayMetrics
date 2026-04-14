@@ -56,5 +56,5 @@ Fixes MUST be tiered in this order:
 6. ALWAYS check effective nginx directive values — server block overrides http block (last occurrence wins)
 7. When proposing LimitNOFILE raise, ALWAYS include fs.nr_open raise as a prerequisite fix at equal or higher value
 8. Systemd services don't use PAM — limits from /etc/security/limits.conf have NO effect on nginx. Only LimitNOFILE in the systemd unit or drop-in files matters
-9. LimitNOFILE and LimitNPROC are per-process limits — processes may fork to escape them. Prefer cgroup controls (MemoryMax, CPUQuota) for service-wide limits
+9. Limit* directives (LimitNOFILE, LimitNPROC, etc.) are PER-PROCESS — child processes can fork and get independent limits. For service-wide enforcement, prefer cgroup resource controls: MemoryMax (replaces LimitRSS which is not implemented on Linux), CPUQuota, TasksMax. When diagnosing throttling, check cgroup controls FIRST (they can't be escaped), then per-process Limit* directives
 10. When removing a systemd drop-in sabotage file, ALWAYS run daemon-reload before restart
