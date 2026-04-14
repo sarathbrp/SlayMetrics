@@ -32,7 +32,8 @@ ALLOWED_SYSCTL = {
 }
 
 ALLOWED_SYSTEMD = {
-    "LimitNOFILE", "LimitNPROC", "CPUQuota", "CPUWeight", "MemoryMax", "MemoryHigh",
+    "LimitNOFILE", "LimitNPROC", "LimitMEMLOCK", "LimitSTACK", "LimitNICE",
+    "LimitSIGPENDING", "CPUQuota", "CPUWeight", "MemoryMax", "MemoryHigh",
     "IOWeight", "Nice", "OOMScoreAdjust", "TasksMax",
 }
 

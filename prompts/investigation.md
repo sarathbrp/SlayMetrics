@@ -16,8 +16,8 @@ Before investigating problems, understand WHAT you are optimizing. From the boot
 3. **Quantify the gap**: Compare actual benchmark RPS to theoretical
    - Example: "112 cores → theoretical 5.6M small RPS, actual 1,100 → 0.02% capacity → SEVERE throttle"
 4. **Run initial commands** to fill in what the bootstrap doesn't show:
-   - `systemctl show nginx.service -p CPUQuotaPerSecUSec -p LimitNOFILE -p LimitNPROC -p MemoryMax -p CPUWeight -p Nice -p IOWeight -p OOMScoreAdjust -p TasksMax`
-   - `ls -1 /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null`
+   - `systemctl show nginx.service -p CPUQuotaPerSecUSec -p LimitNOFILE -p LimitNPROC -p LimitMEMLOCK -p LimitSTACK -p LimitNICE -p LimitSIGPENDING -p MemoryMax -p MemoryHigh -p CPUWeight -p Nice -p IOWeight -p OOMScoreAdjust -p TasksMax` (check ALL resource limits — any can be used to throttle)
+   - `ls -1 /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null && cat /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null` (read drop-in contents in same command)
    - `nginx -T 2>/dev/null | head -30`
    - `sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog fs.nr_open fs.file-max`
 
@@ -46,9 +46,11 @@ Test: [specific commands to confirm/reject]
 
 **Always check these sabotage vectors:**
 - Systemd drop-in files: `cat /etc/systemd/system/nginx.service.d/*.conf`
+- ALL systemd resource limits: LimitNOFILE, LimitNPROC, LimitMEMLOCK, LimitSTACK, LimitNICE, LimitSIGPENDING — any non-infinity value on a server with abundant resources is suspicious
 - Background hog processes: `pgrep -la 'stress-ng|dd|iperf'`
 - Server block overrides: `nginx -T 2>/dev/null` (last occurrence = effective value)
 - Cgroup throttle: CPUQuotaPerSecUSec ≠ infinity means CPU is capped
+- NOTE: /etc/security/limits.conf has NO effect on systemd services — only unit file Limit* directives matter
 
 ### Phase 3: Attack Plan (final iteration)
 
