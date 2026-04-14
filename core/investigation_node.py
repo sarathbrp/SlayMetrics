@@ -124,13 +124,17 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
     if not conclusion and findings:
         logger.info("Investigation hit max iterations without structured conclusion — forcing summary.")
         try:
+            # Send only the last 5 findings to avoid token overflow
+            recent = findings[-5:] if len(findings) > 5 else findings
             summary_prompt = (
-                "\n---\n".join(findings) +
-                "\n\n=== FINAL ITERATION: You MUST now produce the structured report. "
-                "Set done=true and return the findings object with system_blueprint, "
-                "bottleneck_ranking, fix_dependency_chain, attack_plan, "
-                "cross_layer_violations, systemd_sabotage, effective_nginx_values, "
-                "and severity. Do NOT request more commands. ==="
+                "\n---\n".join(recent) +
+                "\n\n=== FINAL ITERATION: You MUST now set done=true and return findings as a JSON object "
+                "with keys: bottleneck_ranking (list of {issue, impact, severity}), "
+                "attack_plan (list of {phase, label, fixes}), "
+                "cross_layer_violations (list of strings), "
+                "systemd_sabotage (list of strings), "
+                "effective_nginx_values (dict), severity (string). "
+                "Do NOT request more commands. ==="
             )
             result, in_tok, out_tok, elapsed = agent.investigator.step(
                 audit_baseline=state["audit_output"],
@@ -141,14 +145,16 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
             total_in += in_tok
             total_out += out_tok
             total_elapsed += elapsed
-            if result.findings:
+            # Only use if it's a real summary, not a parse-error fallback
+            if result.findings and "parse error" not in result.findings:
                 conclusion = result.findings
                 logger.info("Forced summary produced (%d bytes)", len(conclusion))
+            else:
+                logger.warning("Forced summary was unusable — falling back to raw findings.")
         except Exception as e:
             logger.warning("Forced summary call failed: %s", e)
 
-    # Prefer the structured conclusion over raw command dumps.
-    # Raw findings are still saved per-iteration in JSON files for debugging.
+    # Use structured conclusion if available, otherwise raw findings
     notes = conclusion if conclusion else "\n---\n".join(findings)
     logger.info(
         "Investigation produced %d bytes of notes (%d iterations, %.1fs, %d commands run)",
