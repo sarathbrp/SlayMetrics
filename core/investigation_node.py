@@ -42,41 +42,137 @@ def _save_iteration(save_dir: Path, iteration: int,
         logger.warning("Failed to save investigation iteration %d: %s", iteration, e)
 
 
+def _run_commands(executor, commands: list[str], findings: list[str],
+                  cmd_timeout: int, max_output: int, max_cmds: int) -> list[dict]:
+    """Execute validated commands via SSH, append results to findings."""
+    iter_log: list[dict] = []
+    for cmd in commands[:max_cmds]:
+        check = CommandValidator.validate(cmd)
+        if check.blocked:
+            logger.warning("BLOCKED: %s — %s", cmd, check.reason)
+            findings.append(f"$ {cmd}\nBLOCKED: {check.reason}")
+            iter_log.append({"cmd": cmd, "blocked": True, "reason": check.reason})
+            continue
+        logger.info("  Running: %s", cmd)
+        try:
+            stdout, stderr = executor.run(cmd, timeout=cmd_timeout)
+        except Exception as e:
+            logger.warning("Command failed: %s — %s", cmd, e)
+            findings.append(f"$ {cmd}\nERROR: {e}")
+            iter_log.append({"cmd": cmd, "blocked": False, "error": str(e)})
+            continue
+        output = stdout[:max_output]
+        if len(stdout) > max_output:
+            output += f"\n[TRUNCATED — {len(stdout)} bytes total]"
+        findings.append(f"$ {cmd}\n{output}")
+        iter_log.append({"cmd": cmd, "blocked": False, "output": output[:1024],
+                         "output_len": len(stdout)})
+    return iter_log
+
+
 def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
-    """Autonomous SRE investigation node — multi-turn SSH diagnostic loop."""
+    """Plan-driven SRE investigation: plan hypotheses upfront, then execute."""
     if state.get("error"):
         return state
     if not agent.config.investigation_enabled:
         logger.info("Investigation phase disabled — skipping.")
         return {**state, "investigation_notes": ""}
 
-    max_iter = agent.config.investigation_max_iterations
     cmd_timeout = agent.config.investigation_command_timeout
     max_output = agent.config.investigation_max_output_bytes
     max_cmds = agent.config.investigation_max_commands_per_iteration
     save_dir = REPORTS_DIR / state.get("session_id", "unknown")
     findings: list[str] = []
+    confirmed: list[str] = []
     conclusion = ""
     total_in = total_out = 0
     total_elapsed = 0.0
 
     try:
+        # === PHASE 1: PLANNING — LLM produces hypothesis table (no SSH) ===
+        logger.info("=== Investigation: Planning Phase ===")
+        inv_plan, in_tok, out_tok, elapsed = agent.investigator.plan(
+            audit_baseline=state["audit_output"],
+            benchmark_results=state.get("benchmark_results", ""),
+            live_audit_output=state.get("live_audit_output", ""),
+            performance_rules=agent.perf_rules,
+        )
+        total_in += in_tok
+        total_out += out_tok
+        total_elapsed += elapsed
+
+        # Log the plan
+        if inv_plan.system_blueprint:
+            bp = inv_plan.system_blueprint
+            logger.info("  System: %s cores, %sGB RAM, %s NIC, %s disk",
+                        bp.get("cpu_cores", "?"), bp.get("memory_gb", "?"),
+                        bp.get("nic_speed", "?"), bp.get("disk_type", "?"))
+            logger.info("  Capacity: %s actual vs %s theoretical = %s utilization",
+                        bp.get("actual_rps_small", "?"),
+                        bp.get("theoretical_max_rps_small", "?"),
+                        bp.get("capacity_utilization", "?"))
+
+        if inv_plan.hypotheses:
+            logger.info("  Investigation plan (%d hypotheses):", len(inv_plan.hypotheses))
+            for h in inv_plan.hypotheses:
+                logger.info("    [P%d] %s (est. %s)", h.priority, h.hypothesis, h.estimated_impact)
+        else:
+            logger.warning("  No hypotheses produced — falling back to adaptive investigation.")
+
+        # Save the plan
+        _save_iteration(save_dir, 0,
+                        "Investigation Plan", "",
+                        json.dumps([{"priority": h.priority, "hypothesis": h.hypothesis,
+                                     "impact": h.estimated_impact,
+                                     "commands": h.commands_to_verify}
+                                    for h in inv_plan.hypotheses], default=str),
+                        json.dumps(inv_plan.system_blueprint, default=str), [])
+
+        # === PHASE 2: EXECUTION — one hypothesis per iteration ===
         with agent._executor() as executor:
+            hypotheses = inv_plan.hypotheses or []
+            max_iter = min(len(hypotheses), agent.config.investigation_max_iterations)
+            if max_iter == 0:
+                max_iter = agent.config.investigation_max_iterations
+
             for iteration in range(1, max_iter + 1):
-                logger.info("=== Investigation iteration %d/%d ===", iteration, max_iter)
+                # Build context for this iteration
+                confirmed_text = ""
+                if confirmed:
+                    confirmed_text = (
+                        "=== CONFIRMED SO FAR (do NOT re-check) ===\n"
+                        + "\n".join(confirmed) + "\n=== END ===\n\n"
+                    )
+                recent = findings[-10:] if len(findings) > 10 else findings
+                context = confirmed_text + "\n---\n".join(recent)
+
+                # If we have a planned hypothesis, inject it as guidance
+                if iteration <= len(hypotheses):
+                    h = hypotheses[iteration - 1]
+                    logger.info("=== Investigation iteration %d/%d: [P%d] %s ===",
+                                iteration, max_iter, h.priority, h.hypothesis)
+                    context = (
+                        f"EXECUTE HYPOTHESIS {h.priority}: {h.hypothesis}\n"
+                        f"Estimated impact: {h.estimated_impact}\n"
+                        f"Evidence: {h.evidence_so_far}\n"
+                        f"Suggested commands: {', '.join(h.commands_to_verify)}\n\n"
+                        + context
+                    )
+                else:
+                    logger.info("=== Investigation iteration %d/%d (adaptive) ===",
+                                iteration, max_iter)
 
                 result, in_tok, out_tok, elapsed = agent.investigator.step(
                     audit_baseline=state["audit_output"],
                     benchmark_results=state.get("benchmark_results", ""),
                     live_audit_output=state.get("live_audit_output", ""),
-                    previous_findings="\n---\n".join(findings),
+                    previous_findings=context,
                     performance_rules=agent.perf_rules,
                 )
                 total_in += in_tok
                 total_out += out_tok
                 total_elapsed += elapsed
 
-                # Log hypothesis and plan before running commands
                 if result.hypothesis:
                     logger.info("  Hypothesis: %s", result.hypothesis)
                 if result.evidence:
@@ -85,10 +181,8 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                     logger.info("  Plan: %s", result.plan)
 
                 if result.done:
-                    logger.info(
-                        "Investigation complete at iteration %d (%.1fs total)",
-                        iteration, total_elapsed,
-                    )
+                    logger.info("Investigation complete at iteration %d (%.1fs total)",
+                                iteration, total_elapsed)
                     if result.findings:
                         conclusion = result.findings
                     _save_iteration(save_dir, iteration,
@@ -96,61 +190,34 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                                     result.findings, [])
                     break
 
-                iter_log: list[dict] = []
-                for cmd in result.commands[:max_cmds]:
-                    check = CommandValidator.validate(cmd)
-                    if check.blocked:
-                        logger.warning("BLOCKED: %s — %s", cmd, check.reason)
-                        findings.append(f"$ {cmd}\nBLOCKED: {check.reason}")
-                        iter_log.append({
-                            "cmd": cmd, "blocked": True, "reason": check.reason,
-                        })
-                        continue
-
-                    logger.info("  Running: %s", cmd)
-                    try:
-                        stdout, stderr = executor.run(cmd, timeout=cmd_timeout)
-                    except Exception as e:
-                        logger.warning("Command failed: %s — %s", cmd, e)
-                        findings.append(f"$ {cmd}\nERROR: {e}")
-                        iter_log.append({
-                            "cmd": cmd, "blocked": False, "error": str(e),
-                        })
-                        continue
-
-                    output = stdout[:max_output]
-                    if len(stdout) > max_output:
-                        output += f"\n[TRUNCATED — {len(stdout)} bytes total]"
-                    findings.append(f"$ {cmd}\n{output}")
-                    iter_log.append({
-                        "cmd": cmd, "blocked": False,
-                        "output": output[:1024],
-                        "output_len": len(stdout),
-                    })
-
+                iter_log = _run_commands(executor, result.commands, findings,
+                                        cmd_timeout, max_output, max_cmds)
                 _save_iteration(save_dir, iteration,
                                 result.hypothesis, result.evidence, result.plan,
                                 result.findings, iter_log)
+
+                summary_line = f"Iter {iteration}"
+                if result.hypothesis:
+                    summary_line += f": {result.hypothesis[:100]}"
+                if result.findings:
+                    summary_line += f" → {result.findings[:100]}"
+                confirmed.append(summary_line)
 
     except Exception as e:
         logger.error("Investigation failed: %s", e)
         conclusion = f"[ERROR] Investigation aborted: {e}"
 
-    # If the LLM never signaled done, force a final summary call
+    # Force final summary if needed
     if not conclusion and findings:
-        logger.info("Investigation hit max iterations without structured conclusion — forcing summary.")
+        logger.info("Forcing final summary...")
         try:
-            # Send only the last 5 findings to avoid token overflow
             recent = findings[-5:] if len(findings) > 5 else findings
             summary_prompt = (
-                "\n---\n".join(recent) +
-                "\n\n=== FINAL ITERATION: You MUST now set done=true and return findings as a JSON object "
-                "with keys: bottleneck_ranking (list of {issue, impact, severity}), "
-                "attack_plan (list of {phase, label, fixes}), "
-                "cross_layer_violations (list of strings), "
-                "systemd_sabotage (list of strings), "
-                "effective_nginx_values (dict), severity (string). "
-                "Do NOT request more commands. ==="
+                "=== CONFIRMED ===\n" + "\n".join(confirmed) + "\n===\n\n"
+                + "\n---\n".join(recent)
+                + "\n\n=== FINAL: Set done=true, return findings with bottleneck_ranking, "
+                "attack_plan, cross_layer_violations, systemd_sabotage, "
+                "effective_nginx_values, severity. No commands. ==="
             )
             result, in_tok, out_tok, elapsed = agent.investigator.step(
                 audit_baseline=state["audit_output"],
@@ -162,16 +229,14 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
             total_in += in_tok
             total_out += out_tok
             total_elapsed += elapsed
-            # Only use if it's a real summary, not a parse-error fallback
             if result.findings and "parse error" not in result.findings:
                 conclusion = result.findings
                 logger.info("Forced summary produced (%d bytes)", len(conclusion))
             else:
-                logger.warning("Forced summary was unusable — falling back to raw findings.")
+                logger.warning("Forced summary unusable — using raw findings.")
         except Exception as e:
-            logger.warning("Forced summary call failed: %s", e)
+            logger.warning("Forced summary failed: %s", e)
 
-    # Use structured conclusion if available, otherwise raw findings
     notes = conclusion if conclusion else "\n---\n".join(findings)
     logger.info(
         "Investigation produced %d bytes of notes (%d iterations, %.1fs, %d commands run)",
