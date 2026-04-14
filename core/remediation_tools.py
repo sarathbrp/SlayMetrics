@@ -186,12 +186,14 @@ class SystemdPropertyTool(RemediationTool):
                 self._run(f"sysctl -w fs.nr_open={new_nr_open}")
                 self._run(f"sysctl -w fs.file-max={new_nr_open}")
 
+        # Remove the property from any existing drop-in files (prevents revert on restart)
+        self._cleaned_dropins = self._clean_dropin_conflicts(prop)
+
         if prop == "CPUQuota":
-            # CPUQuota removal: empty value removes the limit entirely
             self._run("systemctl set-property nginx.service CPUQuota=")
             self._run("systemctl daemon-reload")
-        elif prop in _DROPIN_PROPS:
-            # LimitNOFILE/LimitNPROC need drop-in files
+        elif prop in _DROPIN_PROPS or self._cleaned_dropins:
+            # Use drop-in file: either required (Limit*) or needed to override sabotage
             q_value = shlex.quote(value)
             dropin_name = f"zz_hosttune_{prop.lower()}.conf"
             dropin_path = f"{_DROPIN_DIR}/{dropin_name}"
@@ -202,7 +204,7 @@ class SystemdPropertyTool(RemediationTool):
             )
             self._run("systemctl daemon-reload && systemctl restart nginx")
         else:
-            # CPUWeight, MemoryMax, IOWeight — use set-property
+            # No conflict — safe to use set-property (runtime)
             q_prop = shlex.quote(prop)
             q_value = shlex.quote(value)
             self._run(f"systemctl set-property nginx.service {q_prop}={q_value}")
@@ -213,17 +215,52 @@ class SystemdPropertyTool(RemediationTool):
             f"systemd {prop}",
         )
 
+    def _clean_dropin_conflicts(self, prop: str) -> list[tuple[str, str]]:
+        """If any drop-in sets this property, create a zz_ override to win.
+
+        Does NOT modify or delete sabotage files — just overrides them.
+        Returns list of created override paths for rollback.
+        """
+        # Already handled via drop-in for these
+        if prop in _DROPIN_PROPS:
+            return []
+        created = []
+        try:
+            ls_out = self._run(f"ls -1 {_DROPIN_DIR}/*.conf 2>/dev/null")
+            for dropin in ls_out.strip().splitlines():
+                dropin = dropin.strip()
+                if not dropin or "zz_hosttune_" in dropin:
+                    continue
+                content = self._run(f"cat {shlex.quote(dropin)}")
+                if f"{prop}=" not in content:
+                    continue
+                # Conflict found — create a zz_ override
+                override_name = f"zz_hosttune_{prop.lower()}.conf"
+                override_path = f"{_DROPIN_DIR}/{override_name}"
+                q_value = shlex.quote(str(self._original))  # will be overwritten by apply
+                logger.info(
+                    "Drop-in %s sets %s — creating %s to override",
+                    dropin, prop, override_name,
+                )
+                created.append(override_path)
+                break  # only need one override regardless of how many files set it
+        except Exception as e:
+            logger.warning("Drop-in conflict scan failed: %s", e)
+        return created
+
     def rollback(self) -> None:
         if not self._original:
             return
         logger.info("Rollback systemd %s → %s", self._prop, self._original)
+        # Remove any zz_ override files we created
+        for override_path in getattr(self, "_cleaned_dropins", []):
+            logger.info("Removing override %s", override_path)
+            self._run(f"rm -f {shlex.quote(override_path)}")
         if self._prop == "CPUQuota":
-            # Restore original quota
             q_orig = shlex.quote(self._original)
             self._run(f"systemctl set-property nginx.service CPUQuota={q_orig}")
             self._run("systemctl daemon-reload")
         elif self._prop in _DROPIN_PROPS:
-            # Remove drop-in file and restart
             if hasattr(self, "_dropin_path"):
                 self._run(f"rm -f {shlex.quote(self._dropin_path)}")
             self._run("systemctl daemon-reload && systemctl restart nginx")
