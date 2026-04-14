@@ -30,6 +30,9 @@ These are hard ceilings that make all other tuning irrelevant.
 | `systemd_MemoryMax` | any value that is NOT infinity (e.g. 256M, 512M, 2G, 2147483648) | `systemd_property` (MemoryMax=infinity) | **CRITICAL** — OOM kills nginx under load. ANY numeric value means a cap is active. Flag it. |
 | `systemd_CPUWeight` | < 100 | `systemd_property` (CPUWeight=100) | Medium — below-default CPU scheduling weight starves nginx relative to other processes |
 | `systemd_IOWeight` | < 100 | `systemd_property` (IOWeight=100) | Medium — below-default I/O weight reduces nginx disk throughput priority |
+| `systemd_Nice` | > 0 (e.g. 19) | `systemd_property` (Nice=0) | HIGH — high nice value deprioritizes nginx on CPU. Default is 0. Any value > 0 is sabotage. |
+| `systemd_OOMScoreAdjust` | > 0 (e.g. 500) | `systemd_property` (OOMScoreAdjust=0) | HIGH — makes nginx the first process killed under memory pressure. Default is 0. |
+| `systemd_TasksMax` | < nproc + 10 (e.g. 100 on 112-core) | `systemd_property` (TasksMax=infinity) | CRITICAL — limits total nginx tasks (master + workers). Must be > CPU count + headroom. |
 
 **CPUQuota detection:** Read CPUQuotaPerSecUSec. Convert: quota_pct = µs_value / 10000. If < 100%, flag CRITICAL.
 

@@ -115,7 +115,10 @@ class NetworkAnalyzer:
 
 _KERNEL_TOOL_DOCS = (
     '  "sysctl": params={"param": "<sysctl_name>", "value": "<new_value>"}\n'
-    '  "systemd_property": params={"property": "<LimitNOFILE|CPUQuota|...>", "value": "<value>"}\n'
+    '  "systemd_property": params={"property": "<prop>", "value": "<value>"}\n'
+    '    Allowed properties: LimitNOFILE, LimitNPROC, CPUQuota (use "infinity" to remove),\n'
+    '    CPUWeight (default=100), IOWeight (default=100), MemoryMax, MemoryHigh,\n'
+    '    Nice (default=0), OOMScoreAdjust (default=0), TasksMax (use "infinity")\n'
     '  "cpu_governor": params={"governor": "<performance|powersave|ondemand|conservative>"}\n'
     '  "ethtool": params={"action": "<ring_buffers|coalescing>", "rx": <int>, "tx": <int>}'
 )
