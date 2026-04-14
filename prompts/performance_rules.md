@@ -61,6 +61,18 @@ Fixes MUST be tiered in this order:
 11. System-wide defaults in `/etc/systemd/system.conf.d/*.conf` (e.g. DefaultLimitNOFILE) apply to ALL services unless overridden per-service. Always check `cat /etc/systemd/system.conf.d/*.conf 2>/dev/null` for hidden global throttles
 12. Some services set their own resource limits at runtime (overriding systemd). nginx does NOT do this — it respects systemd Limit* directives
 
+### RHEL Network Stack Tuning (from RHEL Performance Guide)
+
+- `net.ipv4.tcp_fastopen=3` — enables TCP Fast Open for both client and server, reduces handshake latency
+- `net.core.default_qdisc=fq_codel` — Fair Queue with Controlled Delay, reduces bufferbloat (better than default pfifo_fast)
+- `net.core.netdev_budget=600` — packets processed per softirq iteration (default 300, increase for high-throughput NICs)
+- `net.ipv4.tcp_mtu_probing=1` — automatic MTU discovery, prevents fragmentation
+- `net.ipv4.tcp_abort_on_overflow=1` — fail fast when listen queue overflows instead of silently dropping
+- `net.core.rmem_default=4194304` and `net.core.wmem_default=4194304` — 4MB default socket buffers
+- `vm.dirty_background_ratio` — tune alongside `vm.dirty_ratio` (controls when background writeback starts)
+- NIC ring buffers: `ethtool -G <nic> rx 4096 tx 4096` — increase from defaults to prevent packet drops at NIC level
+- NIC interrupt coalescing: `ethtool -C <nic> adaptive-rx on adaptive-tx on` — auto-balances latency vs throughput
+
 ### Nginx-Specific Rules (from nginx.org verified anti-patterns)
 
 13. worker_rlimit_nofile MUST be at least 2× worker_connections — each connection uses 1 FD for client + 1 FD per served file. When proxying: 1 FD client + 1 FD upstream + potentially 1 FD temp file = 3 FDs per connection

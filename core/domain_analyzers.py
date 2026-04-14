@@ -114,7 +114,8 @@ class NetworkAnalyzer:
 _KERNEL_TOOL_DOCS = (
     '  "sysctl": params={"param": "<sysctl_name>", "value": "<new_value>"}\n'
     '  "systemd_property": params={"property": "<LimitNOFILE|CPUQuota|...>", "value": "<value>"}\n'
-    '  "cpu_governor": params={"governor": "<performance|powersave|ondemand|conservative>"}'
+    '  "cpu_governor": params={"governor": "<performance|powersave|ondemand|conservative>"}\n'
+    '  "ethtool": params={"action": "<ring_buffers|coalescing>", "rx": <int>, "tx": <int>}'
 )
 
 

@@ -23,9 +23,14 @@ logger = logging.getLogger("slayMetrics.tools")
 ALLOWED_SYSCTL = {
     "net.core.somaxconn", "net.ipv4.tcp_max_syn_backlog",
     "net.core.netdev_max_backlog", "net.core.rmem_max", "net.core.wmem_max",
+    "net.core.rmem_default", "net.core.wmem_default",
     "net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem", "net.ipv4.tcp_tw_reuse",
     "net.ipv4.tcp_fin_timeout", "net.ipv4.tcp_slow_start_after_idle",
-    "net.ipv4.ip_local_port_range", "vm.swappiness", "vm.dirty_ratio",
+    "net.ipv4.tcp_fastopen", "net.ipv4.tcp_mtu_probing",
+    "net.ipv4.tcp_abort_on_overflow",
+    "net.ipv4.ip_local_port_range", "net.core.default_qdisc",
+    "net.core.netdev_budget",
+    "vm.swappiness", "vm.dirty_ratio", "vm.dirty_background_ratio",
     "vm.vfs_cache_pressure", "net.netfilter.nf_conntrack_max",
     "net.ipv4.tcp_syncookies",
     "fs.nr_open", "fs.file-max",
@@ -546,6 +551,7 @@ class IoSchedulerTool(RemediationTool):
 # ---------------------------------------------------------------------------
 
 from .network_tools import NETWORK_TOOL_CLASSES  # noqa: E402
+from .ethtool_tool import EthtoolTool  # noqa: E402
 
 _CORE_TOOLS = [
     SysctlTool,
@@ -556,6 +562,7 @@ _CORE_TOOLS = [
     IrqbalanceTool,
     ReadaheadTool,
     IoSchedulerTool,
+    EthtoolTool,
 ]
 
 # Full registry (network tools included — filtered at agent level based on config)
@@ -577,6 +584,7 @@ _REQUIRED_PARAMS: dict[str, set[str]] = {
     "irqbalance":         set(),
     "readahead":          {"value"},
     "io_scheduler":       {"value"},
+    "ethtool":            {"action"},
     "tc_shaping":         set(),
     "iptables_connlimit": set(),
     "nftables_ratelimit": set(),

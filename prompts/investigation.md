@@ -20,7 +20,7 @@ Before investigating problems, understand WHAT you are optimizing. From the boot
    - `ls -1 /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null && cat /etc/systemd/system/nginx.service.d/*.conf 2>/dev/null` (read drop-in contents in same command)
    - `cat /etc/systemd/system.conf.d/*.conf 2>/dev/null || echo "no system-wide defaults"` (check global DefaultLimit* overrides)
    - `nginx -T 2>/dev/null | head -30`
-   - `sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog fs.nr_open fs.file-max`
+   - `sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog fs.nr_open fs.file-max net.ipv4.tcp_fastopen net.core.default_qdisc net.core.netdev_budget net.ipv4.tcp_mtu_probing`
 
 ### Phase 2: Hypothesis-Driven Investigation (iterations 2-4)
 
@@ -38,6 +38,9 @@ Test: [specific commands to confirm/reject]
 - Large/mixed RPS extremely low but small OK → I/O path disabled (sendfile off, tiny buffers, access_log on)
 - High TCP_TIME_WAIT + connection drops → port exhaustion or low somaxconn/backlog
 - Softnet squeeze high → IRQ affinity pinned, irqbalance disabled
+- NIC rx_discards or packet drops → check NIC ring buffers (`ethtool -g <nic>`) and interrupt coalescing (`ethtool -c <nic>`)
+- tcp_fastopen=0 on a server → should be 3 (client+server) for reduced handshake latency
+- default_qdisc=pfifo_fast → should be fq_codel to reduce bufferbloat
 
 **For each hypothesis:**
 1. Run targeted commands to confirm (max 5 per iteration)
