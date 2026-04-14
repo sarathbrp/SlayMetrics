@@ -6,8 +6,8 @@ mlflow:
   experiment: SlayMetrics  # override: SLAY_MLFLOW_EXPERIMENT
 
 memory:
-  inject_into_rca_analysis: true      # pass similar_cases to Call 1 (RCA report)
-  inject_into_fix_extraction: true    # pass similar_cases to Call 2 (fix parser)
+  inject_into_rca_analysis: false     # disabled — investigation_notes is primary source now
+  inject_into_fix_extraction: false   # disabled — avoids stale memory competing with investigation
 
 optimization:
   min_new_examples: 5       # trigger BootstrapFewShot after this many new examples
