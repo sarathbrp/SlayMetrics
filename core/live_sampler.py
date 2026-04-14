@@ -131,7 +131,7 @@ class LiveSampler:
     # ------------------------------------------------------------------
 
     def analyze(self, csv_path: Path) -> str:
-        """Load CSV, downsample, compute deltas/peaks/trends → compact hypothesis."""
+        """Load CSV, downsample, compute deltas/peaks/trends → actionable hypothesis."""
         if not csv_path.exists() or csv_path.stat().st_size == 0:
             return ""
         try:
@@ -151,45 +151,125 @@ class LiveSampler:
 
         duration = int(df["ts"].iloc[-1] - df["ts"].iloc[0]) if "ts" in df.columns else 0
         lines = [f"=== Live Benchmark Analysis ({len(df)} samples over {duration}s) ==="]
+        lines.append("Findings below are from DURING the benchmark — they show behavior under load.\n")
 
-        # Cumulative deltas
-        for col in _CUMULATIVE:
-            if col not in df.columns:
-                continue
-            delta = float(df[col].iloc[-1] - df[col].iloc[0])
-            if delta <= 0:
-                continue
-            label, unit, crit, high = _THRESHOLDS.get(col, (col, "", 1, 1))
-            display = delta / 1_000_000 if unit == "s" else delta
-            sev     = _severity(delta, crit, high)
-            lines.append(f"[{sev:<8}] {label}: {display:>12,.1f}{unit}")
+        # --- Cgroup throttle (most critical — check first) ---
+        cg_throttle_delta = self._delta(df, "cgroup_throttled_usec")
+        cg_nr_delta = self._delta(df, "cgroup_nr_throttled")
+        if cg_throttle_delta > 0:
+            secs = cg_throttle_delta / 1_000_000
+            sev = _severity(cg_throttle_delta, 1_000_000, 100_000)
+            lines.append(
+                f"[{sev:<8}] Cgroup CPU throttle: {secs:.1f}s total ({cg_nr_delta:,.0f} events)"
+                f" → CPUQuota is actively limiting nginx. Remove CPUQuota to unlock CPU."
+            )
 
-        # Instant peaks
-        for col in _INSTANT:
-            if col not in df.columns:
-                continue
-            peak = float(df[col].max())
-            if peak <= 0:
-                continue
-            label, unit, crit, high = _THRESHOLDS.get(col, (col, "", 1e9, 1e9))
-            sev  = _severity(peak, crit, high)
-            lines.append(f"[{sev:<8}] {label}: {peak:>12,.0f}{unit}")
-
-        # CPU busy = us + sy combined
+        # --- CPU utilization ---
         if "cpu_us" in df.columns and "cpu_sy" in df.columns:
             cpu_busy_peak = float((df["cpu_us"] + df["cpu_sy"]).max())
-            sev = _severity(cpu_busy_peak, 90, 70)
-            lines.append(f"[{sev:<8}] CPU_busy_peak (us+sy): {cpu_busy_peak:>8.0f}%")
+            cpu_busy_avg = float((df["cpu_us"] + df["cpu_sy"]).mean())
+            if cpu_busy_peak < 10:
+                lines.append(
+                    f"[WARNING ] CPU busy peak only {cpu_busy_peak:.0f}% (avg {cpu_busy_avg:.0f}%)"
+                    f" during benchmark → nginx is severely underutilizing CPU."
+                    f" Check worker_processes count and CPUQuota."
+                )
+            elif cpu_busy_peak > 90:
+                lines.append(
+                    f"[CRITICAL] CPU saturated: peak {cpu_busy_peak:.0f}% (avg {cpu_busy_avg:.0f}%)"
+                    f" → CPU is the bottleneck. Consider more cores or optimizing per-request CPU."
+                )
+            elif cpu_busy_peak > 70:
+                lines.append(
+                    f"[HIGH    ] CPU busy peak {cpu_busy_peak:.0f}% (avg {cpu_busy_avg:.0f}%)"
+                    f" → approaching CPU saturation."
+                )
 
-        # Trend detection
-        for col in ["rx_discards", "softnet_squeezed", "tcp_time_wait",
-                    "cgroup_throttled_usec"]:
+        # --- Softnet squeeze ---
+        sqz_delta = self._delta(df, "softnet_squeezed")
+        if sqz_delta > 100_000:
+            lines.append(
+                f"[HIGH    ] Softnet squeeze: {sqz_delta:,.0f} events"
+                f" → kernel softirq budget exhausted. Check irqbalance and NIC IRQ affinity."
+            )
+        elif sqz_delta > 0 and sqz_delta < 100:
+            lines.append(
+                f"[INFO    ] Softnet squeeze: {sqz_delta:,.0f} (low)"
+                f" → NIC not under pressure, likely because nginx RPS is too low to stress it."
+            )
+
+        # --- Softnet drops ---
+        drop_delta = self._delta(df, "softnet_dropped")
+        if drop_delta > 0:
+            lines.append(
+                f"[CRITICAL] Softnet drops: {drop_delta:,.0f} packets lost"
+                f" → kernel dropping packets before they reach nginx. Check netdev_max_backlog."
+            )
+
+        # --- NIC discards ---
+        disc_delta = self._delta(df, "rx_discards")
+        if disc_delta > 100:
+            lines.append(
+                f"[HIGH    ] NIC rx_discards: {disc_delta:,.0f}"
+                f" → packets dropped at NIC level. Increase NIC ring buffers (ethtool -G)."
+            )
+
+        # --- NIC errors ---
+        err_delta = self._delta(df, "rx_errors")
+        if err_delta > 10:
+            lines.append(
+                f"[HIGH    ] NIC rx_errors: {err_delta:,.0f}"
+                f" → NIC receiving malformed frames. Check cable/NIC health."
+            )
+
+        # --- TCP state ---
+        if "tcp_time_wait" in df.columns:
+            tw_peak = float(df["tcp_time_wait"].max())
+            if tw_peak > 50_000:
+                lines.append(
+                    f"[CRITICAL] TCP TIME_WAIT peak: {tw_peak:,.0f}"
+                    f" → port exhaustion risk. Enable tcp_tw_reuse=2, widen ip_local_port_range."
+                )
+            elif tw_peak > 20_000:
+                lines.append(
+                    f"[HIGH    ] TCP TIME_WAIT peak: {tw_peak:,.0f}"
+                    f" → elevated connection churn. Check keepalive settings."
+                )
+            elif tw_peak > 1_000:
+                lines.append(
+                    f"[INFO    ] TCP TIME_WAIT peak: {tw_peak:,.0f} → within normal range."
+                )
+
+        if "tcp_established" in df.columns:
+            est_peak = float(df["tcp_established"].max())
+            if est_peak > 10_000:
+                lines.append(
+                    f"[HIGH    ] TCP ESTABLISHED peak: {est_peak:,.0f}"
+                    f" → high concurrency. Verify worker_connections and LimitNOFILE."
+                )
+
+        # --- Trends ---
+        for col, hypothesis in [
+            ("cgroup_throttled_usec", "cgroup throttle accumulating → CPUQuota actively limiting"),
+            ("rx_discards", "NIC discards increasing → ring buffers filling up under load"),
+            ("softnet_squeezed", "softirq budget exhaustion worsening over time"),
+        ]:
             if col not in df.columns:
                 continue
             trend = _detect_trend(df[col])
-            if trend != "stable":
+            if trend == "monotonic_rise":
                 label, *_ = _THRESHOLDS.get(col, (col,))
-                lines.append(f"[TREND   ] {label}: {trend}")
+                lines.append(f"[TREND   ] {label}: {trend} → {hypothesis}")
 
-        logger.info("Live analysis: %d findings over %ds", len(lines) - 1, duration)
+        if len(lines) <= 2:
+            lines.append("[OK      ] No significant issues detected during benchmark.")
+
+        logger.info("Live analysis: %d findings over %ds", len(lines) - 2, duration)
         return "\n".join(lines)
+
+    @staticmethod
+    def _delta(df: "pd.DataFrame", col: str) -> float:
+        """Compute cumulative delta for a column (last - first)."""
+        if col not in df.columns:
+            return 0.0
+        return float(df[col].iloc[-1] - df[col].iloc[0])

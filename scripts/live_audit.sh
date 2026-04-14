@@ -38,8 +38,8 @@ TCP_EST=$(echo "$_SOCKSTAT" | awk '{for(i=1;i<=NF;i++){if($i=="inuse"){print $(i
 TCP_MEM=$(echo "$_SOCKSTAT" | awk '{for(i=1;i<=NF;i++){if($i=="mem") {print $(i+1)}}}')
 TCP_TW=${TCP_TW:-0}; TCP_EST=${TCP_EST:-0}; TCP_MEM=${TCP_MEM:-0}
 
-# --- CPU (vmstat single sample) ---
-read -r CPU_US CPU_SY CPU_WA CTX <<< $(vmstat 1 1 2>/dev/null | tail -1 | awk '{print $13,$14,$16,$12}')
+# --- CPU (vmstat live sample — 2nd line is current, 1st is since-boot average) ---
+read -r CPU_US CPU_SY CPU_WA CTX <<< $(vmstat 1 2 2>/dev/null | tail -1 | awk '{print $13,$14,$16,$12}')
 CPU_US=${CPU_US:-0}; CPU_SY=${CPU_SY:-0}; CPU_WA=${CPU_WA:-0}; CTX=${CTX:-0}
 
 # --- Cgroup CPU throttle ---
