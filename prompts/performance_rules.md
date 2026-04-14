@@ -60,3 +60,12 @@ Fixes MUST be tiered in this order:
 10. When removing a systemd drop-in sabotage file, ALWAYS run daemon-reload before restart
 11. System-wide defaults in `/etc/systemd/system.conf.d/*.conf` (e.g. DefaultLimitNOFILE) apply to ALL services unless overridden per-service. Always check `cat /etc/systemd/system.conf.d/*.conf 2>/dev/null` for hidden global throttles
 12. Some services set their own resource limits at runtime (overriding systemd). nginx does NOT do this — it respects systemd Limit* directives
+
+### Nginx-Specific Rules (from nginx.org verified anti-patterns)
+
+13. worker_rlimit_nofile MUST be at least 2× worker_connections — each connection uses 1 FD for client + 1 FD per served file. When proxying: 1 FD client + 1 FD upstream + potentially 1 FD temp file = 3 FDs per connection
+14. Verify total FD usage: `worker_rlimit_nofile × worker_processes` must be significantly less than `fs.file-max`. If nginx exhausts all system FDs (e.g. during DoS), the machine becomes unmanageable
+15. `error_log off` does NOT disable logging — it creates a file named "off". To discard errors use `error_log /dev/null crit;`
+16. Directive inheritance: child context (server/location) OVERRIDES parent (http) — values are NOT added together. When same directive appears in both http{} and server{}, only the server{} value applies
+17. NEVER disable proxy_buffering unless specifically required (long polling). Disabling it breaks rate limiting, caching, and degrades performance
+18. `sendfile` is automatically disabled by nginx when content-changing filters (gzip, sub_filter) are active in the same context — this is expected behavior, not a bug
