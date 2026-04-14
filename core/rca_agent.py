@@ -1,5 +1,4 @@
 """RCAAgent: LangGraph orchestration + state management."""
-
 from __future__ import annotations
 
 import logging
@@ -28,11 +27,13 @@ from .domain_analyzers import NetworkAnalyzer, KernelAnalyzer, NginxAnalyzer
 from .tracking import RunTracker
 from .orchestrator import FleetTarget, InstallerOrchestrator
 from .investigator import SREInvestigator
+from .fix_generator import FixGenerator
 from .constants import PROMPTS_DIR, DSPY_DIR, REPORTS_DIR, SCRIPTS_DIR, REMOTE_TMP, AUDIT_SCRIPT
 from .comparison import run_comparisons
 from . import rca_nodes
 from . import rca_analysis
 from . import investigation_node
+from . import fix_generation_node
 
 logger = logging.getLogger("slayMetrics.agent")
 
@@ -77,6 +78,7 @@ class RCAAgent:
         self.kernel_analyzer = KernelAnalyzer(config, PROMPTS_DIR)
         self.nginx_analyzer  = NginxAnalyzer(config, PROMPTS_DIR)
         self.investigator     = SREInvestigator(config, PROMPTS_DIR)
+        self.fix_generator   = FixGenerator(config, PROMPTS_DIR)
         self.benchmark       = BenchmarkRunner(config)
         self.evaluator       = Evaluator()
         self.fix_reviewer    = FixEvaluatorLLM(config, PROMPTS_DIR)
@@ -135,9 +137,10 @@ class RCAAgent:
     def _route_benchmark(state: RCAState) -> str:
         return "error" if state.get("error") else "investigate"
 
-    @staticmethod
-    def _route_investigate(state: RCAState) -> str:
-        return "error" if state.get("error") else "analyze_network"
+    def _route_investigate(self, state: RCAState) -> str:
+        if state.get("error"):
+            return "error"
+        return "generate_fixes" if state.get("investigation_notes") else "analyze_network"
 
     def _route_remediate(self, state: RCAState) -> str:
         if state.get("error"):
@@ -156,6 +159,7 @@ class RCAAgent:
         g.add_node("preflight_check", lambda s: rca_nodes.preflight_check(s, self))
         g.add_node("run_benchmark",   lambda s: rca_nodes.run_benchmark(s, self))
         g.add_node("investigate",     lambda s: investigation_node.investigate(s, self))
+        g.add_node("generate_fixes",  lambda s: fix_generation_node.generate_fixes(s, self))
         g.add_node("analyze_network", lambda s: rca_analysis.analyze_network(s, self))
         g.add_node("analyze_kernel",  lambda s: rca_analysis.analyze_kernel(s, self))
         g.add_node("analyze_nginx",   lambda s: rca_analysis.analyze_nginx(s, self))
@@ -169,7 +173,9 @@ class RCAAgent:
         g.add_conditional_edges("run_benchmark",   self._route_benchmark,
                                 {"investigate": "investigate", "error": END})
         g.add_conditional_edges("investigate",     self._route_investigate,
-                                {"analyze_network": "analyze_network", "error": END})
+                                {"generate_fixes": "generate_fixes",
+                                 "analyze_network": "analyze_network", "error": END})
+        g.add_edge("generate_fixes", "merge_fixes")
         g.add_edge("analyze_network", "analyze_kernel")
         g.add_edge("analyze_kernel",  "analyze_nginx")
         g.add_edge("analyze_nginx",   "merge_fixes")

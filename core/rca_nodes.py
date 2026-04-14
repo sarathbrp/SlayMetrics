@@ -207,11 +207,16 @@ def merge_fixes(state: RCAState, agent: RCAAgent) -> RCAState:
     """Combine all domain fixes, apply scope/no-op filters, build final plan."""
     if state.get("error"):
         return state
-    all_fixes = (
-        state.get("network_fixes", []) +
-        state.get("kernel_fixes", []) +
-        state.get("nginx_fixes", [])
-    )
+    # If fix generator already populated fixes, use those directly
+    pre_generated = state.get("fixes", [])
+    if pre_generated:
+        all_fixes = pre_generated
+    else:
+        all_fixes = (
+            state.get("network_fixes", []) +
+            state.get("kernel_fixes", []) +
+            state.get("nginx_fixes", [])
+        )
     scoped = []
     for fix in all_fixes:
         tool = fix.get("tool", "")
