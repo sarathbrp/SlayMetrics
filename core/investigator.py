@@ -103,6 +103,26 @@ def _format_structured_findings(findings: dict) -> str:
     return header + "\n\n" + "\n\n".join(sections)
 
 
+def _extract_from_reasoning(reasoning: str, field: str, fallback: str = "") -> str:
+    """Extract a section from reasoning text when the LLM embeds it inline.
+
+    Looks for patterns like "Hypothesis: ..." or "Test: ..." in the reasoning.
+    """
+    import re
+    patterns = {
+        "hypothesis": r"[Hh]ypothesis:\s*(.+?)(?=\s*(?:Test:|Evidence:|Observation:|Plan:|$))",
+        "evidence": r"(?:Observation|Evidence):\s*(.+?)(?=\s*(?:Hypothesis:|Test:|Plan:|$))",
+        "plan": r"(?:Test|Plan):\s*(.+?)(?=\s*(?:Hypothesis:|Observation:|Evidence:|$))",
+    }
+    pattern = patterns.get(field)
+    if not pattern:
+        return fallback
+    match = re.search(pattern, reasoning, re.DOTALL)
+    if match:
+        return match.group(1).strip()[:300]
+    return fallback
+
+
 def _parse_response(raw: str) -> InvestigationResult:
     """Parse LLM JSON response into InvestigationResult."""
     raw = raw.strip()
@@ -117,13 +137,27 @@ def _parse_response(raw: str) -> InvestigationResult:
             findings_text = _format_structured_findings(findings_raw)
         else:
             findings_text = str(findings_raw)
+
+        reasoning = data.get("reasoning", "")
+        hypothesis = data.get("hypothesis", "")
+        evidence = data.get("evidence", "")
+        plan = data.get("plan", "")
+
+        # If model didn't use separate fields, extract from reasoning text
+        if not hypothesis and reasoning:
+            hypothesis = _extract_from_reasoning(reasoning, "hypothesis")
+        if not evidence and reasoning:
+            evidence = _extract_from_reasoning(reasoning, "evidence")
+        if not plan and reasoning:
+            plan = _extract_from_reasoning(reasoning, "plan")
+
         return InvestigationResult(
             done=bool(data.get("done", False)),
             commands=data.get("commands", []),
-            hypothesis=data.get("hypothesis", ""),
-            evidence=data.get("evidence", ""),
-            plan=data.get("plan", ""),
-            reasoning=data.get("reasoning", ""),
+            hypothesis=hypothesis,
+            evidence=evidence,
+            plan=plan,
+            reasoning=reasoning,
             findings=findings_text,
             layer=data.get("layer", ""),
         )
