@@ -171,21 +171,7 @@ class Display:
         logger.info("RCA Summary\n%s\n%s\n%s", "=" * 70, snippet, "=" * 70)
 
         if audit_only:
-            directives = fixes or []
-            t = PrettyTable()
-            t.field_names = ["#", "Tier", "Tool", "Directive", "Target"]
-            t.align["#"] = "r"
-            t.align["Tier"] = "c"
-            t.align["Tool"] = "l"
-            t.align["Directive"] = "l"
-            t.align["Target"] = "l"
-            for i, fix in enumerate(directives, 1):
-                params = ", ".join(f"{k}={v}" for k, v in fix.get("params", {}).items())
-                t.add_row([i, fix.get("tier", "?"), fix.get("tool", ""),
-                           fix.get("description", ""), params])
-            logger.info("Audit Directives\n%s",
-                        t.get_string(title=f"Audit Directives — {len(directives)} suggested fixes | "
-                                           f"Tokens: {in_tok + out_tok:,}"))
+            # Fix plan table already printed by merge_fixes — skip duplicate
             return
 
         # Remediation results table

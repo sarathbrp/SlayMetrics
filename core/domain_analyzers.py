@@ -102,7 +102,9 @@ class NetworkAnalyzer:
         if save_dir:
             save_prompt(save_dir, "network",
                          {"network_audit_section": network_section,
-                          "live_audit_output": live_audit, "similar_cases": similar_cases},
+                          "live_audit_output": live_audit, "similar_cases": similar_cases,
+                          "investigation_notes": investigation_notes,
+                          "performance_rules": performance_rules},
                          fixes, summary, in_tok, out_tok)
         return fixes, summary, in_tok, out_tok, elapsed
 
@@ -190,7 +192,9 @@ class KernelAnalyzer:
             save_prompt(save_dir, "kernel",
                          {"kernel_audit_section": kernel_section,
                           "benchmark_results": benchmark_results,
-                          "network_summary": network_summary, "similar_cases": similar_cases},
+                          "network_summary": network_summary, "similar_cases": similar_cases,
+                          "investigation_notes": investigation_notes,
+                          "performance_rules": performance_rules},
                          fixes, summary, in_tok, out_tok)
         return fixes, summary, in_tok, out_tok, elapsed
 
@@ -279,6 +283,8 @@ class NginxAnalyzer:
                          {"nginx_audit_section": nginx_section,
                           "benchmark_results": benchmark_results,
                           "network_summary": network_summary,
-                          "kernel_summary": kernel_summary, "similar_cases": similar_cases},
+                          "kernel_summary": kernel_summary, "similar_cases": similar_cases,
+                          "investigation_notes": investigation_notes,
+                          "performance_rules": performance_rules},
                          fixes, "", in_tok, out_tok)
         return fixes, in_tok, out_tok, elapsed

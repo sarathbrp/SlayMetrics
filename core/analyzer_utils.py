@@ -55,7 +55,19 @@ def save_prompt(save_dir: Path, name: str, inputs: dict,
     """Save LLM prompt + response to session folder for debugging."""
     try:
         history = dspy.settings.lm.history
-        raw_messages = history[-1] if history else {}
+        raw_entry = history[-1] if history else {}
+        # Extract the LLM response text from history
+        llm_response = ""
+        if isinstance(raw_entry, dict):
+            # DSPy stores response in 'response' or 'outputs' depending on version
+            resp = raw_entry.get("response", raw_entry.get("outputs", ""))
+            if isinstance(resp, dict):
+                choices = resp.get("choices", [])
+                if choices:
+                    llm_response = choices[0].get("message", {}).get("content", "")
+            elif isinstance(resp, str):
+                llm_response = resp
+
         save_dir.mkdir(parents=True, exist_ok=True)
         path = save_dir / f"prompt_{name}.json"
         payload = {
@@ -65,8 +77,9 @@ def save_prompt(save_dir: Path, name: str, inputs: dict,
                        for k, v in inputs.items()},
             "fixes": fixes,
             "summary": summary,
+            "llm_response": llm_response[:5000] if llm_response else "",
             "tokens": {"input": in_tok, "output": out_tok},
-            "raw_messages": raw_messages,
+            "raw_messages": raw_entry,
         }
         path.write_text(json.dumps(payload, indent=2, default=str))
         logger.debug("Prompt saved to %s", path)
