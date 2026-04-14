@@ -5,7 +5,6 @@ import logging
 import signal
 import sys
 from datetime import datetime
-from pathlib import Path
 from typing import Any, TypedDict
 from uuid import uuid4
 
@@ -52,7 +51,8 @@ class RCAState(TypedDict):
     kernel_summary: str           # chained → analyze_nginx
     nginx_fixes: list
     rca_report: str               # combined summaries
-    fixes: list                   # merged + sorted from all 3 domains
+    fix_groups: list               # LLM-grouped fixes for group remediation
+    fixes: list                   # flattened fixes with _group metadata
     fix_index: int
     applied_fixes: list           # [(description, improvement_pct)]
     rejected_fixes: list          # [(description, improvement_pct)]
@@ -197,7 +197,7 @@ class RCAAgent:
             "network_fixes": [], "network_summary": "",
             "kernel_fixes":  [], "kernel_summary":  "",
             "nginx_fixes":   [],
-            "rca_report": "", "fixes": [], "fix_index": 0,
+            "rca_report": "", "fix_groups": [], "fixes": [], "fix_index": 0,
             "applied_fixes": [], "rejected_fixes": [],
             "total_input_tokens": 0, "total_output_tokens": 0,
             "llm_calls": [], "error": "",

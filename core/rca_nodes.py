@@ -309,6 +309,7 @@ def _llm_fix_review(
 
 
 def remediate_fix(state: RCAState, agent: RCAAgent) -> RCAState:
+    """Apply fixes — group-aware. Fixes with same _group are applied together."""
     fixes    = state["fixes"]
     idx      = state["fix_index"]
     fix      = fixes[idx]
@@ -316,70 +317,95 @@ def remediate_fix(state: RCAState, agent: RCAAgent) -> RCAState:
     applied  = list(state.get("applied_fixes", []))
     rejected = list(state.get("rejected_fixes", []))
 
-    logger.info(
-        "--- Fix %d/%d [Tier %s] ---\n  tool: %s\n  desc: %s\n  params: %s",
-        idx + 1, len(fixes), fix.get("tier", "?"),
-        fix.get("tool", ""), fix.get("description", ""), fix.get("params", {}),
-    )
-    try:
-        if fix.get("_net_scope") == "read":
-            logger.warning(
-                "Network tool '%s' scope=read — skipping apply. "
-                "Set scope to 'write' in config.yaml to allow.",
-                fix.get("tool", ""),
-            )
-            rejected.append((fix.get("description", ""), 0.0))
-            return {**state, "fix_index": idx + 1, "baseline_rps": baseline,
-                    "applied_fixes": applied, "rejected_fixes": rejected}
+    # Collect all fixes in the same group
+    group_id = fix.get("_group")
+    if group_id is not None:
+        group_fixes = [f for f in fixes[idx:] if f.get("_group") == group_id]
+        group_label = fix.get("_group_label", f"Group {group_id}")
+        next_idx = idx + len(group_fixes)
+    else:
+        group_fixes = [fix]
+        group_label = fix.get("description", "")
+        next_idx = idx + 1
 
+    logger.info(
+        "--- Group %s (%d fixes) ---\n  %s",
+        group_label, len(group_fixes),
+        "\n  ".join(f"{f.get('tool')}: {f.get('description')}" for f in group_fixes),
+    )
+
+    try:
         with agent._executor() as executor:
             applier = FixApplier(executor)
             agent._current_applier = applier
-            applier.apply(fix)
 
-            if fix.get("tool") in NETWORK_TOOL_NAMES:
-                logger.info("Network tool '%s' auto-accepted (no benchmark needed)", fix.get("tool"))
-                applied.append((fix.get("description", ""), 0.0))
+            # Apply all fixes in the group
+            applied_in_group = []
+            for gf in group_fixes:
+                if gf.get("_net_scope") == "read":
+                    logger.warning("Network tool '%s' scope=read — skipping", gf.get("tool"))
+                    continue
+                try:
+                    applier.apply(gf)
+                    applied_in_group.append(gf)
+                except ValueError as e:
+                    logger.info("Skipped (no-op): %s — %s", gf.get("description"), e)
+                except Exception as e:
+                    logger.error("Failed to apply %s: %s", gf.get("description"), e)
+
+            if not applied_in_group:
+                logger.info("Group %s: no fixes applied (all no-op or failed)", group_label)
+                for gf in group_fixes:
+                    rejected.append((gf.get("description", ""), 0.0))
                 agent._current_applier = None
-                agent._partial_state["applied_fixes"] = applied
-                return {**state, "fix_index": idx + 1, "baseline_rps": baseline,
+                return {**state, "fix_index": next_idx, "baseline_rps": baseline,
                         "applied_fixes": applied, "rejected_fixes": rejected}
 
+            # Check if all are network tools (auto-accept)
+            all_network = all(gf.get("tool") in NETWORK_TOOL_NAMES for gf in applied_in_group)
+            if all_network:
+                logger.info("Group %s: all network tools — auto-accepted", group_label)
+                for gf in applied_in_group:
+                    applied.append((gf.get("description", ""), 0.0))
+                agent._current_applier = None
+                agent._partial_state["applied_fixes"] = applied
+                return {**state, "fix_index": next_idx, "baseline_rps": baseline,
+                        "applied_fixes": applied, "rejected_fixes": rejected}
+
+            # Benchmark the group as a whole
             raw = agent.benchmark.run()
             current_rps = agent.evaluator.parse_rps(raw)
             keep, pct, degraded = agent.evaluator.should_keep(
                 baseline, current_rps, agent.config.remediation_threshold,
                 agent.config.remediation_degradation_tolerance,
             )
-            simple_pct  = agent.evaluator.improvement_pct(baseline, current_rps)
-            weighted_pct = agent.evaluator.weighted_improvement_pct(baseline, current_rps)
 
-            keep, llm_overridden, state = _llm_fix_review(
-                state, agent, fix, baseline, current_rps, keep, simple_pct, weighted_pct, degraded,
-            )
-
+            desc_list = ", ".join(gf.get("description", "") for gf in applied_in_group)
             Display.fix_comparison(
-                idx + 1, len(fixes), fix.get("description", ""),
-                fix.get("tool", ""), fix.get("params", {}),
-                baseline, current_rps, keep, pct, llm_override=llm_overridden,
+                idx + 1, len(fixes), f"[GROUP] {group_label}",
+                "group", {}, baseline, current_rps, keep, pct,
             )
+
             if keep:
-                applied.append((fix.get("description", ""), round(pct, 2)))
+                for gf in applied_in_group:
+                    applied.append((gf.get("description", ""), round(pct, 2)))
                 baseline = current_rps
+                logger.info("Group %s ACCEPTED (+%.1f%%): %s", group_label, pct, desc_list)
             else:
-                rejected.append((fix.get("description", ""), round(pct, 2)))
+                for gf in applied_in_group:
+                    rejected.append((gf.get("description", ""), round(pct, 2)))
                 applier.rollback()
-            agent.tracker.log_fix(fix.get("description", ""), fix.get("tool", ""), keep, pct)
+                logger.info("Group %s REJECTED (%.1f%%): %s", group_label, pct, desc_list)
+
+            agent.tracker.log_fix(f"[GROUP] {group_label}", "group", keep, pct)
             agent._current_applier = None
             agent._partial_state["applied_fixes"]  = applied
             agent._partial_state["rejected_fixes"] = rejected
 
-    except ValueError as e:
-        logger.info("remediate_fix [%d] skipped (no-op at apply time): %s", idx, e)
-        rejected.append((fix.get("description", ""), 0.0))
     except Exception as e:
-        logger.error("remediate_fix [%d] failed: %s", idx, e)
-        rejected.append((fix.get("description", ""), 0.0))
+        logger.error("remediate_fix group [%s] failed: %s", group_label, e)
+        for gf in group_fixes:
+            rejected.append((gf.get("description", ""), 0.0))
 
-    return {**state, "fix_index": idx + 1, "baseline_rps": baseline,
+    return {**state, "fix_index": next_idx, "baseline_rps": baseline,
             "applied_fixes": applied, "rejected_fixes": rejected}

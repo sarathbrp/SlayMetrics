@@ -14,26 +14,42 @@ logger = logging.getLogger("slayMetrics.fix_generation")
 
 
 def generate_fixes(state: RCAState, agent: RCAAgent) -> RCAState:
-    """Generate fix list from investigation findings in one LLM call."""
+    """Generate fix groups from investigation findings in one LLM call."""
     if state.get("error"):
         return state
 
     save_dir = REPORTS_DIR / state.get("session_id", "unknown")
     try:
-        fixes, rca_summary, in_tok, out_tok, elapsed = agent.fix_generator.generate(
+        groups, rca_summary, in_tok, out_tok, elapsed = agent.fix_generator.generate(
             investigation_notes=state.get("investigation_notes", ""),
             benchmark_results=state.get("benchmark_results", ""),
             live_audit_output=state.get("live_audit_output", ""),
             performance_rules=agent.perf_rules,
             save_dir=save_dir,
         )
+        total_fixes = sum(len(g.get("fixes", [])) for g in groups)
         calls = list(state.get("llm_calls", []))
-        calls.append(("fix_generator", round(elapsed, 1), in_tok, out_tok, len(fixes)))
-        agent.tracker.log_llm_call("fix_generator", elapsed, in_tok, out_tok, len(fixes))
+        calls.append(("fix_generator", round(elapsed, 1), in_tok, out_tok, total_fixes))
+        agent.tracker.log_llm_call("fix_generator", elapsed, in_tok, out_tok, total_fixes)
+
+        # Flatten groups into fixes list with group metadata for merge_fixes
+        all_fixes = []
+        for g in groups:
+            group_id = g.get("group", 0)
+            label = g.get("label", "")
+            rationale = g.get("rationale", "")
+            for fix in g.get("fixes", []):
+                fix["_group"] = group_id
+                fix["_group_label"] = label
+                fix["_group_rationale"] = rationale
+                if "tier" not in fix:
+                    fix["tier"] = group_id
+                all_fixes.append(fix)
 
         return {
             **state,
-            "fixes": fixes,
+            "fix_groups": groups,
+            "fixes": all_fixes,
             "rca_report": rca_summary,
             "llm_calls": calls,
             "total_input_tokens": state.get("total_input_tokens", 0) + in_tok,

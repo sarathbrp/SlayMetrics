@@ -19,17 +19,28 @@ from .analyzer_utils import extract_tokens, save_prompt
 logger = logging.getLogger("slayMetrics.fix_generator")
 
 
-def _parse_fixes(raw: str) -> tuple[list[dict], str]:
-    """Parse LLM JSON response into (fixes, rca_summary)."""
+def _parse_fix_groups(raw: str) -> tuple[list[dict], str]:
+    """Parse LLM JSON response into (fix_groups, rca_summary).
+
+    Each group: {"group": N, "label": "...", "rationale": "...", "fixes": [...]}
+    Falls back to flat fixes list if fix_groups key is missing.
+    """
     raw = raw.strip()
     if raw.startswith("```"):
         lines = raw.splitlines()
         raw = "\n".join(lines[1:-1]) if len(lines) > 2 else ""
     try:
         data = json.loads(raw)
-        fixes = data.get("fixes", []) if isinstance(data, dict) else data
         summary = data.get("rca_summary", "") if isinstance(data, dict) else ""
-        return fixes, summary
+        groups = data.get("fix_groups", [])
+        if groups:
+            return groups, summary
+        # Fallback: flat fixes list → wrap in single group
+        flat = data.get("fixes", [])
+        if flat:
+            return [{"group": 1, "label": "all fixes", "rationale": "flat list",
+                     "fixes": flat}], summary
+        return [], summary
     except (json.JSONDecodeError, AttributeError):
         logger.warning("Failed to parse fix generator response")
         return [], ""
@@ -75,9 +86,10 @@ class FixGenerator:
         performance_rules: str,
         save_dir: Path | None = None,
     ) -> tuple[list[dict], str, int, int, float]:
-        """Generate fixes from investigation findings.
+        """Generate fix groups from investigation findings.
 
-        Returns (fixes, rca_summary, input_tokens, output_tokens, elapsed).
+        Returns (fix_groups, rca_summary, input_tokens, output_tokens, elapsed).
+        Each group: {"group": N, "label": "...", "rationale": "...", "fixes": [...]}
         """
         if self._module is None:
             self._module = self._build()
@@ -90,17 +102,24 @@ class FixGenerator:
             performance_rules=performance_rules,
         )
         elapsed = (datetime.now() - t0).total_seconds()
-        fixes, rca_summary = _parse_fixes(pred.result_json)
+        groups, rca_summary = _parse_fix_groups(pred.result_json)
         in_tok, out_tok = extract_tokens()
-        logger.info("Fix generation done in %.1fs — %d fixes", elapsed, len(fixes))
-        for f in fixes:
-            logger.info("  [Fix] %s → tool=%s params=%s",
-                        f.get("description", ""), f.get("tool", ""), f.get("params", {}))
+        total_fixes = sum(len(g.get("fixes", [])) for g in groups)
+        logger.info("Fix generation done in %.1fs — %d groups, %d fixes",
+                    elapsed, len(groups), total_fixes)
+        for g in groups:
+            logger.info("  [Group %d] %s (%d fixes): %s",
+                        g.get("group", "?"), g.get("label", ""),
+                        len(g.get("fixes", [])), g.get("rationale", ""))
+            for f in g.get("fixes", []):
+                logger.info("    → %s: tool=%s params=%s",
+                            f.get("description", ""), f.get("tool", ""),
+                            f.get("params", {}))
         if save_dir:
             save_prompt(save_dir, "fix_generator",
                         {"investigation_notes": investigation_notes,
                          "benchmark_results": benchmark_results,
                          "live_audit_output": live_audit_output,
                          "performance_rules": performance_rules},
-                        fixes, rca_summary, in_tok, out_tok)
-        return fixes, rca_summary, in_tok, out_tok, elapsed
+                        groups, rca_summary, in_tok, out_tok)
+        return groups, rca_summary, in_tok, out_tok, elapsed
