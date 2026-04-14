@@ -26,6 +26,9 @@ class InvestigationResult:
     """Parsed output from one investigation turn."""
     done: bool
     commands: list[str] = field(default_factory=list)
+    hypothesis: str = ""
+    evidence: str = ""
+    plan: str = ""
     reasoning: str = ""
     findings: str = ""
     layer: str = ""
@@ -117,6 +120,9 @@ def _parse_response(raw: str) -> InvestigationResult:
         return InvestigationResult(
             done=bool(data.get("done", False)),
             commands=data.get("commands", []),
+            hypothesis=data.get("hypothesis", ""),
+            evidence=data.get("evidence", ""),
+            plan=data.get("plan", ""),
             reasoning=data.get("reasoning", ""),
             findings=findings_text,
             layer=data.get("layer", ""),

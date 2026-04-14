@@ -23,7 +23,8 @@ logger = logging.getLogger("slayMetrics.investigation")
 
 
 def _save_iteration(save_dir: Path, iteration: int,
-                    reasoning: str, commands_run: list[dict]) -> None:
+                    hypothesis: str, evidence: str, plan: str,
+                    findings: str, commands_run: list[dict]) -> None:
     """Save one investigation iteration to session folder for debugging."""
     try:
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -31,7 +32,10 @@ def _save_iteration(save_dir: Path, iteration: int,
         path.write_text(json.dumps({
             "timestamp": datetime.now().isoformat(),
             "iteration": iteration,
-            "reasoning": reasoning,
+            "hypothesis": hypothesis,
+            "evidence": evidence,
+            "plan": plan,
+            "findings": findings,
             "commands": commands_run,
         }, indent=2, default=str))
     except Exception as e:
@@ -72,16 +76,24 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                 total_out += out_tok
                 total_elapsed += elapsed
 
+                # Log hypothesis and plan before running commands
+                if result.hypothesis:
+                    logger.info("  Hypothesis: %s", result.hypothesis)
+                if result.evidence:
+                    logger.info("  Evidence: %s", result.evidence[:200])
+                if result.plan:
+                    logger.info("  Plan: %s", result.plan)
+
                 if result.done:
                     logger.info(
                         "Investigation complete at iteration %d (%.1fs total)",
                         iteration, total_elapsed,
                     )
-                    # Use the structured conclusion as the final notes
-                    # (replaces raw command dumps with clean summary)
                     if result.findings:
                         conclusion = result.findings
-                    _save_iteration(save_dir, iteration, result.reasoning, [])
+                    _save_iteration(save_dir, iteration,
+                                    result.hypothesis, result.evidence, result.plan,
+                                    result.findings, [])
                     break
 
                 iter_log: list[dict] = []
@@ -112,10 +124,13 @@ def investigate(state: RCAState, agent: RCAAgent) -> RCAState:
                     findings.append(f"$ {cmd}\n{output}")
                     iter_log.append({
                         "cmd": cmd, "blocked": False,
+                        "output": output[:1024],
                         "output_len": len(stdout),
                     })
 
-                _save_iteration(save_dir, iteration, result.reasoning, iter_log)
+                _save_iteration(save_dir, iteration,
+                                result.hypothesis, result.evidence, result.plan,
+                                result.findings, iter_log)
 
     except Exception as e:
         logger.error("Investigation failed: %s", e)
