@@ -375,9 +375,13 @@ def remediate_fix(state: RCAState, agent: RCAAgent) -> RCAState:
             # Benchmark the group as a whole
             raw = agent.benchmark.run()
             current_rps = agent.evaluator.parse_rps(raw)
-            keep, pct, degraded = agent.evaluator.should_keep(
-                baseline, current_rps, agent.config.remediation_threshold,
-                agent.config.remediation_degradation_tolerance,
+            tier = fix.get("tier", fix.get("_group", 1))
+            keep, pct, degraded = agent.evaluator.should_keep_group(
+                baseline, current_rps,
+                tier=tier,
+                tier_thresholds=agent.config.group_tier_thresholds or None,
+                high_value_share=agent.config.group_high_value_share,
+                high_value_max_degradation=agent.config.group_high_value_max_degradation,
             )
 
             desc_list = ", ".join(gf.get("description", "") for gf in applied_in_group)

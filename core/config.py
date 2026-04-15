@@ -121,6 +121,19 @@ class Config:
     def remediation_llm_review_rejected(self) -> bool:
         return self._cfg.get("remediation", {}).get("llm_review_rejected", False)
 
+    @property
+    def group_tier_thresholds(self) -> dict[int, float]:
+        raw = self._cfg.get("remediation", {}).get("group_tier_thresholds", {})
+        return {int(k): float(v) for k, v in raw.items()} if raw else {}
+
+    @property
+    def group_high_value_share(self) -> float:
+        return self._cfg.get("remediation", {}).get("group_high_value_share", 0.10)
+
+    @property
+    def group_high_value_max_degradation(self) -> float:
+        return self._cfg.get("remediation", {}).get("group_high_value_max_degradation", -10.0)
+
     # --- MLflow — env vars override config.yaml ---
     @property
     def mlflow_enabled(self) -> bool:

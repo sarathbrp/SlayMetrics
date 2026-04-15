@@ -146,3 +146,63 @@ class Evaluator:
                 priority_avg, threshold, "KEEP" if keep else "ROLLBACK",
             )
         return keep, priority_avg, degraded
+
+    @staticmethod
+    def should_keep_group(
+        baseline: dict[str, float],
+        current: dict[str, float],
+        tier: int = 1,
+        tier_thresholds: dict[int, float] | None = None,
+        high_value_share: float = 0.10,
+        high_value_max_degradation: float = -10.0,
+    ) -> tuple[bool, float, dict[str, float]]:
+        """Group-aware acceptance: total RPS change + tier-aware threshold.
+
+        Uses absolute RPS sum instead of per-workload % average to prevent
+        low-RPS workloads from vetoing high-value improvements.
+
+        Returns (keep, net_pct, degraded_high_value_workloads).
+        """
+        defaults = {1: -10.0, 2: -5.0, 3: -3.0, 4: -2.0, 5: -2.0, 6: -1.0}
+        thresholds = tier_thresholds or defaults
+        threshold = thresholds.get(tier, thresholds.get(6, -1.0))
+
+        common = set(baseline) & set(current)
+        if not common:
+            return False, 0.0, {}
+
+        baseline_total = sum(baseline[w] for w in common)
+        current_total = sum(current[w] for w in common)
+        if baseline_total == 0:
+            return False, 0.0, {}
+
+        net_pct = (current_total - baseline_total) / baseline_total * 100
+
+        # Protect high-value workloads (>10% of total baseline RPS)
+        degraded_hv: dict[str, float] = {}
+        for w in common:
+            share = baseline[w] / baseline_total
+            if share < high_value_share:
+                continue
+            if baseline[w] == 0:
+                continue
+            wl_pct = (current[w] - baseline[w]) / baseline[w] * 100
+            if wl_pct < high_value_max_degradation:
+                degraded_hv[w] = wl_pct
+
+        keep = net_pct >= threshold and not degraded_hv
+
+        if degraded_hv:
+            logger.info(
+                "Group eval: net=%.2f%% tier=%d threshold=%.1f%% — REJECT "
+                "(high-value degraded: %s)",
+                net_pct, tier, threshold,
+                ", ".join(f"{w}={d:.1f}%" for w, d in degraded_hv.items()),
+            )
+        else:
+            logger.info(
+                "Group eval: net=%.2f%% (total: %.0f→%.0f) tier=%d threshold=%.1f%% — %s",
+                net_pct, baseline_total, current_total,
+                tier, threshold, "KEEP" if keep else "REJECT",
+            )
+        return keep, net_pct, degraded_hv

@@ -33,6 +33,15 @@ remediation:
     iptables_connlimit: write
     nftables_ratelimit: write
   max_fixes: 23                     # safety cap on fixes per run
+  group_tier_thresholds:             # net total RPS % threshold per tier (more lenient for critical tiers)
+    1: -10.0                         # sabotage removal — must accept even with brief disruption
+    2: -5.0                          # constraint chains — applied together, may show no individual gain
+    3: -3.0                          # connection stack — moderate leniency
+    4: -2.0                          # I/O path tuning
+    5: -2.0                          # network tuning
+    6: -1.0                          # fine tuning — should clearly help
+  group_high_value_share: 0.10       # workload must be >10% of total RPS to be "high-value"
+  group_high_value_max_degradation: -10.0  # reject if high-value workload degrades >10%
 
 target:
   mode: ssh
