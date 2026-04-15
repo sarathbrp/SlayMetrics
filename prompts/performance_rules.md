@@ -88,3 +88,5 @@ Fixes MUST be tiered in this order:
 18. `sendfile` is automatically disabled by nginx when content-changing filters (gzip, sub_filter) are active in the same context — this is expected behavior, not a bug
 19. On multi-core systems (>4 cores), `listen 80 reuseport;` enables SO_REUSEPORT socket sharding — each worker gets its own socket listener, eliminating kernel accept lock contention. This makes accept_mutex redundant (automatically disabled when reuseport is set). Combine with backlog: `listen 80 reuseport backlog=65535;`
 20. The `listen` directive parameters (reuseport, backlog) are in the server{} block (conf.d/), NOT in nginx.conf main/http context
+21. worker_connections=256 (default 512) is a CRITICAL bottleneck on multi-core systems — with 112 workers × 256 = only 28K total concurrent connections. Raise to at least 4096-65535 per worker. ALWAYS flag worker_connections < 1024 as a problem, even if RPS looks acceptable — it limits peak throughput under load spikes
+22. worker_connections, tcp_nopush, tcp_nodelay, and keepalive_requests are common "last mile" bottlenecks — ALWAYS check and fix these even when major sabotage has been resolved
