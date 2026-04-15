@@ -51,8 +51,10 @@ if command -v nginx >/dev/null 2>&1; then
     fmt_line "nginx_binary" "$(which nginx)"
     fmt_line "nginx_runtime" "host"
     CONF_DUMP=$(nginx -T 2>/dev/null)
-    WP=$(echo "$CONF_DUMP" | grep -E "^\s*worker_processes\s+" | tail -n1 | awk '{print $2}' | tr -d ';')
-    fmt_line "nginx_worker_processes" "${WP:-unknown}"
+    for d in worker_processes worker_connections worker_rlimit_nofile sendfile tcp_nopush tcp_nodelay access_log keepalive_timeout keepalive_requests; do
+        VAL=$(echo "$CONF_DUMP" | grep -E "^\s*$d\s+" | tail -n1 | awk '{$1=""; print $0}' | sed 's/^ //;s/;$//')
+        fmt_line "nginx_$d" "${VAL:-default}"
+    done
 else
     fmt_line "nginx_binary" "not found"
 fi
