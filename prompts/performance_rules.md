@@ -46,6 +46,11 @@ Fixes MUST be tiered in this order:
 | 3 | Tune keepalive, buffers, tcp params | Incremental gains through monitoring |
 | 3 | Fix scheduling (CPUWeight, IOWeight, Nice) | Priority tuning |
 
+### Mandatory Grouping Rules (OOM prevention)
+
+- **MemoryMax removal MUST be in the SAME group as worker_processes=auto and TasksMax=infinity**. Spawning 112 workers (auto) without raising the memory cap (e.g., 256M) causes cgroup OOM kill. All three must be applied together or not at all.
+- **All systemd sabotage settings MUST be in ONE group**: CPUQuota, MemoryMax, Nice, CPUWeight, IOWeight, OOMScoreAdjust, TasksMax + worker_processes=auto. These compound — partial removal can cause OOM, scheduling starvation, or no measurable improvement.
+
 ### Hard Rules
 
 1. NEVER set tcp_tw_reuse=1 — always use 2 on RHEL (kernel-controlled reuse)
