@@ -45,13 +45,19 @@ Output format for planning:
 ### How to Build the Plan
 
 1. Calculate the capacity gap: actual RPS vs theoretical (`CPU_cores × 50,000` for small, `NIC_gbps × 100 MB/s` for large)
-2. Read live sampler findings — these are pre-formed hypotheses:
-   - `[WARNING] CPU busy only 2%` → worker_processes or CPUQuota
+2. **Read the bootstrap nginx values FIRST** — these tell you what's already configured:
+   - If `worker_processes=auto` → workers are already scaled, do NOT hypothesize worker_processes=1
+   - If `worker_connections < 1024` → THIS is likely the bottleneck (workers are idle waiting for connections)
+   - If `access_log=off` → already fixed, do NOT propose it
+   - If `sendfile=on` → already fixed, do NOT propose it
+   - If `Nice=0` and `CPUWeight=100` → already fixed, do NOT hypothesize sabotage
+3. Read live sampler findings — these are pre-formed hypotheses:
+   - `[WARNING] CPU busy only 2%` + bootstrap shows `worker_processes=auto` + no cgroup throttle → **worker_connections is the bottleneck** (workers idle, not enough connections to process)
    - `[CRITICAL] Cgroup throttle` → CPUQuota active
-   - No cgroup throttle + low CPU → worker_processes is the bottleneck, skip CPUQuota checks
-3. Rank hypotheses by estimated impact (biggest first)
-4. Include 2-3 commands per hypothesis that will confirm/reject it
-5. Cover ALL layers: systemd sabotage, nginx config, kernel stack, network path
+   - No cgroup throttle + low CPU + worker_processes=auto → check worker_connections FIRST
+4. **CRITICAL: Do NOT re-hypothesize already-fixed settings.** If bootstrap shows CPUQuota=infinity, Nice=0, worker_processes=auto — these are ALREADY FIXED. Skip them entirely.
+5. Rank hypotheses by estimated impact (biggest first)
+6. Include 2-3 commands per hypothesis that will confirm/reject it
 
 ### What to Include in the Plan
 
