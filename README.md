@@ -1,245 +1,291 @@
-# SlayMetrics — Autonomous RCA & Remediation Agent
+# SlayMetrics — Autonomous SRE Performance Agent
 
-A LangGraph + DSPy agent that autonomously diagnoses and fixes NGINX performance bottlenecks on a remote DUT (Device Under Test). It runs an audit, benchmarks with live runtime sampling, generates domain-focused LLM Root Cause Analyses with chained context, applies fixes in a benchmark-gated loop, and learns from each run.
+An autonomous LLM-driven agent that diagnoses and remediates NGINX performance bottlenecks on RHEL 9.x systems. It investigates like a senior SRE — forming hypotheses, validating via SSH, and applying fixes in dependency-aware groups with benchmark-gated acceptance.
 
 ---
 
 ## Architecture
 
 ```
-run_audit → run_benchmark ──── live sampler (background SSH thread) ────┐
-                 ↓                                                       ↓
-          analyze_network ──(network_summary)──→ analyze_kernel ──(kernel_summary)──→ analyze_nginx
-               ↓                                      ↓                                   ↓
-          (net fixes)                          (sysctl fixes)                      (nginx fixes)
-               └──────────────────────────────────────┴───────────────────────────────────┘
-                                                       ↓
-                                                 merge_fixes
-                                                       ↓
-                                               remediate_fix ◄────────────────────┐
-                                                       ↓ more fixes?              │
-                                                       └───────────────────────────┘
-                                                       ↓ done
-                                                      END
+                         ┌──────────────────────┐
+                         │   bootstrap_audit.sh  │
+                         │   (5s, system ID)     │
+                         └──────────┬───────────┘
+                                    │
+                         ┌──────────▼───────────┐
+                         │   preflight_check     │
+                         │   nginx up? HTTP 200? │
+                         │   fix fs.nr_open trap │
+                         └──────────┬───────────┘
+                                    │
+                         ┌──────────▼───────────┐
+                         │   run_benchmark       │
+                         │   5 workloads (~5min)  │
+                         │   + live sampler       │
+                         └──────────┬───────────┘
+                                    │
+              ┌─────────────────────▼─────────────────────┐
+              │         SRE Investigation Agent            │
+              │                                           │
+              │  PLANNING (1 LLM call, no SSH)            │
+              │  → Analyze bootstrap + benchmark          │
+              │    + live sampler findings                 │
+              │  → Produce ranked hypothesis table        │
+              │                                           │
+              │  EXECUTION (1 LLM call per hypothesis)    │
+              │  → [P1] worker_processes=1  ──► SSH       │
+              │  → [P2] LimitNOFILE=512     ──► SSH       │
+              │  → [P3] access_log on       ──► SSH       │
+              │  → [PN] ...                 ──► SSH       │
+              │                                           │
+              │  FORCED SUMMARY (if needed)               │
+              │  → Structured report for fix generator    │
+              └─────────────────┬─────────────────────────┘
+                                │
+              ┌─────────────────▼─────────────────────┐
+              │       Fix Generator (1 LLM call)       │
+              │  Input: investigation report + rules   │
+              │  Output: fix_groups (not flat list)    │
+              │  ┌──────────────────────────────────┐  │
+              │  │ Grp1: systemd sabotage (6 fixes) │  │
+              │  │ Grp2: CPU capacity (2 fixes)     │  │
+              │  │ Grp3: fd chain (4 fixes)         │  │
+              │  │ Grp4: backlog chain (3 fixes)    │  │
+              │  │ Grp5: I/O path (2 fixes)         │  │
+              │  └──────────────────────────────────┘  │
+              └─────────────────┬──────────────────────┘
+                                │
+              ┌─────────────────▼──────────────────────┐
+              │          merge_fixes                     │
+              │  validate tools, filter no-ops           │
+              └─────────────────┬──────────────────────┘
+                                │
+     ┌──────────────────────────▼──────────────────────────┐
+     │           Group-Based Remediation Loop               │
+     │                                                      │
+     │  ┌─────────────────────────────────────────────┐     │
+     │  │ Grp1: Apply ALL fixes ──► benchmark ──►     │     │
+     │  │       ACCEPT or REJECT (rollback entire grp)│     │
+     │  ├─────────────────────────────────────────────┤     │
+     │  │ Grp2 ... GrpN: same pattern                │     │
+     │  └─────────────────────────────────────────────┘     │
+     │                        │                             │
+     │              Any rejected groups?                    │
+     │                ┌───────┴───────┐                     │
+     │              YES               NO                    │
+     │                ▼                ▼                     │
+     │  ┌──────────────────┐   ┌──────────┐                │
+     │  │ RETRY PASS (1x)  │   │   DONE   │                │
+     │  │ Re-test rejected │   └────┬─────┘                │
+     │  │ on improved sys  │        │                       │
+     │  └────────┬─────────┘        │                       │
+     │           └──────────────────┘                       │
+     └──────────────────────┬──────────────────────────────┘
+                            │
+              ┌─────────────▼──────────────────┐
+              │     Final Benchmark (5 min)     │
+              └─────────────┬──────────────────┘
+                            │
+              ┌─────────────▼──────────────────┐
+              │     Comparisons                 │
+              │     vs detuned baseline         │
+              │     vs vanilla (healthy)        │
+              └─────────────┬──────────────────┘
+                            │
+              ┌─────────────▼──────────────────┐
+              │     Final Report (markdown)     │
+              └────────────────────────────────┘
 ```
-
-**Three focused LLM calls per run — with chained context:**
-1. `analyze_network` — live metrics + Group 5 audit → network fixes + `network_summary`
-2. `analyze_kernel` — Groups 1-3 audit + `network_summary` → kernel fixes + `kernel_summary`
-3. `analyze_nginx` — Group 4 audit + both summaries → nginx fixes
-
-Each node receives a compact summary of what previous nodes found and fixed — no domain overlap, no repeated recommendations.
-
-All fix execution is plain Python + SSH — no LLM in the remediation loop.
 
 ---
 
-## Features
+## Technology Stack
 
-- **5-group static audit** via `omega_master_audit.sh` — hardware, kernel, systemd, nginx, network chaos
-- **Live runtime sampler** — background SSH thread collects 25 samples during benchmark (TCP state, NIC discards, softirq, cgroup throttle, CPU); analyzed into compact hypothesis via pandas; injected into `analyze_network`
-- **3 focused domain prompts** — `network_analysis.md`, `kernel_analysis.md`, `nginx_analysis.md` (replaces monolithic `rca.md`)
-- **Context chaining** — each LLM node receives summaries from all previous nodes (no re-suggesting already-fixed issues)
-- **Scoped remediation tools** — LLM can only call pre-defined tools (no arbitrary shell)
-- **Benchmark-gated loop** — each fix benchmarked; kept only if priority workloads (`homepage`, `small`) improve; low-RPS workloads excluded from noise-prone percentage checks
-- **Network chaos tools** — auto-detected and auto-accepted without benchmarking (TC shaping, iptables connlimit, nftables rate limits)
-- **Cooling period** — configurable pause after each benchmark to allow DUT to drain connections before SSH
-- **SSH retry** — 3-attempt retry with backoff on connection timeout
-- **Rollback** — every tool stores original state; restored on rejection or Ctrl+C
-- **Semantic memory** — ChromaDB (local `all-MiniLM-L6-v2`) stores past outcomes; injected into all 3 LLM calls
-- **DSPy optimization** — BootstrapFewShot compiles better prompts after 30+ examples
-- **Session IDs** — every run gets a UUID; all artifacts linked by session
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| **Agent Framework** | [LangGraph](https://github.com/langchain-ai/langgraph) | State machine orchestration with conditional routing |
+| **Prompt Optimization** | [DSPy](https://dspy-docs.vercel.app/) | Typed Signatures, BootstrapFewShot optimization after 30+ runs |
+| **LLM Provider** | GPT-OSS (OpenAI-compatible) | Via `dspy.LM()` with LiteLLM backend |
+| **Experiment Tracking** | [MLflow](https://mlflow.org/) | Run metrics, token usage, fix outcomes |
+| **Semantic Memory** | [ChromaDB](https://www.trychroma.com/) | Local `all-MiniLM-L6-v2` embeddings for past case retrieval |
+| **SSH Execution** | [Paramiko](https://www.paramiko.org/) | Remote command execution, file upload, 3-retry with backoff |
+| **Benchmarking** | [wrk](https://github.com/wg/wrk) | HTTP load testing with Lua scripts per workload |
+| **Live Metrics** | pandas + numpy | Runtime CSV analysis with delta/peak/trend detection |
+| **Language** | Python 3.12+ | Type-annotated, PEP 8, max 300 lines per file |
+
+---
+
+## How DSPy Works Here
+
+DSPy provides **typed LLM interfaces** via Signatures — each LLM call has defined InputFields and OutputFields with descriptions. This gives us:
+
+1. **Structured I/O** — the LLM receives named fields (not a blob of text) and returns typed outputs
+2. **Prompt optimization** — after collecting 30+ run examples, `BootstrapFewShot` compiles optimized few-shot prompts that improve fix accuracy over time
+3. **Provider-agnostic** — swap LLM by changing one line in `.env` (`GPT_OSS_MODEL`)
+
+```python
+class Sig(dspy.Signature):
+    investigation_notes: str = dspy.InputField(desc="SRE investigation findings")
+    performance_rules: str = dspy.InputField(desc="Constraint chains and fix ordering rules")
+    result_json: str = dspy.OutputField(desc='JSON: {"fix_groups": [...]}')
+
+Sig.__doc__ = (prompts_dir / "fix_generator.md").read_text()
+module = dspy.Predict(Sig)
+result = module(investigation_notes=notes, performance_rules=rules)
+```
+
+**DSPy calls in the pipeline:**
+
+| Call | Module | Input | Output |
+|------|--------|-------|--------|
+| Investigation planning | `dspy.Predict` | bootstrap + benchmark + live sampler | Hypothesis table |
+| Investigation execution | `dspy.Predict` × N | Previous findings + planned hypothesis | Commands + findings |
+| Fix generation | `dspy.Predict` | Investigation report + tool docs + rules | Fix groups |
+
+---
+
+## Observability
+
+### MLflow Integration
+
+Every run is tracked as an MLflow experiment with:
+
+- **Run metadata**: session ID, DUT host, LLM model, timestamps
+- **Metrics**: total tokens (input/output), fix count, acceptance rate
+- **Per-fix tracking**: description, tool, accepted/rejected, improvement %
+- **Artifacts**: final report, investigation iterations, prompt I/O
+
+```bash
+# Enable in config.yaml or .env
+SLAY_MLFLOW_ENABLED=true
+SLAY_MLFLOW_URI=http://localhost:5000
+```
+
+### Session Artifacts
+
+Each run produces a full audit trail:
+
+```
+rca_reports/<session-uuid>/
+  investigation_iter_0.json    # planning phase (hypothesis table)
+  investigation_iter_1.json    # execution: hypothesis, evidence, plan, commands + outputs
+  investigation_iter_2.json    # ...
+  live_samples.csv             # 25+ runtime metric samples during benchmark
+  prompt_fix_generator.json    # fix generator LLM I/O (what it received, what it produced)
+  final_report.md              # comprehensive run summary
+  final_benchmark.txt          # post-fix benchmark results
+  rca_report.md                # RCA summary
+
+logs/
+  audit_rca_YYYYMMDD_HHMMSS.log  # full run log with hypothesis/evidence/plan per iteration
+```
+
+### DSPy Learning Pipeline
+
+```
+Run 1-5:   Collect examples → dspy_data/examples.jsonl
+Run 6+:    BootstrapFewShot triggers → compiles optimized prompts
+Run N+:    Optimized prompts improve fix accuracy over time
+```
+
+---
+
+## Key Features
+
+### Autonomous SRE Investigation
+- **Plan-driven**: LLM analyzes 3 inputs (bootstrap + benchmark + live sampler), produces ranked hypothesis table
+- **Hypothesis → evidence → plan → commands**: each iteration is logged with full reasoning
+- **Adaptive**: number of iterations varies (3-10) based on how quickly hypotheses are confirmed
+- **Performance rules spec**: 20 rules from Red Hat KB + nginx.org, injected into every LLM call
+
+### Intelligent Fix Generation
+- **Single LLM call** replaces 3 domain analyzers — sees full investigation report + all tool docs
+- **Group-based output**: dependency chains grouped (fd chain, backlog chain, sabotage removal)
+- **Every confirmed bottleneck produces a fix** — no silent drops
+
+### Group-Based Remediation
+- **Dependency chains applied together**: fs.nr_open → LimitNOFILE → worker_rlimit_nofile → worker_connections tested as ONE unit
+- **Benchmark per group** (not per fix): prevents false rejections of chain dependencies
+- **Retry pass**: rejected groups retried once on the improved system
+
+### Preflight Health Check
+- Detects crashed nginx (LimitNOFILE > fs.nr_open trap)
+- Removes sabotage systemd drop-ins
+- Verifies HTTP reachability before benchmarking
+
+### zz_ Override Pattern
+- Sabotage drop-in files (e.g., `hackathon_degrade.conf`) are never modified or deleted
+- Agent creates `zz_hosttune_<prop>.conf` overrides that sort after sabotage files
+- Values persist across nginx restarts; clean rollback by removing the override
 
 ---
 
 ## Tool Registry
 
-| Tool | Domain | Scope | What it fixes |
-|------|--------|-------|--------------|
-| `tc_shaping` | Network | configurable | Removes HTB qdisc bandwidth throttle — **auto-accepted** |
-| `iptables_connlimit` | Network | configurable | Removes iptables connlimit DROP rules — **auto-accepted** |
-| `nftables_ratelimit` | Network | configurable | Flushes nftables rate-limit rules — **auto-accepted** |
-| `sysctl` | Kernel | always | Kernel network params (somaxconn, tcp buffers, conntrack, etc.) |
-| `systemd_property` | Kernel | always | nginx.service cgroup limits (LimitNOFILE, CPUQuota) |
-| `cpu_governor` | Kernel | always | CPU frequency scaling governor |
-| `nginx_directive` | Nginx | always | nginx config directives (worker_connections, access_log, etc.) |
-| `nginx_listen_backlog` | Nginx | always | TCP listen backlog on nginx listen lines |
-
-Network tools support `none | read | write` scope in `config.yaml`.
-
----
-
-## Evaluation Logic
-
-- **Priority workloads** (`homepage`, `small`): average improvement must be ≥ threshold (`-0.2%` default — reject only if actively hurting)
-- **Other workloads** (`medium`, `large`, `mixed`): degradation must not exceed tolerance (`-5.0%` default)
-- **Low-RPS workloads** (< 10 RPS): excluded from degradation check — percentage swings are meaningless noise at tiny baselines
-- **Network tools**: auto-accepted — removing a 25× bandwidth throttle is always correct
-- All thresholds configurable in `config.yaml`
+| Tool | Domain | What it fixes |
+|------|--------|--------------|
+| `sysctl` | Kernel | somaxconn, tcp buffers, fs.nr_open, tcp_fastopen, default_qdisc, etc. |
+| `systemd_property` | Systemd | LimitNOFILE, CPUQuota, MemoryMax, Nice, CPUWeight, IOWeight, TasksMax, OOMScoreAdjust |
+| `nginx_directive` | Nginx | worker_processes, worker_connections, sendfile, access_log, etc. |
+| `nginx_listen_backlog` | Nginx | TCP listen backlog on listen directives |
+| `cpu_governor` | Hardware | CPU frequency scaling governor |
+| `irqbalance` | Hardware | IRQ distribution across cores |
+| `readahead` | I/O | Block device readahead sectors |
+| `io_scheduler` | I/O | Block device I/O scheduler |
+| `ethtool` | NIC | Ring buffers (rx/tx) and adaptive interrupt coalescing |
+| `tc_shaping` | Network | Removes TC bandwidth throttle (auto-accepted) |
+| `iptables_connlimit` | Network | Removes iptables connection limits (auto-accepted) |
+| `nftables_ratelimit` | Network | Removes nftables rate limits (auto-accepted) |
 
 ---
 
-## Live Runtime Sampling
+## Performance Rules Spec
 
-While the benchmark runs, a background SSH thread collects metrics every 2 seconds:
+A shared "constitution" injected into every LLM call (`prompts/performance_rules.md`):
 
-| Metric | Signal |
-|--------|--------|
-| `/proc/net/softnet_stat` | Softirq budget exhaustion, packet drops |
-| `ethtool -S <iface>` | NIC rx_discards, rx_errors at ring level |
-| `/proc/net/sockstat` | TCP TIME_WAIT, ESTABLISHED (label-based extraction) |
-| `vmstat` | CPU us/sy/wa, context switches |
-| `cgroup cpu.stat` | CPUQuota throttle ratio (v1 and v2 supported) |
+- **Constraint chains**: `fs.nr_open >= LimitNOFILE >= worker_rlimit_nofile >= worker_connections`
+- **Fix ordering**: remove cgroup throttles → unlock workers → fix fd chain → optimize I/O
+- **Hard rules**: never lower limits (raise ceilings), never set tcp_tw_reuse=1
+- **RHEL-specific**: systemd drop-in behavior, PAM limits don't affect services, per-process vs cgroup limits
+- **nginx-specific**: worker_rlimit_nofile >= 2x worker_connections, directive inheritance, reuseport
 
-Samples saved to `rca_reports/<session-id>/live_samples.csv`. Pandas analysis computes deltas, peaks, and trend slopes. A compact severity-tagged hypothesis is printed to console and passed to `analyze_network`.
-
----
-
-## Configuration
-
-```yaml
-target:
-  connect_timeout_seconds: 30  # SSH timeout per attempt (3 retries with 5s backoff)
-
-orchestration:
-  max_parallel_audits: 10      # --fleet: static audits fan out in parallel
-  target_password: ""          # optional installer->target SSH password
-  installer:
-    user: root                 # Mac -> installer SSH user
-    private_key_path: /path/to/key
-    port: 22
-    auto_install_wrk: true     # auto-install wrk on installer if missing
-
-targets:                       # optional inventory for --fleet mode
-  - name: node01
-    host: 172.21.90.178
-  - name: node02
-    host: 172.21.90.179
-    # group is optional; if omitted, inferred from name prefix before the last '-'
-    # group: automationcontroller
-
-remediation:
-  improvement_threshold_pct: -0.2   # reject only if priority workloads degrade > 0.2%
-  degradation_tolerance_pct: -5.0   # non-priority workloads noise floor
-  max_fixes: 15
-  network_tools:
-    tc_shaping: write               # none | read | write
-    iptables_connlimit: write
-    nftables_ratelimit: write
-
-benchmark:
-  cooling_period_seconds: 30        # pause after benchmark for DUT to drain connections
-  collect_live_audit: true
-  live_sampling:
-    enabled: true
-    interval_seconds: 2
-    max_samples: 25
-  final_benchmark_duration_minutes: 5
-
-memory:
-  inject_into_rca_analysis: true    # pass similar cases to analyze_network
-  inject_into_fix_extraction: true  # pass similar cases to analyze_kernel + analyze_nginx
-
-optimization:
-  min_new_examples: 30              # trigger DSPy BootstrapFewShot after N examples
-  max_bootstrap_demos: 3
-```
+Based on Red Hat verified KB articles + nginx.org anti-patterns guide.
 
 ---
 
 ## Setup
 
-**Requires Python 3.12+**
-
 ```bash
-# 1. Install dependencies
-python3.12 -m venv venv
-source venv/bin/activate
+# 1. Install
+python3.12 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Configure environment variables
-cp .env.example .env
-# Edit .env with your values:
-#   GPT_OSS_BASE_URL   — LLM endpoint (required)
-#   GPT_OSS_API_KEY    — LLM API key (required)
-#   GPT_OSS_MODEL      — LLM model name (required)
-#   GPT_OSS_EMBED_MODEL — embedding model (optional, defaults to GPT_OSS_MODEL)
-#   SLAY_DUT_HOST      — target host IP (overrides config.yaml)
-#   SLAY_DUT_USER      — SSH user (overrides config.yaml)
-#   SLAY_DUT_KEY       — SSH private key path (overrides config.yaml)
-#   SLAY_DUT_PORT      — SSH port (overrides config.yaml)
-#   SLAY_DUT_TIMEOUT   — SSH timeout (overrides config.yaml)
-#   SLAY_MLFLOW_ENABLED — enable/disable MLflow (overrides config.yaml)
-#   SLAY_MLFLOW_URI    — MLflow tracking URI (overrides config.yaml)
-#   SLAY_MLFLOW_EXPERIMENT — MLflow experiment name (overrides config.yaml)
+# 2. Configure
+cp .env.example .env   # Edit with LLM + DUT credentials
 
-# 3. Configure config.yaml (defaults work if .env is set)
-#   target.*       — DUT connection (overridden by SLAY_DUT_* env vars)
-#   benchmark.*    — benchmark scripts, workloads, cooling period
-#   remediation.*  — fix thresholds, max fixes, network tool scopes
-#   mlflow.*       — experiment tracking (overridden by SLAY_MLFLOW_* env vars)
-#   memory.*       — semantic memory injection toggles
-#   optimization.* — DSPy BootstrapFewShot trigger thresholds
-
-# 4. Run
-python agent.py
-
-# Audit-only mode (no fix application; RCA + recommended fixes only)
-python agent.py --audit
-
-# Fleet mode: audits in parallel, benchmark/RCA sequential per target
-python agent.py --fleet
-
-# Fleet + audit-only directives (no fix apply on any target)
-python agent.py --fleet --audit
-
-# Fleet via installer (required flags for installer-orchestrated execution)
-python agent.py --fleet --audit --orchestrate --installer <installer-ip>
-
-# Force password auth from installer -> selected targets
-python agent.py --fleet --audit --orchestrate --installer <installer-ip> --target-password '<password>'
-
-# Choose only one group from CLI
-python agent.py --fleet --audit --orchestrate --installer <installer-ip> --target-group automationcontroller
-
-# Choose specific nodes from CLI (name or IP)
-python agent.py --fleet --audit --orchestrate --installer <installer-ip> --target automationhub-0,10.1.91.191
-
-# List available groups/nodes from config
-python agent.py --list-targets
-
-# Remediation via installer requires explicit confirmation flag
-python agent.py --fleet --orchestrate --installer <installer-ip> --confirm-remediation
+# 3. Run
+python agent.py                    # Full remediation
+python agent.py --audit            # Recommendations only (no fixes applied)
+python agent.py --fleet            # Multi-target mode
+python agent.py --fleet --audit    # Multi-target audit only
+python agent.py --list-targets     # Show configured targets
 ```
 
 ---
 
-## Session Output
+## Results
 
-Each run produces a session folder:
-```
-rca_reports/<session-uuid>/
-  final_report.md        # comprehensive run summary (baseline, fixes, final benchmark, runtime)
-  rca_report.md          # combined summaries from all 3 LLM calls
-  live_samples.csv       # raw runtime samples (25+ rows per benchmark)
-  prompt_network.json    # full inputs + response for network LLM call
-  prompt_kernel.json     # full inputs + response for kernel LLM call
-  prompt_nginx.json      # full inputs + response for nginx LLM call
-  final_benchmark.txt    # extended benchmark (if fixes were accepted)
+Tested against an 8-layer degradation on a 112-core RHEL 9.7 system:
 
-dspy_data/
-  examples.jsonl         # training examples with remediation outcomes
-  rca_program/           # compiled DSPy program (after 30+ examples)
-  chroma/                # ChromaDB semantic memory store
-```
+| Metric | Before | After |
+|--------|--------|-------|
+| Homepage RPS | 2,840 | **935,140** (+32,822%) |
+| Small file RPS | 61 | **964,989** (+1,583,927%) |
+| Medium file RPS | 345 | 1,408 (+308%) |
+| Large file RPS | 55 | 187 (+240%) |
+| Fixes applied | — | 12 accepted / 3 rejected |
+| Total tokens | — | 48,140 |
+| LLM calls | — | 2 (investigation + fix generator) |
+| Runtime | — | ~25 minutes |
 
----
-
-## Scripts
-
-```bash
-# View / clean semantic memory
-python scripts/clean_chromadb.py
-python scripts/clean_chromadb.py --reset
-python scripts/clean_chromadb.py --before 2026-04-09
-```
+Homepage and small file RPS **exceeded the healthy vanilla baseline by 2.5x**.
