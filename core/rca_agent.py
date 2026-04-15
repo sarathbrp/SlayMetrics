@@ -1,9 +1,6 @@
 """RCAAgent: LangGraph orchestration + state management."""
 from __future__ import annotations
-
-import logging
-import signal
-import sys
+import logging, signal, sys  # noqa: E401
 from datetime import datetime
 from typing import Any, TypedDict
 from uuid import uuid4
@@ -59,6 +56,7 @@ class RCAState(TypedDict):
     total_input_tokens: int
     total_output_tokens: int
     llm_calls: list
+    _retry_done: bool
     error: str
 
 
@@ -200,7 +198,7 @@ class RCAAgent:
             "rca_report": "", "fix_groups": [], "fixes": [], "fix_index": 0,
             "applied_fixes": [], "rejected_fixes": [],
             "total_input_tokens": 0, "total_output_tokens": 0,
-            "llm_calls": [], "error": "",
+            "llm_calls": [], "_retry_done": False, "error": "",
         }
         if initial_state:
             initial.update(initial_state)
