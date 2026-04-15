@@ -318,10 +318,13 @@ class NginxDirectiveTool(RemediationTool):
         lines = [ln.strip() for ln in all_matches.strip().splitlines() if ln.strip()]
         self._original = lines[-1] if lines else ""
         logger.info("nginx %s: [%s] → %s", directive, self._original.strip(), value)
-        # Use awk for safer in-place editing instead of sed with unescaped regex
+        # Replace directive value — scan all fields to handle compact formats
+        # e.g. "events { worker_connections 256; }" where directive is not $1
+        # Strip trailing ; from the old value, set new value with ;
         self._run(
             f"awk -v dir={q_dir} -v val={q_value} "
-            "'$1 == dir {$0 = \"    \" dir \" \" val \";\"} 1' "
+            "'{for(i=1;i<=NF;i++) if($i==dir){"
+            "v=$(i+1); sub(/;$/,\"\",v); $(i+1)=val\";\"}} 1' "
             f"{q_conf} > {q_conf}.tmp && mv {q_conf}.tmp {q_conf}"
         )
         self._run("nginx -t && nginx -s reload")
