@@ -23,7 +23,8 @@ def run_comparisons(config: Config) -> None:
         )
     except Exception as e:
         logger.warning("Failed to copy results to %s: %s", hackathon_dir, e)
-    env = {**os.environ, "TARGET_HOST": config.dut_host}
+    env = {**os.environ, "TARGET_HOST": config.dut_host,
+           "RESULTS_DIR": hackathon_dir}
     comparisons = [
         (contestant, "baseline", "vs DETUNED BASELINE"),
         (contestant, "vanilla", "vs VANILLA (healthy)"),
